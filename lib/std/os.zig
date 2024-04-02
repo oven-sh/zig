@@ -5289,7 +5289,7 @@ pub fn realpathW(pathname: []const u16, out_buffer: *[MAX_PATH_BYTES]u8) RealPat
 
     const dir = std.fs.cwd().fd;
     const access_mask = w.GENERIC_READ | w.SYNCHRONIZE;
-    const share_access = w.FILE_SHARE_READ;
+    const share_access = w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE;
     const creation = w.FILE_OPEN;
     const h_file = blk: {
         const res = w.OpenFile(pathname, .{
