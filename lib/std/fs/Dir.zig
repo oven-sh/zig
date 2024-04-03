@@ -1226,7 +1226,7 @@ pub fn realpathZ(self: Dir, pathname: [*:0]const u8, out_buffer: []u8) ![]u8 {
     // anyway.
     var buffer: [fs.MAX_PATH_BYTES]u8 = undefined;
 
-    if (pathname.len == 1 and pathname[0] == '.') {
+    if (pathname[0] == '.' and pathname[0] == 0) {
         const out_path = try posix.getFdPath(self.fd, &buffer);
 
         if (out_path.len > out_buffer.len) {
