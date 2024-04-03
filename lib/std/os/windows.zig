@@ -122,13 +122,11 @@ pub fn OpenFile(sub_path_w: []const u16, options: OpenFileOptions) OpenError!HAN
                 }
                 return result;
             },
-            .OBJECT_NAME_INVALID => unreachable,
             .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
             .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
             .BAD_NETWORK_PATH => return error.NetworkNotFound, // \\server was not found
             .BAD_NETWORK_NAME => return error.NetworkNotFound, // \\server was found but \\server\share wasn't
             .NO_MEDIA_IN_DEVICE => return error.NoDevice,
-            .INVALID_PARAMETER => unreachable,
             .SHARING_VIOLATION => return error.AccessDenied,
             .ACCESS_DENIED => return error.AccessDenied,
             .PIPE_BUSY => return error.PipeBusy,
@@ -138,16 +136,7 @@ pub fn OpenFile(sub_path_w: []const u16, options: OpenFileOptions) OpenError!HAN
             .NOT_A_DIRECTORY => return error.NotDir,
             .USER_MAPPED_FILE => return error.AccessDenied,
             .INVALID_HANDLE => unreachable,
-            .DELETE_PENDING => {
-                // This error means that there *was* a file in this location on
-                // the file system, but it was deleted. However, the OS is not
-                // finished with the deletion operation, and so this CreateFile
-                // call has failed. There is not really a sane way to handle
-                // this other than retrying the creation after the OS finishes
-                // the deletion.
-                std.time.sleep(std.time.ns_per_ms);
-                continue;
-            },
+            .FILE_DELETED, .DELETE_PENDING => return error.AccessDenied,
             else => return unexpectedStatus(rc),
         }
     }
@@ -234,7 +223,6 @@ pub fn DeviceIoControl(
         .PRIVILEGE_NOT_HELD => return error.AccessDenied,
         .ACCESS_DENIED => return error.AccessDenied,
         .INVALID_DEVICE_REQUEST => return error.AccessDenied, // Not supported by the underlying filesystem
-        .INVALID_PARAMETER => unreachable,
         else => return unexpectedStatus(rc),
     }
 }
@@ -342,7 +330,6 @@ pub fn CreateIoCompletionPort(
 ) CreateIoCompletionPortError!HANDLE {
     const handle = kernel32.CreateIoCompletionPort(file_handle, existing_completion_port, completion_key, concurrent_thread_count) orelse {
         switch (kernel32.GetLastError()) {
-            .INVALID_PARAMETER => unreachable,
             else => |err| return unexpectedError(err),
         }
     };
@@ -655,7 +642,7 @@ pub fn SetCurrentDirectory(path_name: []const u16) SetCurrentDirectoryError!void
         .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
         .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
         .NO_MEDIA_IN_DEVICE => return error.NoDevice,
-        .INVALID_PARAMETER => unreachable,
+        .INVALID_PARAMETER => return error.BadPathName,
         .ACCESS_DENIED => return error.AccessDenied,
         .OBJECT_PATH_SYNTAX_BAD => unreachable,
         .NOT_A_DIRECTORY => return error.NotDir,
@@ -804,6 +791,7 @@ pub const ReadLinkError = error{
     Unexpected,
     NameTooLong,
     UnsupportedReparsePointType,
+    BadPathName,
 };
 
 pub fn ReadLink(dir: ?HANDLE, sub_path_w: []const u16, out_buffer: []u8) ReadLinkError![]u8 {
@@ -843,13 +831,13 @@ pub fn ReadLink(dir: ?HANDLE, sub_path_w: []const u16, out_buffer: []u8) ReadLin
     );
     switch (rc) {
         .SUCCESS => {},
-        .OBJECT_NAME_INVALID => unreachable,
+        .OBJECT_NAME_INVALID => return error.BadPathName,
         .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
         .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
         .NO_MEDIA_IN_DEVICE => return error.FileNotFound,
         .BAD_NETWORK_PATH => return error.NetworkNotFound, // \\server was not found
         .BAD_NETWORK_NAME => return error.NetworkNotFound, // \\server was found but \\server\share wasn't
-        .INVALID_PARAMETER => unreachable,
+        .INVALID_PARAMETER => return error.BadPathName,
         .SHARING_VIOLATION => return error.AccessDenied,
         .ACCESS_DENIED => return error.AccessDenied,
         .PIPE_BUSY => return error.AccessDenied,
@@ -913,6 +901,7 @@ pub const DeleteFileError = error{
     NotDir,
     IsDir,
     DirNotEmpty,
+    BadPathName,
     NetworkNotFound,
 };
 
@@ -954,7 +943,7 @@ pub fn DeleteFile(sub_path_w: []const u16, options: DeleteFileOptions) DeleteFil
     };
     var io: IO_STATUS_BLOCK = undefined;
     var tmp_handle: HANDLE = undefined;
-    var rc = ntdll.NtCreateFile(
+    var rc: NTSTATUS = ntdll.NtCreateFile(
         &tmp_handle,
         SYNCHRONIZE | DELETE,
         &attr,
@@ -969,17 +958,17 @@ pub fn DeleteFile(sub_path_w: []const u16, options: DeleteFileOptions) DeleteFil
     );
     switch (rc) {
         .SUCCESS => {},
-        .OBJECT_NAME_INVALID => unreachable,
+        .OBJECT_NAME_INVALID => return error.BadPathName,
         .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
         .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
         .BAD_NETWORK_PATH => return error.NetworkNotFound, // \\server was not found
         .BAD_NETWORK_NAME => return error.NetworkNotFound, // \\server was found but \\server\share wasn't
-        .INVALID_PARAMETER => unreachable,
+        .INVALID_PARAMETER => return error.BadPathName,
         .FILE_IS_A_DIRECTORY => return error.IsDir,
         .NOT_A_DIRECTORY => return error.NotDir,
         .SHARING_VIOLATION => return error.FileBusy,
-        .ACCESS_DENIED => return error.AccessDenied,
-        .DELETE_PENDING => return,
+        .CANNOT_DELETE, .ACCESS_DENIED => return error.AccessDenied,
+        .FILE_DELETED, .DELETE_PENDING => return,
         else => return unexpectedStatus(rc),
     }
     defer CloseHandle(tmp_handle);
@@ -1006,7 +995,7 @@ pub fn DeleteFile(sub_path_w: []const u16, options: DeleteFileOptions) DeleteFil
             .FileDispositionInformationEx,
         );
         switch (rc) {
-            .SUCCESS => return,
+            .FILE_DELETED, .DELETE_PENDING, .SUCCESS => return,
             // INVALID_PARAMETER here means that the filesystem does not support FileDispositionInformationEx
             .INVALID_PARAMETER => {},
             // For all other statuses, fall down to the switch below to handle them.
@@ -1029,12 +1018,13 @@ pub fn DeleteFile(sub_path_w: []const u16, options: DeleteFileOptions) DeleteFil
         );
     }
     switch (rc) {
-        .SUCCESS => {},
+        .FILE_DELETED, .DELETE_PENDING, .SUCCESS => {},
         .DIRECTORY_NOT_EMPTY => return error.DirNotEmpty,
-        .INVALID_PARAMETER => unreachable,
+        .INVALID_PARAMETER => return error.BadPathName,
         .CANNOT_DELETE => return error.AccessDenied,
         .MEDIA_WRITE_PROTECTED => return error.AccessDenied,
         .ACCESS_DENIED => return error.AccessDenied,
+        .SHARING_VIOLATION => return error.FileBusy,
         else => return unexpectedStatus(rc),
     }
 }
@@ -1082,7 +1072,6 @@ pub fn SetFilePointerEx_BEGIN(handle: HANDLE, offset: u64) SetFilePointerError!v
     const ipos = @as(LARGE_INTEGER, @bitCast(offset));
     if (kernel32.SetFilePointerEx(handle, ipos, null, FILE_BEGIN) == 0) {
         switch (kernel32.GetLastError()) {
-            .INVALID_PARAMETER => unreachable,
             .INVALID_HANDLE => unreachable,
             else => |err| return unexpectedError(err),
         }
@@ -1093,7 +1082,6 @@ pub fn SetFilePointerEx_BEGIN(handle: HANDLE, offset: u64) SetFilePointerError!v
 pub fn SetFilePointerEx_CURRENT(handle: HANDLE, offset: i64) SetFilePointerError!void {
     if (kernel32.SetFilePointerEx(handle, offset, null, FILE_CURRENT) == 0) {
         switch (kernel32.GetLastError()) {
-            .INVALID_PARAMETER => unreachable,
             .INVALID_HANDLE => unreachable,
             else => |err| return unexpectedError(err),
         }
@@ -1104,7 +1092,6 @@ pub fn SetFilePointerEx_CURRENT(handle: HANDLE, offset: i64) SetFilePointerError
 pub fn SetFilePointerEx_END(handle: HANDLE, offset: i64) SetFilePointerError!void {
     if (kernel32.SetFilePointerEx(handle, offset, null, FILE_END) == 0) {
         switch (kernel32.GetLastError()) {
-            .INVALID_PARAMETER => unreachable,
             .INVALID_HANDLE => unreachable,
             else => |err| return unexpectedError(err),
         }
@@ -1116,7 +1103,6 @@ pub fn SetFilePointerEx_CURRENT_get(handle: HANDLE) SetFilePointerError!u64 {
     var result: LARGE_INTEGER = undefined;
     if (kernel32.SetFilePointerEx(handle, 0, &result, FILE_CURRENT) == 0) {
         switch (kernel32.GetLastError()) {
-            .INVALID_PARAMETER => unreachable,
             .INVALID_HANDLE => unreachable,
             else => |err| return unexpectedError(err),
         }
@@ -1724,6 +1710,7 @@ pub const CreateProcessError = error{
     NameTooLong,
     InvalidExe,
     Unexpected,
+    BadPathName,
 };
 
 pub fn CreateProcessW(
@@ -1754,7 +1741,7 @@ pub fn CreateProcessW(
             .FILE_NOT_FOUND => return error.FileNotFound,
             .PATH_NOT_FOUND => return error.FileNotFound,
             .ACCESS_DENIED => return error.AccessDenied,
-            .INVALID_PARAMETER => unreachable,
+            .INVALID_PARAMETER => return error.BadPathName,
             .INVALID_NAME => return error.InvalidName,
             .FILENAME_EXCED_RANGE => return error.NameTooLong,
             // These are all the system errors that are mapped to ENOEXEC by
@@ -4569,6 +4556,7 @@ pub const GetProcessMemoryInfoError = error{
     AccessDenied,
     InvalidHandle,
     Unexpected,
+    BadPathName,
 };
 
 pub fn GetProcessMemoryInfo(hProcess: HANDLE) GetProcessMemoryInfoError!VM_COUNTERS {
@@ -4578,7 +4566,7 @@ pub fn GetProcessMemoryInfo(hProcess: HANDLE) GetProcessMemoryInfoError!VM_COUNT
         .SUCCESS => return vmc,
         .ACCESS_DENIED => return error.AccessDenied,
         .INVALID_HANDLE => return error.InvalidHandle,
-        .INVALID_PARAMETER => unreachable,
+        .INVALID_PARAMETER => return error.BadPathName,
         else => return unexpectedStatus(rc),
     }
 }
@@ -5234,7 +5222,7 @@ pub fn ProcessBaseAddress(handle: HANDLE) ProcessBaseAddressError!HMODULE {
         .SUCCESS => {},
         .ACCESS_DENIED => return error.AccessDenied,
         .INVALID_HANDLE => return error.InvalidHandle,
-        .INVALID_PARAMETER => unreachable,
+        .INVALID_PARAMETER => return error.BadPathName,
         else => return unexpectedStatus(rc),
     }
 

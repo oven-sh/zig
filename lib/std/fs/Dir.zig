@@ -1203,6 +1203,11 @@ pub fn realpath(self: Dir, pathname: []const u8, out_buffer: []u8) ![]u8 {
         @compileError("realpath is not available on WASI");
     }
     if (builtin.os.tag == .windows) {
+        if (pathname.len == 1 and pathname[0] == '.') {
+            const ptr: *[std.fs.MAX_PATH_BYTES]u8 = out_buffer[0..std.fs.MAX_PATH_BYTES];
+            return try std.os.getFdPath(self.fd, ptr);
+        }
+
         const pathname_w = try std.os.windows.sliceToPrefixedFileW(self.fd, pathname);
         return self.realpathW(pathname_w.span(), out_buffer);
     }
@@ -1213,6 +1218,26 @@ pub fn realpath(self: Dir, pathname: []const u8, out_buffer: []u8) ![]u8 {
 /// Same as `Dir.realpath` except `pathname` is null-terminated.
 /// See also `Dir.realpath`, `realpathZ`.
 pub fn realpathZ(self: Dir, pathname: [*:0]const u8, out_buffer: []u8) ![]u8 {
+    // Use of MAX_PATH_BYTES here is valid as the realpath function does not
+    // have a variant that takes an arbitrary-size buffer.
+    // TODO(#4812): Consider reimplementing realpath or using the POSIX.1-2008
+    // NULL out parameter (GNU's canonicalize_file_name) to handle overelong
+    // paths. musl supports passing NULL but restricts the output to PATH_MAX
+    // anyway.
+    var buffer: [fs.MAX_PATH_BYTES]u8 = undefined;
+
+    if (pathname.len == 1 and pathname[0] == '.') {
+        const out_path = try posix.getFdPath(self.fd, &buffer);
+
+        if (out_path.len > out_buffer.len) {
+            return error.NameTooLong;
+        }
+
+        const result = out_buffer[0..out_path.len];
+        @memcpy(result, out_path);
+        return result;
+    }
+
     if (builtin.os.tag == .windows) {
         const pathname_w = try posix.windows.cStrToPrefixedFileW(self.fd, pathname);
         return self.realpathW(pathname_w.span(), out_buffer);
@@ -1227,14 +1252,6 @@ pub fn realpathZ(self: Dir, pathname: [*:0]const u8, out_buffer: []u8) ![]u8 {
         else => |e| return e,
     };
     defer posix.close(fd);
-
-    // Use of MAX_PATH_BYTES here is valid as the realpath function does not
-    // have a variant that takes an arbitrary-size buffer.
-    // TODO(#4812): Consider reimplementing realpath or using the POSIX.1-2008
-    // NULL out parameter (GNU's canonicalize_file_name) to handle overelong
-    // paths. musl supports passing NULL but restricts the output to PATH_MAX
-    // anyway.
-    var buffer: [fs.MAX_PATH_BYTES]u8 = undefined;
     const out_path = try posix.getFdPath(fd, &buffer);
 
     if (out_path.len > out_buffer.len) {
@@ -1250,6 +1267,26 @@ pub fn realpathZ(self: Dir, pathname: [*:0]const u8, out_buffer: []u8) ![]u8 {
 /// See also `Dir.realpath`, `realpathW`.
 pub fn realpathW(self: Dir, pathname: []const u16, out_buffer: []u8) ![]u8 {
     const w = std.os.windows;
+
+    // Use of MAX_PATH_BYTES here is valid as the realpath function does not
+    // have a variant that takes an arbitrary-size buffer.
+    // TODO(#4812): Consider reimplementing realpath or using the POSIX.1-2008
+    // NULL out parameter (GNU's canonicalize_file_name) to handle overelong
+    // paths. musl supports passing NULL but restricts the output to PATH_MAX
+    // anyway.
+    var buffer: [fs.MAX_PATH_BYTES]u8 = undefined;
+
+    if (pathname.len == 1 and pathname[0] == '.') {
+        const out_path = try posix.getFdPath(self.fd, &buffer);
+
+        if (out_path.len > out_buffer.len) {
+            return error.NameTooLong;
+        }
+
+        const result = out_buffer[0..out_path.len];
+        @memcpy(result, out_path);
+        return result;
+    }
 
     const access_mask = w.GENERIC_READ | w.SYNCHRONIZE;
     const share_access = w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE;
@@ -1270,13 +1307,6 @@ pub fn realpathW(self: Dir, pathname: []const u16, out_buffer: []u8) ![]u8 {
     };
     defer w.CloseHandle(h_file);
 
-    // Use of MAX_PATH_BYTES here is valid as the realpath function does not
-    // have a variant that takes an arbitrary-size buffer.
-    // TODO(#4812): Consider reimplementing realpath or using the POSIX.1-2008
-    // NULL out parameter (GNU's canonicalize_file_name) to handle overelong
-    // paths. musl supports passing NULL but restricts the output to PATH_MAX
-    // anyway.
-    var buffer: [fs.MAX_PATH_BYTES]u8 = undefined;
     const out_path = try posix.getFdPath(h_file, &buffer);
 
     if (out_path.len > out_buffer.len) {
@@ -1500,8 +1530,8 @@ fn makeOpenDirAccessMaskW(self: Dir, sub_path_w: [*:0]const u16, access_mask: u3
         .NOT_A_DIRECTORY => return error.NotDir,
         // This can happen if the directory has 'List folder contents' permission set to 'Deny'
         // and the directory is trying to be opened for iteration.
-        .ACCESS_DENIED => return error.AccessDenied,
-        .INVALID_PARAMETER => unreachable,
+        .FILE_DELETED, .DELETE_PENDING, .ACCESS_DENIED => return error.AccessDenied,
+        .INVALID_PARAMETER => return error.BadPathName,
         else => return w.unexpectedStatus(rc),
     }
 }

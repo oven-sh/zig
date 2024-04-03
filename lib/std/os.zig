@@ -5287,6 +5287,10 @@ pub fn realpathZ(pathname: [*:0]const u8, out_buffer: *[MAX_PATH_BYTES]u8) RealP
 pub fn realpathW(pathname: []const u16, out_buffer: *[MAX_PATH_BYTES]u8) RealPathError![]u8 {
     const w = windows;
 
+    if (pathname.len == 1 and pathname[0] == '.') {
+        return getFdPath(std.fs.cwd().fd, out_buffer);
+    }
+
     const dir = std.fs.cwd().fd;
     const access_mask = w.GENERIC_READ | w.SYNCHRONIZE;
     const share_access = w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE;
