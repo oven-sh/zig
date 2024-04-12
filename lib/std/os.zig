@@ -4585,6 +4585,7 @@ pub const AccessError = error{
     FileBusy,
     SymLinkLoop,
     ReadOnlyFileSystem,
+    InvalidArgument,
 
     /// On Windows, file paths must be valid Unicode.
     InvalidUtf8,
@@ -4754,8 +4755,8 @@ pub fn faccessatW(dirfd: fd_t, sub_path_w: [*:0]const u16, mode: u32, flags: u32
         .SUCCESS => return,
         .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
         .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
-        .OBJECT_NAME_INVALID => unreachable,
-        .INVALID_PARAMETER => unreachable,
+        .OBJECT_NAME_INVALID => return error.BadPathName,
+        .INVALID_PARAMETER => return error.InvalidArgument,
         .ACCESS_DENIED => return error.PermissionDenied,
         .OBJECT_PATH_SYNTAX_BAD => unreachable,
         else => |rc| return windows.unexpectedStatus(rc),
