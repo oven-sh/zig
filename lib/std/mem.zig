@@ -956,6 +956,15 @@ const backend_supports_vectors = switch (builtin.zig_backend) {
 };
 
 pub fn indexOfSentinel(comptime T: type, comptime sentinel: T, p: [*:sentinel]const T) usize {
+    if (comptime @hasDecl(@import("root"), "overrides")) {
+        const overrides = @import("root").overrides;
+        if (comptime @hasDecl(overrides, "mem")) {
+            if (comptime @hasDecl(overrides.mem, "indexOfSentinel")) {
+                return overrides.mem.indexOfSentinel(T, sentinel, p);
+            }
+        }
+    }
+
     var i: usize = 0;
 
     if (backend_supports_vectors and
