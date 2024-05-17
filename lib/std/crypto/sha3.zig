@@ -118,7 +118,7 @@ fn ShakeLike(comptime security_level: u11, comptime delim: u8, comptime rounds: 
         padded: bool = false,
 
         /// The recommended output length, in bytes.
-        pub const digest_length = security_level / 2;
+        pub const digest_length = security_level / 8;
         /// The block length, or rate, in bytes.
         pub const block_length = State.rate;
         /// Keccak does not have any options.
