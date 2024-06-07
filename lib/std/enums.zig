@@ -1277,7 +1277,7 @@ test "EnumSet non-exhaustive" {
 pub fn EnumIndexer(comptime E: type) type {
     // Assumes that the enum fields are sorted in ascending order (optimistic).
     // Unsorted enums may require the user to manually increase the quota.
-    @setEvalBranchQuota(3 * @typeInfo(E).Enum.fields.len + eval_branch_quota_cushion);
+    @setEvalBranchQuota(4294967295);
 
     if (!@typeInfo(E).Enum.is_exhaustive) {
         const BackingInt = @typeInfo(E).Enum.tag_type;
@@ -1370,6 +1370,7 @@ pub fn EnumIndexer(comptime E: type) type {
         pub const Key = E;
         pub const count: comptime_int = fields_len;
         pub fn indexOf(e: E) usize {
+            @setEvalBranchQuota(4294967295);
             for (keys, 0..) |k, i| {
                 if (k == e) return i;
             }

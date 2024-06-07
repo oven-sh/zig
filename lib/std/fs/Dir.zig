@@ -1273,6 +1273,11 @@ pub fn realpath(self: Dir, pathname: []const u8, out_buffer: []u8) RealPathError
         @compileError("realpath is not available on WASI");
     }
     if (native_os == .windows) {
+        if (pathname.len == 1 and pathname[0] == '.') {
+            const ptr: *[std.fs.MAX_PATH_BYTES]u8 = out_buffer[0..std.fs.MAX_PATH_BYTES];
+            return try std.os.getFdPath(self.fd, ptr);
+        }
+
         const pathname_w = try windows.sliceToPrefixedFileW(self.fd, pathname);
         return self.realpathW(pathname_w.span(), out_buffer);
     }
@@ -1283,6 +1288,20 @@ pub fn realpath(self: Dir, pathname: []const u8, out_buffer: []u8) RealPathError
 /// Same as `Dir.realpath` except `pathname` is null-terminated.
 /// See also `Dir.realpath`, `realpathZ`.
 pub fn realpathZ(self: Dir, pathname: [*:0]const u8, out_buffer: []u8) RealPathError![]u8 {
+    var buffer: [fs.MAX_PATH_BYTES]u8 = undefined;
+
+    if (pathname[0] == '.' and pathname[1] == 0) {
+        const out_path = try std.os.getFdPath(self.fd, &buffer);
+
+        if (out_path.len > out_buffer.len) {
+            return error.NameTooLong;
+        }
+
+        const result = out_buffer[0..out_path.len];
+        @memcpy(result, out_path);
+        return result;
+    }
+
     if (native_os == .windows) {
         const pathname_w = try windows.cStrToPrefixedFileW(self.fd, pathname);
         return self.realpathW(pathname_w.span(), out_buffer);
@@ -1309,7 +1328,6 @@ pub fn realpathZ(self: Dir, pathname: [*:0]const u8, out_buffer: []u8) RealPathE
     };
     defer posix.close(fd);
 
-    var buffer: [fs.MAX_PATH_BYTES]u8 = undefined;
     const out_path = try std.os.getFdPath(fd, &buffer);
 
     if (out_path.len > out_buffer.len) {
@@ -1326,6 +1344,20 @@ pub fn realpathZ(self: Dir, pathname: [*:0]const u8, out_buffer: []u8) RealPathE
 /// See also `Dir.realpath`, `realpathW`.
 pub fn realpathW(self: Dir, pathname: []const u16, out_buffer: []u8) RealPathError![]u8 {
     const w = windows;
+
+    var buffer: [fs.MAX_PATH_BYTES]u8 = undefined;
+
+    if (pathname.len == 1 and pathname[0] == '.') {
+        const out_path = try std.os.getFdPath(self.fd, &buffer);
+
+        if (out_path.len > out_buffer.len) {
+            return error.NameTooLong;
+        }
+
+        const result = out_buffer[0..out_path.len];
+        @memcpy(result, out_path);
+        return result;
+    }
 
     const access_mask = w.GENERIC_READ | w.SYNCHRONIZE;
     const share_access = w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE;
@@ -1571,7 +1603,7 @@ const MakeOpenDirAccessMaskWOptions = struct {
     create_disposition: u32,
 };
 
-fn makeOpenDirAccessMaskW(self: Dir, sub_path_w: [*:0]const u16, access_mask: u32, flags: MakeOpenDirAccessMaskWOptions) (MakeError || OpenError)!Dir {
+pub fn makeOpenDirAccessMaskW(self: Dir, sub_path_w: [*:0]const u16, access_mask: u32, flags: MakeOpenDirAccessMaskWOptions) (MakeError || OpenError)!Dir {
     const w = windows;
 
     var result = Dir{
@@ -1617,8 +1649,8 @@ fn makeOpenDirAccessMaskW(self: Dir, sub_path_w: [*:0]const u16, access_mask: u3
         .NOT_A_DIRECTORY => return error.NotDir,
         // This can happen if the directory has 'List folder contents' permission set to 'Deny'
         // and the directory is trying to be opened for iteration.
-        .ACCESS_DENIED => return error.AccessDenied,
-        .INVALID_PARAMETER => unreachable,
+        .FILE_DELETED, .DELETE_PENDING, .ACCESS_DENIED => return error.AccessDenied,
+        .INVALID_PARAMETER => return error.BadPathName,
         else => return w.unexpectedStatus(rc),
     }
 }
