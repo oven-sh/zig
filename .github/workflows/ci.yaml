@@ -15,34 +15,35 @@ permissions:
   # Sets permission policy for `GITHUB_TOKEN`
   contents: read
 jobs:
-  # build:
-  #   runs-on: big-ubuntu
-  #   strategy:
-  #     matrix:
-  #       target:
-  #         - x86_64-macos-none
-  #         - x86_64-linux-musl
-  #         - x86_64-windows-gnu
-  #         - aarch64-macos-none
-  #         - aarch64-linux-musl
-  #   steps:
-  #     - run: sudo apt-get install -y ninja-build
-  #     - uses: actions/checkout@v4
-  #       with:
-  #         repository: ziglang/zig-bootstrap
-  #         ref: 50d8e88ba329b5d58a212f9fd2e9b1ad59a88e7d
-  #     - run: rm -rf zig
-  #     - uses: actions/checkout@v4
-  #       with:
-  #         path: zig
-  #     - run: sed -i 's/ZIG_VERSION="0.14.0-dev.2257+e6d2e1641"/ZIG_VERSION="0.14.0-dev.2987+183bb8b08"/' build
-  #     - run: CMAKE_GENERATOR=Ninja ./build ${{ matrix.target }} baseline
-  #     - uses: actions/upload-artifact@v4
-  #       with:
-  #         name: bootstrap-${{ matrix.target }}
-  #         path: out/zig-${{ matrix.target }}-baseline
+  build:
+    runs-on: big-ubuntu
+    strategy:
+      matrix:
+        target:
+          - x86_64-macos-none
+          - x86_64-linux-musl
+          - x86_64-windows-gnu
+          - aarch64-macos-none
+          - aarch64-linux-musl
+    steps:
+      - run: sudo apt-get install -y ninja-build
+      - uses: actions/checkout@v4
+        with:
+          repository: ziglang/zig-bootstrap
+          ref: 50d8e88ba329b5d58a212f9fd2e9b1ad59a88e7d
+      - run: rm -rf zig
+      - uses: actions/checkout@v4
+        with:
+          path: zig
+      - run: sed -i 's/ZIG_VERSION="0.14.0-dev.2257+e6d2e1641"/ZIG_VERSION="0.14.0-dev.2987+183bb8b08"/' build
+      - run: cat build
+      - run: CMAKE_GENERATOR=Ninja ./build ${{ matrix.target }} baseline
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-${{ matrix.target }}
+          path: out/zig-${{ matrix.target }}-baseline
   release:
-    # needs: build
+    needs: build
     permissions:
       contents: write
     runs-on: big-ubuntu
@@ -52,9 +53,6 @@ jobs:
           repository: zigtools/zls
           ref: d746d19a27729c519c58581838e17e733d35444d
       - uses: actions/download-artifact@v4
-        with:
-          run-id: 13188388737
-          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: chmod
         run: |
           chmod +x bootstrap-x86_64-macos-none/zig
@@ -64,7 +62,6 @@ jobs:
           chmod +x bootstrap-aarch64-linux-musl/zig
       - name: Build ZLS
         run: |
-          sed -i 's/builtin\.zig_version\.order(min_build_zig)/min_build_zig.order(min_build_zig)/g' build.zig
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos-none --prefix . --prefix-exe-dir ./bootstrap-x86_64-macos-none &
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix . --prefix-exe-dir ./bootstrap-x86_64-linux-musl &
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu --prefix . --prefix-exe-dir ./bootstrap-x86_64-windows-gnu &
