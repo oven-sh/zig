@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: zig
-      - run: ./build ${{ matrix.target }} baseline
+      - run: CMAKE_GENERATOR=Ninja ./build ${{ matrix.target }} baseline
       - uses: actions/upload-artifact@v4
         with:
           name: bootstrap-${{ matrix.target }}
