@@ -48,7 +48,7 @@ jobs:
         with:
           run-id: 13188388737
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: ls
+      - run: ls && ls bootstrap-x86_64-linux-musl
       - uses: actions/checkout@v4
         with:
           repository: zigtools/zls
