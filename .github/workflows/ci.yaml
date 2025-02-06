@@ -40,12 +40,33 @@ jobs:
         with:
           name: bootstrap-${{ matrix.target }}
           path: out/zig-${{ matrix.target }}-baseline
-
-# a second step can download all the bootstrap results, add zls, and create the release
-# - uses: actions/checkout@v4
-#   with:
-#     repository: zigtools/zls
-#     ref: d3d11a089d608014d50aca429fcb8bd82724fedf
-#     path: zls
-# - run: cd zls && zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
-# - run: cp zls/zig-out/bin/zls out/zig-${{ matrix.target }}-baseline/zls
+  release:
+    needs: build
+    runs-on: big-ubuntu
+    steps:
+      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: zigtools/zls
+          ref: d3d11a089d608014d50aca429fcb8bd82724fedf
+          path: zls
+      - name: Build ZLS
+        run: |
+          cd zls
+          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos-none && cp zig-out/bin/zls bootstrap-x86_64-macos-none/zls
+          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl && cp zig-out/bin/zls bootstrap-x86_64-linux-musl/zls
+          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu && cp zig-out/bin/zls.exe bootstrap-x86_64-windows-gnu/zls.exe
+          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos-none && cp zig-out/bin/zls bootstrap-aarch64-macos-none/zls
+          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl && cp zig-out/bin/zls bootstrap-aarch64-linux-musl/zls
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        id: release
+        with:
+          generate_release_notes: true
+          tag_name: "autobuild-${{github.sha}}"
+          files: |
+            ${{runner.temp}}/bootstrap-x86_64-macos-none
+            ${{runner.temp}}/bootstrap-x86_64-linux-musl
+            ${{runner.temp}}/bootstrap-x86_64-windows-gnu
+            ${{runner.temp}}/bootstrap-aarch64-macos-none
+            ${{runner.temp}}/bootstrap-aarch64-linux-musl
