@@ -20,11 +20,11 @@ jobs:
     strategy:
       matrix:
         target:
-          # - x86_64-macos-none
-          # - x86_64-linux-musl
-          # - x86_64-windows-gnu
+          - x86_64-macos-none
+          - x86_64-linux-musl
+          - x86_64-windows-gnu
           - aarch64-macos-none
-          # - aarch64-linux-musl
+          - aarch64-linux-musl
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,6 +37,14 @@ jobs:
       - run: ./build ${{ matrix.target }} baseline
       - uses: actions/upload-artifact@v4
         with:
-          name: zig-${{ matrix.target }}-baseline
-          path: out/zig-${{ matrix.target }}-baseline
-# TODO zls
+          name: bootstrap-${{ matrix.target }}
+          path: out
+
+# a second step can download all the bootstrap results, add zls, and create the release
+# - uses: actions/checkout@v4
+#   with:
+#     repository: zigtools/zls
+#     ref: d3d11a089d608014d50aca429fcb8bd82724fedf
+#     path: zls
+# - run: cd zls && zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+# - run: cp zls/zig-out/bin/zls out/zig-${{ matrix.target }}-baseline/zls
