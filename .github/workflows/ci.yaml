@@ -26,6 +26,7 @@ jobs:
           - aarch64-macos-none
           - aarch64-linux-musl
     steps:
+      - run: sudo apt-get install -y ninja-build
       - uses: actions/checkout@v4
         with:
           repository: ziglang/zig-bootstrap
