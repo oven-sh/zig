@@ -55,12 +55,12 @@ jobs:
           ref: d3d11a089d608014d50aca429fcb8bd82724fedf
       - name: Build ZLS
         run: |
-          cd zls
-          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos-none && cp zig-out/bin/zls bootstrap-x86_64-macos-none/zls
-          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl && cp zig-out/bin/zls bootstrap-x86_64-linux-musl/zls
-          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu && cp zig-out/bin/zls.exe bootstrap-x86_64-windows-gnu/zls.exe
-          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos-none && cp zig-out/bin/zls bootstrap-aarch64-macos-none/zls
-          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl && cp zig-out/bin/zls bootstrap-aarch64-linux-musl/zls
+          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos-none --prefix . --prefix-exe-dir ./bootstrap-x86_64-macos-none &
+          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix . --prefix-exe-dir ./bootstrap-x86_64-linux-musl &
+          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu --prefix . --prefix-exe-dir ./bootstrap-x86_64-windows-gnu &
+          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos-none --prefix . --prefix-exe-dir ./bootstrap-aarch64-macos-none &
+          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl --prefix . --prefix-exe-dir ./bootstrap-aarch64-linux-musl &
+          wait
       - name: Release
         uses: softprops/action-gh-release@v1
         id: release
