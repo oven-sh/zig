@@ -15,84 +15,28 @@ permissions:
   # Sets permission policy for `GITHUB_TOKEN`
   contents: read
 jobs:
-  aarch64-macos-debug:
-    runs-on: macos-13-xlarge
-    env:
-      ARCH: "aarch64"
-      TARGET: "aarch64-macos-none"
-      CACHE_BASENAME: "zig+llvm+lld+clang-aarch64-macos-none-0.14.0-dev.1622+2ac543388"
-      MCPU: "baseline"
-      BUILD_TYPE: "Debug"
+  build:
+    runs-on: big-ubuntu
+    strategy:
+      matrix:
+        target:
+          # - x86_64-macos-none
+          # - x86_64-linux-musl
+          # - x86_64-windows-gnu
+          - aarch64-macos-none
+          # - aarch64-linux-musl
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Cache Zig toolchain
-        uses: actions/cache@v4
+      - uses: actions/checkout@v4
         with:
-          path: ${{ runner.home }}/${{ env.CACHE_BASENAME }}
-          key: ${{ env.CACHE_BASENAME }}
-          restore-keys: |
-            ${{ env.CACHE_BASENAME }}
-      - name: Install Ninja
-        run: brew install ninja
-      - name: Build
-        run: ci/macos.sh
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+          repository: ziglang/zig-bootstrap
+          ref: 50d8e88ba329b5d58a212f9fd2e9b1ad59a88e7d
+      - run: rm -rf zig
+      - uses: actions/checkout@v4
         with:
-          name: aarch64-macos-debug
-          path: build/stage3/bin/zig
-  aarch64-macos-release:
-    runs-on: macos-13-xlarge
-    env:
-      ARCH: "aarch64"
-      TARGET: "aarch64-macos-none"
-      CACHE_BASENAME: "zig+llvm+lld+clang-aarch64-macos-none-0.14.0-dev.1622+2ac543388"
-      MCPU: "baseline"
-      BUILD_TYPE: "Release"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Cache Zig toolchain
-        uses: actions/cache@v4
+          path: zig
+      - run: ./zig-bootstrap/build ${{ matrix.target }} baseline
+      - uses: actions/upload-artifact@v4
         with:
-          path: ${{ runner.home }}/${{ env.CACHE_BASENAME }}
-          key: ${{ env.CACHE_BASENAME }}
-          restore-keys: |
-            ${{ env.CACHE_BASENAME }}
-      - name: Install Ninja
-        run: brew install ninja
-      - name: Build
-        run: ci/macos.sh
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: aarch64-macos-release
-          path: build/stage3/bin/zig
-  x86_64-macos-release:
-    runs-on: macos-13-large
-    env:
-      ARCH: "x86_64"
-      TARGET: "x86_64-macos-none"
-      CACHE_BASENAME: "zig+llvm+lld+clang-x86_64-macos-none-0.14.0-dev.1622+2ac543388"
-      MCPU: "baseline"
-      BUILD_TYPE: "Release"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Cache Zig toolchain
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.home }}/${{ env.CACHE_BASENAME }}
-          key: ${{ env.CACHE_BASENAME }}
-          restore-keys: |
-            ${{ env.CACHE_BASENAME }}
-      - name: Install Ninja
-        run: brew install ninja
-      - name: Build
-        run: ci/macos.sh
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: x86_64-macos-release
-          path: build/stage3/bin/zig
+          name: zig-${{ matrix.target }}-baseline
+          path: out/zig-${{ matrix.target }}-baseline
+# TODO zls
