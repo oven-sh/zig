@@ -56,7 +56,7 @@ jobs:
         run: |
           chmod +x bootstrap-x86_64-macos-none/zig
           chmod +x bootstrap-x86_64-linux-musl/zig
-          chmod +x bootstrap-x86_64-windows-gnu/zig
+          chmod +x bootstrap-x86_64-windows-gnu/zig.exe
           chmod +x bootstrap-aarch64-macos-none/zig
           chmod +x bootstrap-aarch64-linux-musl/zig
       - name: Build ZLS
