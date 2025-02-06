@@ -44,15 +44,15 @@ jobs:
     # needs: build
     runs-on: big-ubuntu
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          run-id: 13188388737
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: ls && ls bootstrap-x86_64-linux-musl
       - uses: actions/checkout@v4
         with:
           repository: zigtools/zls
           ref: d3d11a089d608014d50aca429fcb8bd82724fedf
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 13188388737
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: ls && echo && ls bootstrap-x86_64-linux-musl && echo && pwd
       - name: Build ZLS
         run: |
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos-none --prefix . --prefix-exe-dir ./bootstrap-x86_64-macos-none &
@@ -68,8 +68,8 @@ jobs:
           generate_release_notes: true
           tag_name: "autobuild-${{github.sha}}"
           files: |
-            ${{runner.temp}}/bootstrap-x86_64-macos-none
-            ${{runner.temp}}/bootstrap-x86_64-linux-musl
-            ${{runner.temp}}/bootstrap-x86_64-windows-gnu
-            ${{runner.temp}}/bootstrap-aarch64-macos-none
-            ${{runner.temp}}/bootstrap-aarch64-linux-musl
+            bootstrap-x86_64-macos-none
+            bootstrap-x86_64-linux-musl
+            bootstrap-x86_64-windows-gnu
+            bootstrap-aarch64-macos-none
+            bootstrap-aarch64-linux-musl
