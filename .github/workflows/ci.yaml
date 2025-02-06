@@ -39,7 +39,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: bootstrap-${{ matrix.target }}
-          path: out
+          path: out/zig-${{ matrix.target }}-baseline
 
 # a second step can download all the bootstrap results, add zls, and create the release
 # - uses: actions/checkout@v4
