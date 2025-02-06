@@ -15,36 +15,39 @@ permissions:
   # Sets permission policy for `GITHUB_TOKEN`
   contents: read
 jobs:
-  build:
-    runs-on: big-ubuntu
-    strategy:
-      matrix:
-        target:
-          - x86_64-macos-none
-          - x86_64-linux-musl
-          - x86_64-windows-gnu
-          - aarch64-macos-none
-          - aarch64-linux-musl
-    steps:
-      - run: sudo apt-get install -y ninja-build
-      - uses: actions/checkout@v4
-        with:
-          repository: ziglang/zig-bootstrap
-          ref: 50d8e88ba329b5d58a212f9fd2e9b1ad59a88e7d
-      - run: rm -rf zig
-      - uses: actions/checkout@v4
-        with:
-          path: zig
-      - run: CMAKE_GENERATOR=Ninja ./build ${{ matrix.target }} baseline
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bootstrap-${{ matrix.target }}
-          path: out/zig-${{ matrix.target }}-baseline
+  # build:
+  #   runs-on: big-ubuntu
+  #   strategy:
+  #     matrix:
+  #       target:
+  #         - x86_64-macos-none
+  #         - x86_64-linux-musl
+  #         - x86_64-windows-gnu
+  #         - aarch64-macos-none
+  #         - aarch64-linux-musl
+  #   steps:
+  #     - run: sudo apt-get install -y ninja-build
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         repository: ziglang/zig-bootstrap
+  #         ref: 50d8e88ba329b5d58a212f9fd2e9b1ad59a88e7d
+  #     - run: rm -rf zig
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         path: zig
+  #     - run: CMAKE_GENERATOR=Ninja ./build ${{ matrix.target }} baseline
+  #     - uses: actions/upload-artifact@v4
+  #       with:
+  #         name: bootstrap-${{ matrix.target }}
+  #         path: out/zig-${{ matrix.target }}-baseline
   release:
-    needs: build
+    # needs: build
     runs-on: big-ubuntu
     steps:
       - uses: actions/download-artifact@v4
+        with:
+          run-id: 13188388737
+          github_token: ${{ secrets.GITHUB_TOKEN }}
       - run: ls
       - uses: actions/checkout@v4
         with:
