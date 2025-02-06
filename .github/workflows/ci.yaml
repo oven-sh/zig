@@ -45,11 +45,11 @@ jobs:
     runs-on: big-ubuntu
     steps:
       - uses: actions/download-artifact@v4
+      - run: ls
       - uses: actions/checkout@v4
         with:
           repository: zigtools/zls
           ref: d3d11a089d608014d50aca429fcb8bd82724fedf
-          path: zls
       - name: Build ZLS
         run: |
           cd zls
