@@ -64,7 +64,7 @@ jobs:
           chmod +x bootstrap-aarch64-linux-musl/zig
       - name: Build ZLS
         run: |
-          sed -i 's/builtin\.zig_version\.order(min_build_zig)/min_build_zig.order(min_build_zig)/g' src/zls.zig
+          sed -i 's/builtin\.zig_version\.order(min_build_zig)/min_build_zig.order(min_build_zig)/g' build.zig
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos-none --prefix . --prefix-exe-dir ./bootstrap-x86_64-macos-none &
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix . --prefix-exe-dir ./bootstrap-x86_64-linux-musl &
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu --prefix . --prefix-exe-dir ./bootstrap-x86_64-windows-gnu &
