@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: zig
-      - run: ./zig-bootstrap/build ${{ matrix.target }} baseline
+      - run: ./build ${{ matrix.target }} baseline
       - uses: actions/upload-artifact@v4
         with:
           name: zig-${{ matrix.target }}-baseline
