@@ -14,6 +14,7 @@
  */
 
 #include "zig_llvm.h"
+#include <cstdlib>
 
 #if __GNUC__ >= 9
 #pragma GCC diagnostic push
@@ -62,6 +63,7 @@
 #include <llvm/Transforms/Utils/AddDiscriminators.h>
 #include <llvm/Transforms/Utils/CanonicalizeAliases.h>
 #include <llvm/Transforms/Utils/NameAnonGlobals.h>
+#include <llvm/Transforms/Utils/SplitModule.h>
 
 #include <lld/Common/Driver.h>
 
@@ -225,9 +227,36 @@ static AddressSanitizerOptions getAsanOptions(void) {
     return o;
 }
 
+ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile_inner(LLVMTargetMachineRef targ_machine_ref, LLVMModuleRef module_ref,
+    char **error_message, const ZigLLVMEmitOptions *options);
 ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machine_ref, LLVMModuleRef module_ref,
     char **error_message, const ZigLLVMEmitOptions *options)
 {
+    // void SplitModule(
+    //     Module &M, unsigned N,
+    //     function_ref<void(std::unique_ptr<Module> MPart)> ModuleCallback,
+    //     bool PreserveLocals = false, bool RoundRobin = false);
+ 
+    // this code is to emit llvm bytecode
+ 
+    if (getenv("ZIG_MULTITHREAD_EMIT")) {
+        // TODO: we need to split the output files
+        bool result = false;
+        SplitModule(*(llvm::Module*)module_ref, 12, [&](std::unique_ptr<Module> MPart) {
+            if (ZigLLVMTargetMachineEmitToFile_inner(targ_machine_ref, (LLVMModuleRef)MPart.get(), error_message, options)) {
+                result = true;
+            }
+        });
+        return result;
+    }else{
+        return ZigLLVMTargetMachineEmitToFile_inner(targ_machine_ref, module_ref, error_message, options);
+    }
+}
+
+ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile_inner(LLVMTargetMachineRef targ_machine_ref, LLVMModuleRef module_ref,
+    char **error_message, const ZigLLVMEmitOptions *options)
+{
+
     TimePassesIsEnabled = options->time_report;
 
     raw_fd_ostream *dest_asm_ptr = nullptr;
