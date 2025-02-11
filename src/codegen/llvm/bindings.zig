@@ -51,6 +51,11 @@ pub const Context = opaque {
 pub const Module = opaque {
     pub const dispose = LLVMDisposeModule;
     extern fn LLVMDisposeModule(*Module) void;
+
+    pub fn split(M: *Module, out_modules: []*Module) void {
+        ZigLLVMSplitModule(M, @intCast(out_modules.len), out_modules.ptr);
+    }
+    extern fn ZigLLVMSplitModule(M: *Module, N: c_uint, out_modules: [*]*Module) void;
 };
 
 pub const disposeMessage = LLVMDisposeMessage;

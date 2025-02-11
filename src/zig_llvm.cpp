@@ -227,33 +227,15 @@ static AddressSanitizerOptions getAsanOptions(void) {
     return o;
 }
 
-ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile_inner(LLVMTargetMachineRef targ_machine_ref, LLVMModuleRef module_ref,
-    char **error_message, const ZigLLVMEmitOptions *options);
-ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machine_ref, LLVMModuleRef module_ref,
-    char **error_message, const ZigLLVMEmitOptions *options)
-{
-    // void SplitModule(
-    //     Module &M, unsigned N,
-    //     function_ref<void(std::unique_ptr<Module> MPart)> ModuleCallback,
-    //     bool PreserveLocals = false, bool RoundRobin = false);
- 
-    // this code is to emit llvm bytecode
- 
-    if (getenv("ZIG_MULTITHREAD_EMIT")) {
-        // TODO: we need to split the output files
-        bool result = false;
-        SplitModule(*(llvm::Module*)module_ref, 12, [&](std::unique_ptr<Module> MPart) {
-            if (ZigLLVMTargetMachineEmitToFile_inner(targ_machine_ref, (LLVMModuleRef)MPart.get(), error_message, options)) {
-                result = true;
-            }
-        });
-        return result;
-    }else{
-        return ZigLLVMTargetMachineEmitToFile_inner(targ_machine_ref, module_ref, error_message, options);
-    }
+ZIG_EXTERN_C void ZigLLVMSplitModule(llvm::Module *module_ref, unsigned N, llvm::Module **out_modules) {
+    int i = 0;
+    SplitModule(*module_ref, N, [&](std::unique_ptr<Module> MPart) {
+        out_modules[i] = MPart.release();
+        i++;
+    });
 }
 
-ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile_inner(LLVMTargetMachineRef targ_machine_ref, LLVMModuleRef module_ref,
+ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machine_ref, LLVMModuleRef module_ref,
     char **error_message, const ZigLLVMEmitOptions *options)
 {
 

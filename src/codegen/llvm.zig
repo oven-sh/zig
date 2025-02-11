@@ -1309,6 +1309,51 @@ pub const Object = struct {
         else
             .Soft;
 
+        if (comp.llvm_opt_bisect_limit >= 0) {
+            context.setOptBisectLimit(comp.llvm_opt_bisect_limit);
+        }
+
+        var split_buf: [32]*llvm.Module = undefined;
+        const split_res = if (std.c.getenv("ZIG_MULTITHREAD_EMIT")) |memit| blk: {
+            const count = std.fmt.parseInt(usize, std.mem.span(memit), 10) catch @panic("ZIG_MULTITHREAD_EMIT must be a number");
+            if (count > split_buf.len) @panic("ZIG_MULTITHREAD_EMIT must be less than 32");
+            if (count <= 0) @panic("ZIG_MULTITHREAD_EMIT must be greater than 0");
+            break :blk split_buf[0..count];
+        } else split_buf[0..1];
+        if (split_res.len > 1) module.split(split_res) else split_res[0] = module;
+
+        var threads: [32]std.Thread = undefined;
+        for (split_res, threads[0..split_res.len], 0..) |m, *t, i| {
+            t.* = std.Thread.spawn(.{}, emit_thread, .{
+                target,
+                target_triple_sentinel,
+                comp,
+                opt_level,
+                reloc_mode,
+                code_model,
+                float_abi,
+                m,
+                &options,
+                i,
+            }) catch @panic("thread spawn fail");
+        }
+        for (threads[0..split_res.len]) |*t| {
+            t.join();
+        }
+    }
+    fn emit_thread(
+        target: *llvm.Target,
+        target_triple_sentinel: [:0]const u8,
+        comp: *Compilation,
+        opt_level: llvm.CodeGenOptLevel,
+        reloc_mode: llvm.RelocMode,
+        code_model: llvm.CodeModel,
+        float_abi: llvm.TargetMachine.FloatABI,
+        module: *llvm.Module,
+        options: *const EmitOptions,
+        index: usize,
+    ) void {
+        var error_message: [*:0]const u8 = undefined;
         var target_machine = llvm.TargetMachine.create(
             target,
             target_triple_sentinel,
@@ -1324,13 +1369,6 @@ pub const Object = struct {
         );
         errdefer target_machine.dispose();
 
-        if (comp.llvm_opt_bisect_limit >= 0) {
-            context.setOptBisectLimit(comp.llvm_opt_bisect_limit);
-        }
-
-        // Unfortunately, LLVM shits the bed when we ask for both binary and assembly.
-        // So we call the entire pipeline multiple times if this is requested.
-        // var error_message: [*:0]const u8 = undefined;
         var lowered_options: llvm.TargetMachine.EmitOptions = .{
             .is_debug = options.is_debug,
             .is_small = options.is_small,
@@ -1371,12 +1409,31 @@ pub const Object = struct {
                 .CollectControlFlow = false,
             },
         };
-        if (options.asm_path != null and options.bin_path != null) {
+        if (index != 0) {
+            if (lowered_options.bin_filename) |lbf| {
+                lowered_options.bin_filename = (std.fmt.allocPrintZ(std.heap.c_allocator, "{d}_{s}", .{ index, std.mem.span(lbf) }) catch @panic("oom")).ptr;
+            }
+            if (lowered_options.llvm_ir_filename) |lbf| {
+                lowered_options.llvm_ir_filename = (std.fmt.allocPrintZ(std.heap.c_allocator, "{d}_{s}", .{ index, std.mem.span(lbf) }) catch @panic("oom")).ptr;
+            }
+            if (lowered_options.asm_filename) |lbf| {
+                lowered_options.asm_filename = (std.fmt.allocPrintZ(std.heap.c_allocator, "{d}_{s}", .{ index, std.mem.span(lbf) }) catch @panic("oom")).ptr;
+            }
+            if (lowered_options.bitcode_filename) |lbf| {
+                lowered_options.bitcode_filename = (std.fmt.allocPrintZ(std.heap.c_allocator, "{d}_{s}", .{ index, std.mem.span(lbf) }) catch @panic("oom")).ptr;
+            }
+        }
+
+        // Unfortunately, LLVM shits the bed when we ask for both binary and assembly.
+        // So we call the entire pipeline multiple times if this is requested.
+        if (lowered_options.asm_filename != null and lowered_options.bin_filename != null) {
             if (target_machine.emitToFile(module, &error_message, &lowered_options)) {
                 defer llvm.disposeMessage(error_message);
-                return diags.fail("LLVM failed to emit bin={s} ir={s}: {s}", .{
-                    emit_bin_msg, post_llvm_ir_msg, error_message,
-                });
+                std.debug.panic("emit fail: {s}\n", .{std.mem.span(error_message)});
+                // defer llvm.disposeMessage(error_message);
+                // return diags.fail("LLVM failed to emit bin={s} ir={s}: {s}", .{
+                //     emit_bin_msg, post_llvm_ir_msg, error_message,
+                // });
             }
             lowered_options.bin_filename = null;
             lowered_options.llvm_ir_filename = null;
@@ -1385,9 +1442,10 @@ pub const Object = struct {
         lowered_options.asm_filename = options.asm_path;
         if (target_machine.emitToFile(module, &error_message, &lowered_options)) {
             defer llvm.disposeMessage(error_message);
-            return diags.fail("LLVM failed to emit asm={s} bin={s} ir={s} bc={s}: {s}", .{
-                emit_asm_msg, emit_bin_msg, post_llvm_ir_msg, post_llvm_bc_msg, error_message,
-            });
+            std.debug.panic("emit fail: {s}\n", .{std.mem.span(error_message)});
+            // return diags.fail("LLVM failed to emit asm={s} bin={s} ir={s} bc={s}: {s}", .{
+            //     emit_asm_msg, emit_bin_msg, post_llvm_ir_msg, post_llvm_bc_msg, error_message,
+            // });
         }
     }
 
