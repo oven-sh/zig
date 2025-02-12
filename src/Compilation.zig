@@ -2752,6 +2752,7 @@ pub fn emitLlvmObject(
         .sanitize_address = comp.config.any_sanitize_address,
         .fuzz = comp.config.any_fuzz,
         .lto = comp.config.lto,
+        .prog_node = sub_prog_node,
     });
 }
 

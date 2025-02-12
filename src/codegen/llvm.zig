@@ -1058,6 +1058,8 @@ pub const Object = struct {
         sanitize_address: bool,
         fuzz: bool,
         lto: Compilation.Config.LtoMode,
+
+        prog_node: std.Progress.Node,
     };
 
     pub fn emit(o: *Object, options: EmitOptions) error{ LinkFailure, OutOfMemory }!void {
@@ -1320,7 +1322,15 @@ pub const Object = struct {
             if (count <= 0) @panic("ZIG_MULTITHREAD_EMIT must be greater than 0");
             break :blk split_buf[0..count];
         } else split_buf[0..1];
-        if (split_res.len > 1) module.split(split_res) else split_res[0] = module;
+        if (split_res.len > 1) {
+            const sub = options.prog_node.start("Split Module", 1);
+            defer sub.end();
+
+            module.split(split_res);
+        } else split_res[0] = module;
+
+        const sub = options.prog_node.start("Do Emit", split_res.len);
+        defer sub.end();
 
         var threads: [32]std.Thread = undefined;
         for (split_res, threads[0..split_res.len], 0..) |m, *t, i| {
@@ -1335,10 +1345,17 @@ pub const Object = struct {
                 m,
                 &options,
                 i,
+                sub,
             }) catch @panic("thread spawn fail");
         }
         for (threads[0..split_res.len]) |*t| {
             t.join();
+        }
+
+        // done!
+        if (split_res.len > 1) {
+            std.log.err("LLVM SPLIT EMIT ENDED. EARLY-EXITING.", .{});
+            std.process.exit(0);
         }
     }
     fn emit_thread(
@@ -1352,7 +1369,10 @@ pub const Object = struct {
         module: *llvm.Module,
         options: *const EmitOptions,
         index: usize,
+        prog_node: std.Progress.Node,
     ) void {
+        defer prog_node.completeOne();
+
         var error_message: [*:0]const u8 = undefined;
         var target_machine = llvm.TargetMachine.create(
             target,
