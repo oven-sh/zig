@@ -7,6 +7,7 @@ on:
       - llvm19
       - 014-dev
       - actions-test
+      - actions-test-2
 concurrency:
   # Cancels pending runs when a PR gets updated.
   group: ${{ github.head_ref || github.run_id }}-${{ github.actor }}
@@ -25,14 +26,12 @@ jobs:
           - x86_64-windows-gnu
           - aarch64-macos-none
           - aarch64-linux-musl
-        release_flag: ["Doptimize=ReleaseFast"]
-        strip_flag: ["Dstrip"]
-        name_append: [""]
+        safe: [false]
         include:
           - target: aarch64-macos-none
-            release_flag: "Doptimize=ReleaseSafe"
-            strip_flag: "Ddebug-extensions"
-            name_append: "-ReleaseSafe"
+            safe: true
+          - target: x86_64-linux-musl
+            safe: true
     steps:
       - run: sudo apt-get install -y ninja-build
       - uses: actions/checkout@v4
@@ -44,14 +43,14 @@ jobs:
         with:
           path: zig
       - run: sed -i 's/ZIG_VERSION="0.14.0-dev.2257+e6d2e1641"/ZIG_VERSION="0.14.0"/' build
-      - run: sed -i 's/Doptimize=ReleaseFast/${{ matrix.release_flag }}/' build
-      - run: sed -i 's/Dstrip/${{ matrix.strip_flag }}/' build
+      - run: sed -i 's/Doptimize=ReleaseFast/${{ matrix.safe && "Doptimize=ReleaseSafe" || "Doptimize=ReleaseFast" }}/' build
+      - run: sed -i 's/Dstrip/${{ matrix.safe && "Ddebug-extensions" || "Dstrip" }}/' build
       - run: sed -i 's/max_rss = 7_800_000_000/max_rss = 9_000_000_000/' zig/build.zig
       - run: cat build
       - run: CMAKE_GENERATOR=Ninja ./build ${{ matrix.target }} baseline
       - uses: actions/upload-artifact@v4
         with:
-          name: bootstrap-${{ matrix.target }}${{ matrix.name_append }}
+          name: bootstrap-${{ matrix.target }}${{ matrix.safe && "-ReleaseSafe" || "" }}
           path: out/zig-${{ matrix.target }}-baseline
   release:
     needs: build
@@ -72,6 +71,7 @@ jobs:
           chmod +x bootstrap-aarch64-macos-none/zig
           chmod +x bootstrap-aarch64-macos-none-ReleaseSafe/zig
           chmod +x bootstrap-aarch64-linux-musl/zig
+          chmod +x bootstrap-aarch64-linux-musl-ReleaseSafe/zig
       - name: Build ZLS
         run: |
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos-none --prefix . --prefix-exe-dir ./bootstrap-x86_64-macos-none &
@@ -80,11 +80,13 @@ jobs:
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos-none --prefix . --prefix-exe-dir ./bootstrap-aarch64-macos-none &
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos-none --prefix . --prefix-exe-dir ./bootstrap-aarch64-macos-none-ReleaseSafe &
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl --prefix . --prefix-exe-dir ./bootstrap-aarch64-linux-musl &
+          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl --prefix . --prefix-exe-dir ./bootstrap-aarch64-linux-musl-ReleaseSafe &
           wait
       - name: Compress artifacts
         run: |
           zip -r bootstrap-x86_64-macos-none.zip bootstrap-x86_64-macos-none &
           zip -r bootstrap-x86_64-linux-musl.zip bootstrap-x86_64-linux-musl &
+          zip -r bootstrap-x86_64-linux-musl-ReleaseSafe.zip bootstrap-x86_64-linux-musl-ReleaseSafe &
           zip -r bootstrap-x86_64-windows-gnu.zip bootstrap-x86_64-windows-gnu &
           zip -r bootstrap-aarch64-macos-none.zip bootstrap-aarch64-macos-none &
           zip -r bootstrap-aarch64-macos-none-ReleaseSafe.zip bootstrap-aarch64-macos-none-ReleaseSafe &
@@ -99,6 +101,7 @@ jobs:
           files: |
             bootstrap-x86_64-macos-none.zip
             bootstrap-x86_64-linux-musl.zip
+            bootstrap-x86_64-linux-musl-ReleaseSafe.zip
             bootstrap-x86_64-windows-gnu.zip
             bootstrap-aarch64-macos-none.zip
             bootstrap-aarch64-macos-none-ReleaseSafe.zip
