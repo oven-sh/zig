@@ -41,8 +41,8 @@ jobs:
         with:
           path: zig
       - run: sed -i 's/ZIG_VERSION="0.14.0-dev.2257+e6d2e1641"/ZIG_VERSION="0.14.0"/' build
-      - run: sed -i 's/Doptimize=ReleaseFast/${{ matrix.safe && "Doptimize=ReleaseSafe" || "Doptimize=ReleaseFast" }}/' build
-      - run: sed -i 's/Dstrip/${{ matrix.safe && "Ddebug-extensions" || "Dstrip" }}/' build
+      - run: sed -i 's/Doptimize=ReleaseFast/${{ matrix.safe == "true" && "Doptimize=ReleaseSafe" || "Doptimize=ReleaseFast" }}/' build
+      - run: sed -i 's/Dstrip/${{ matrix.safe == "true" && "Ddebug-extensions" || "Dstrip" }}/' build
       - run: sed -i 's/max_rss = 7_800_000_000/max_rss = 9_000_000_000/' zig/build.zig
       - run: cat build
       - run: CMAKE_GENERATOR=Ninja ./build ${{ matrix.target }} baseline
