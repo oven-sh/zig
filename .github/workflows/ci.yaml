@@ -41,14 +41,17 @@ jobs:
         with:
           path: zig
       - run: sed -i 's/ZIG_VERSION="0.14.0-dev.2257+e6d2e1641"/ZIG_VERSION="0.14.0"/' build
-      - run: sed -i 's/Doptimize=ReleaseFast/${{ matrix.safe == "true" && "Doptimize=ReleaseSafe" || "Doptimize=ReleaseFast" }}/' build
-      - run: sed -i 's/Dstrip/${{ matrix.safe == "true" && "Ddebug-extensions" || "Dstrip" }}/' build
+      - run: sed -i 's/Doptimize=ReleaseFast/Doptimize=ReleaseSafe/' build
+        if: matrix.safe == "true"
+      - run: sed -i 's/Dstrip/Ddebug-extensions/' build
+        if: matrix.safe == "true"
       - run: sed -i 's/max_rss = 7_800_000_000/max_rss = 9_000_000_000/' zig/build.zig
+        if: matrix.safe == "true"
       - run: cat build
       - run: CMAKE_GENERATOR=Ninja ./build ${{ matrix.target }} baseline
       - uses: actions/upload-artifact@v4
         with:
-          name: bootstrap-${{ matrix.target }}${{ matrix.safe && "-ReleaseSafe" || "" }}
+          name: bootstrap-${{ matrix.target }}${{ matrix.safe == "true" && "-ReleaseSafe" || "" }}
           path: out/zig-${{ matrix.target }}-baseline
   release:
     needs: build
