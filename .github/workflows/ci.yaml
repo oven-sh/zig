@@ -3,11 +3,7 @@ on:
   pull_request:
   push:
     branches:
-      - master
-      - llvm19
       - 014-dev
-      - actions-test
-      - actions-test-2
 concurrency:
   group: ${{ github.head_ref || github.run_id }}-${{ github.actor }}
   cancel-in-progress: true
