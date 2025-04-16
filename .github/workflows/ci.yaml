@@ -51,7 +51,7 @@ jobs:
       - run: CMAKE_GENERATOR=Ninja ./build ${{ matrix.target }} baseline
       - uses: actions/upload-artifact@v4
         with:
-          name: bootstrap-${{ matrix.target }}${{ matrix.safe == "true" && "-ReleaseSafe" || "" }}
+          name: bootstrap-${{ matrix.target }}${{ matrix.safe == 'true' && '-ReleaseSafe' || '' }}
           path: out/zig-${{ matrix.target }}-baseline
   release:
     needs: build
