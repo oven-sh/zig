@@ -24,12 +24,12 @@ jobs:
           - x86_64-windows-gnu
           - aarch64-macos-none
           - aarch64-linux-musl
-        safe: [false]
+        safe: ["false"]
         include:
           - target: aarch64-macos-none
-            safe: true
+            safe: "true"
           - target: x86_64-linux-musl
-            safe: true
+            safe: "true"
     steps:
       - run: sudo apt-get install -y ninja-build
       - uses: actions/checkout@v4
