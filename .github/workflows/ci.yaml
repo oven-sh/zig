@@ -20,12 +20,7 @@ jobs:
           - x86_64-windows-gnu
           - aarch64-macos-none
           - aarch64-linux-musl
-        safe: ["false"]
-        include:
-          - target: aarch64-macos-none
-            safe: "true"
-          - target: x86_64-linux-musl
-            safe: "true"
+        safe: ["false", "true"]
     steps:
       - run: sudo apt-get install -y ninja-build
       - uses: actions/checkout@v4
@@ -72,8 +67,11 @@ jobs:
       - name: Build ZLS
         run: |
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos-none --prefix . --prefix-exe-dir ./bootstrap-x86_64-macos-none &
+          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos-none --prefix . --prefix-exe-dir ./bootstrap-x86_64-macos-none-ReleaseSafe &
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix . --prefix-exe-dir ./bootstrap-x86_64-linux-musl &
+          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix . --prefix-exe-dir ./bootstrap-x86_64-linux-musl-ReleaseSafe &
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu --prefix . --prefix-exe-dir ./bootstrap-x86_64-windows-gnu &
+          ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu --prefix . --prefix-exe-dir ./bootstrap-x86_64-windows-gnu-ReleaseSafe &
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos-none --prefix . --prefix-exe-dir ./bootstrap-aarch64-macos-none &
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos-none --prefix . --prefix-exe-dir ./bootstrap-aarch64-macos-none-ReleaseSafe &
           ./bootstrap-x86_64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl --prefix . --prefix-exe-dir ./bootstrap-aarch64-linux-musl &
@@ -82,12 +80,15 @@ jobs:
       - name: Compress artifacts
         run: |
           zip -r bootstrap-x86_64-macos-none.zip bootstrap-x86_64-macos-none &
+          zip -r bootstrap-x86_64-macos-none-ReleaseSafe.zip bootstrap-x86_64-macos-none-ReleaseSafe &
           zip -r bootstrap-x86_64-linux-musl.zip bootstrap-x86_64-linux-musl &
           zip -r bootstrap-x86_64-linux-musl-ReleaseSafe.zip bootstrap-x86_64-linux-musl-ReleaseSafe &
           zip -r bootstrap-x86_64-windows-gnu.zip bootstrap-x86_64-windows-gnu &
+          zip -r bootstrap-x86_64-windows-gnu-ReleaseSafe.zip bootstrap-x86_64-windows-gnu-ReleaseSafe &
           zip -r bootstrap-aarch64-macos-none.zip bootstrap-aarch64-macos-none &
           zip -r bootstrap-aarch64-macos-none-ReleaseSafe.zip bootstrap-aarch64-macos-none-ReleaseSafe &
           zip -r bootstrap-aarch64-linux-musl.zip bootstrap-aarch64-linux-musl &
+          zip -r bootstrap-aarch64-linux-musl-ReleaseSafe.zip bootstrap-aarch64-linux-musl-ReleaseSafe &
           wait
       - name: Release
         uses: softprops/action-gh-release@v1
@@ -97,9 +98,12 @@ jobs:
           tag_name: "autobuild-${{github.sha}}"
           files: |
             bootstrap-x86_64-macos-none.zip
+            bootstrap-x86_64-macos-none-ReleaseSafe.zip
             bootstrap-x86_64-linux-musl.zip
             bootstrap-x86_64-linux-musl-ReleaseSafe.zip
             bootstrap-x86_64-windows-gnu.zip
+            bootstrap-x86_64-windows-gnu-ReleaseSafe.zip
             bootstrap-aarch64-macos-none.zip
             bootstrap-aarch64-macos-none-ReleaseSafe.zip
             bootstrap-aarch64-linux-musl.zip
+            bootstrap-aarch64-linux-musl-ReleaseSafe.zip
