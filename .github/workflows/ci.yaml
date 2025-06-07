@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - 014-dev
+      - pfg/update-zig-6
 concurrency:
   group: ${{ github.head_ref || github.run_id }}-${{ github.actor }}
   cancel-in-progress: true
