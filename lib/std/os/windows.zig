@@ -676,6 +676,7 @@ pub fn WriteFile(
             .INVALID_HANDLE => return error.NotOpenForWriting,
             .LOCK_VIOLATION => return error.LockViolation,
             .NETNAME_DELETED => return error.ConnectionResetByPeer,
+            .WORKING_SET_QUOTA => return error.SystemResources,
             else => |err| return unexpectedError(err),
         }
     }
@@ -1897,6 +1898,7 @@ pub fn CreateProcessW(
         switch (GetLastError()) {
             .FILE_NOT_FOUND => return error.FileNotFound,
             .PATH_NOT_FOUND => return error.FileNotFound,
+            .DIRECTORY => return error.FileNotFound,
             .ACCESS_DENIED => return error.AccessDenied,
             .INVALID_PARAMETER => return error.BadPathName,
             .INVALID_NAME => return error.InvalidName,
@@ -5229,6 +5231,9 @@ pub const PF = enum(DWORD) {
 
     /// This ARM processor implements the ARM v8.3 JavaScript conversion (JSCVT) instructions.
     ARM_V83_JSCVT_INSTRUCTIONS_AVAILABLE = 44,
+
+    /// This Arm processor implements the Arm v8.3 LRCPC instructions (for example, LDAPR). Note that certain Arm v8.2 CPUs may optionally support the LRCPC instructions.
+    ARM_V83_LRCPC_INSTRUCTIONS_AVAILABLE,
 };
 
 pub const MAX_WOW64_SHARED_ENTRIES = 16;
