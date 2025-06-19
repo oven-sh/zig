@@ -32,6 +32,7 @@ any_non_single_threaded: bool,
 /// per-Module setting.
 any_error_tracing: bool,
 any_sanitize_thread: bool,
+any_sanitize_address: bool,
 any_sanitize_c: std.zig.SanitizeC,
 any_fuzz: bool,
 pie: bool,
@@ -86,6 +87,7 @@ pub const Options = struct {
     ensure_libcpp_on_non_freestanding: bool = false,
     any_non_single_threaded: bool = false,
     any_sanitize_thread: bool = false,
+    any_sanitize_address: bool = false,
     any_sanitize_c: std.zig.SanitizeC = .off,
     any_fuzz: bool = false,
     any_unwind_tables: bool = false,
@@ -129,6 +131,7 @@ pub const ResolveError = error{
     LldCannotIncrementallyLink,
     LtoRequiresLld,
     SanitizeThreadRequiresLibCpp,
+    SanitizeAddressRequiresLibCpp,
     LibCRequiresLibUnwind,
     LibCppRequiresLibUnwind,
     OsRequiresLibC,
@@ -142,6 +145,7 @@ pub const ResolveError = error{
     DynamicLibraryPrecludesPie,
     TargetRequiresPie,
     SanitizeThreadRequiresPie,
+    SanitizeAddressRequiresPie,
     BackendLacksErrorTracing,
     LlvmLibraryUnavailable,
     LldUnavailable,
@@ -208,6 +212,11 @@ pub fn resolve(options: Options) ResolveError!Config {
         if (options.any_sanitize_thread) {
             // TSAN is (for now...) implemented in C++ so it requires linking libc++.
             if (options.link_libcpp == false) return error.SanitizeThreadRequiresLibCpp;
+            break :b true;
+        }
+        if (options.any_sanitize_address) {
+            // ASAN is (for now...) implemented in C++ so it requires linking libc++.
+            if (options.link_libcpp == false) return error.SanitizeAddressRequiresLibCpp;
             break :b true;
         }
         if (options.ensure_libcpp_on_non_freestanding and target.os.tag != .freestanding)
@@ -334,6 +343,10 @@ pub fn resolve(options: Options) ResolveError!Config {
         }
         if (options.any_sanitize_thread) {
             if (options.pie == false) return error.SanitizeThreadRequiresPie;
+            break :b true;
+        }
+        if (options.any_sanitize_address) {
+            if (options.pie == false) return error.SanitizeAddressRequiresPie;
             break :b true;
         }
         if (options.pie) |pie| break :b pie;
@@ -525,6 +538,7 @@ pub fn resolve(options: Options) ResolveError!Config {
         .any_non_single_threaded = options.any_non_single_threaded,
         .any_error_tracing = any_error_tracing,
         .any_sanitize_thread = options.any_sanitize_thread,
+        .any_sanitize_address = options.any_sanitize_address,
         .any_sanitize_c = options.any_sanitize_c,
         .any_fuzz = options.any_fuzz,
         .san_cov_trace_pc_guard = options.san_cov_trace_pc_guard,

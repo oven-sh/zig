@@ -68,6 +68,7 @@ struct ZigLLVMEmitOptions {
     bool is_small;
     bool time_report;
     bool tsan;
+    bool asan;
     bool sancov;
     ZigLLVMThinOrFullLTOPhase lto;
     bool allow_fast_isel;

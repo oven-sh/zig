@@ -147,6 +147,8 @@ pub inline fn rawFree(a: Allocator, memory: []u8, alignment: Alignment, ret_addr
     return a.vtable.free(a.ptr, memory, alignment, ret_addr);
 }
 
+const bun_heap_breakdown = @hasDecl(@import("root"), "bun") and @import("root").bun.heap_breakdown.enabled;
+
 /// Returns a pointer to undefined memory.
 /// Call `destroy` with the result to free the memory.
 pub fn create(a: Allocator, comptime T: type) Error!*T {
@@ -164,6 +166,7 @@ pub fn destroy(self: Allocator, ptr: anytype) void {
     const info = @typeInfo(@TypeOf(ptr)).pointer;
     if (info.size != .one) @compileError("ptr must be a single item pointer");
     const T = info.child;
+
     if (@sizeOf(T) == 0) return;
     const non_const_ptr = @as([*]u8, @ptrCast(@constCast(ptr)));
     self.rawFree(non_const_ptr[0..@sizeOf(T)], .fromByteUnits(info.alignment), @returnAddress());
