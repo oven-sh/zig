@@ -802,6 +802,8 @@ pub const ObjectOptions = struct {
     /// Deprecated; prefer populating `root_module`.
     sanitize_thread: ?bool = null,
     /// Deprecated; prefer populating `root_module`.
+    sanitize_address: ?bool = null,
+    /// Deprecated; prefer populating `root_module`.
     error_tracing: ?bool = null,
 };
 
@@ -822,6 +824,7 @@ pub fn addObject(b: *Build, options: ObjectOptions) *Step.Compile {
             .unwind_tables = options.unwind_tables,
             .omit_frame_pointer = options.omit_frame_pointer,
             .sanitize_thread = options.sanitize_thread,
+            .sanitize_address = options.sanitize_address,
             .error_tracing = options.error_tracing,
             .code_model = options.code_model,
         }),

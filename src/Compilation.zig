@@ -3094,6 +3094,7 @@ fn flush(
                 .is_small = comp.root_mod.optimize_mode == .ReleaseSmall,
                 .time_report = comp.time_report,
                 .sanitize_thread = comp.config.any_sanitize_thread,
+                .sanitize_address = comp.config.any_sanitize_address,
                 .fuzz = comp.config.any_fuzz,
                 .lto = comp.config.lto,
             });
