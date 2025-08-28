@@ -28567,20 +28567,7 @@ fn structFieldPtr(
     const field_index = struct_type.nameIndex(ip, field_name) orelse
         return sema.failWithBadStructFieldAccess(block, struct_ty, struct_type, field_name_src, field_name);
 
-    const field_name_slice = field_name.toSlice(ip);
-    if (std.mem.startsWith(u8, field_name_slice, "#")) {
-        // Get the file scope of the struct
-        const struct_namespace = struct_ty.getNamespace(zcu).unwrap().?;
-        const struct_file_scope = zcu.namespacePtr(struct_namespace).file_scope;
-
-        // Get the current file scope
-        const current_file_scope = block.getFileScopeIndex(zcu);
-
-        // If not in the same file, deny access
-        if (struct_file_scope != current_file_scope) {
-            return sema.fail(block, field_name_src, "field '{}' is private and cannot be accessed outside its defining file", .{field_name.fmt(ip)});
-        }
-    }
+    try ensureFieldVisible(sema, block, field_name, field_name_src, struct_ty);
 
     return sema.structFieldPtrByIndex(block, src, struct_ptr, field_index, struct_ty);
 }
@@ -28675,6 +28662,34 @@ fn structFieldPtrByIndex(
     return block.addStructFieldPtr(struct_ptr, field_index, ptr_field_ty);
 }
 
+fn ensureFieldVisible(
+    sema: *Sema,
+    block: *Block,
+    field_name: InternPool.NullTerminatedString,
+    field_name_src: LazySrcLoc,
+    struct_ty: Type,
+) CompileError!void {
+    const pt = sema.pt;
+    const zcu = pt.zcu;
+    const ip = &zcu.intern_pool;
+
+    // Check if field is private (starts with '#')
+    const field_name_slice = field_name.toSlice(ip);
+    if (std.mem.startsWith(u8, field_name_slice, "#")) {
+        // Get the file scope of the struct
+        const struct_namespace = struct_ty.getNamespace(zcu).unwrap().?;
+        const struct_file_scope = zcu.namespacePtr(struct_namespace).file_scope;
+
+        // Get the current file scope
+        const current_file_scope = block.getFileScopeIndex(zcu);
+
+        // If not in the same file, deny access
+        if (struct_file_scope != current_file_scope) {
+            return sema.fail(block, field_name_src, "field '{}' is private and cannot be accessed outside its defining file", .{field_name.fmt(ip)});
+        }
+    }
+}
+
 fn structFieldVal(
     sema: *Sema,
     block: *Block,
@@ -28697,21 +28712,7 @@ fn structFieldVal(
             const field_index = struct_type.nameIndex(ip, field_name) orelse
                 return sema.failWithBadStructFieldAccess(block, struct_ty, struct_type, field_name_src, field_name);
 
-            // Check if field is private (starts with '#')
-            const field_name_slice = field_name.toSlice(ip);
-            if (std.mem.startsWith(u8, field_name_slice, "#")) {
-                // Get the file scope of the struct
-                const struct_namespace = struct_ty.getNamespace(zcu).unwrap().?;
-                const struct_file_scope = zcu.namespacePtr(struct_namespace).file_scope;
-
-                // Get the current file scope
-                const current_file_scope = block.getFileScopeIndex(zcu);
-
-                // If not in the same file, deny access
-                if (struct_file_scope != current_file_scope) {
-                    return sema.fail(block, field_name_src, "field '{}' is private and cannot be accessed outside its defining file", .{field_name.fmt(ip)});
-                }
-            }
+            try ensureFieldVisible(sema, block, field_name, field_name_src, struct_ty);
 
             if (struct_type.fieldIsComptime(ip, field_index)) {
                 try struct_ty.resolveStructFieldInits(pt);
