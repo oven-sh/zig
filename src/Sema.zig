@@ -18764,15 +18764,36 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ai
                     .struct_type => ip.loadStructType(ty.toIntern()),
                     else => unreachable,
                 };
-                struct_field_vals = try gpa.alloc(InternPool.Index, struct_type.field_types.len);
 
-                try ty.resolveStructFieldInits(pt);
-
-                for (struct_field_vals, 0..) |*field_val, field_index| {
+                // Count non-private fields first
+                var non_private_field_count: u32 = 0;
+                for (0..struct_type.field_types.len) |field_index| {
                     const field_name = if (struct_type.fieldName(ip, field_index).unwrap()) |field_name|
                         field_name
                     else
                         try ip.getOrPutStringFmt(gpa, pt.tid, "{d}", .{field_index}, .no_embedded_nulls);
+                    const field_name_slice = field_name.toSlice(ip);
+                    if (!fieldNameIsPrivate(field_name_slice)) {
+                        non_private_field_count += 1;
+                    }
+                }
+
+                struct_field_vals = try gpa.alloc(InternPool.Index, non_private_field_count);
+
+                try ty.resolveStructFieldInits(pt);
+
+                var output_field_index: u32 = 0;
+                for (0..struct_type.field_types.len) |field_index| {
+                    const field_name = if (struct_type.fieldName(ip, field_index).unwrap()) |field_name|
+                        field_name
+                    else
+                        try ip.getOrPutStringFmt(gpa, pt.tid, "{d}", .{field_index}, .no_embedded_nulls);
+                    const field_name_slice = field_name.toSlice(ip);
+
+                    // Skip private fields (those starting with '#')
+                    if (fieldNameIsPrivate(field_name_slice)) continue;
+
+                    const field_val = &struct_field_vals[output_field_index];
                     const field_name_len = field_name.length(ip);
                     const field_ty = Type.fromInterned(struct_type.field_types.get(ip)[field_index]);
                     const field_init = struct_type.fieldInit(ip, field_index);
@@ -18828,6 +18849,8 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ai
                         .ty = struct_field_ty.toIntern(),
                         .storage = .{ .elems = &struct_field_fields },
                     } });
+
+                    output_field_index += 1;
                 }
             }
 
@@ -28662,6 +28685,9 @@ fn structFieldPtrByIndex(
     return block.addStructFieldPtr(struct_ptr, field_index, ptr_field_ty);
 }
 
+fn fieldNameIsPrivate(field_name: []const u8) bool {
+    return field_name.len > 0 and field_name[0] == '#';
+}
 fn ensureFieldVisible(
     sema: *Sema,
     block: *Block,
@@ -28675,18 +28701,18 @@ fn ensureFieldVisible(
 
     // Check if field is private (starts with '#')
     const field_name_slice = field_name.toSlice(ip);
-    if (std.mem.startsWith(u8, field_name_slice, "#")) {
-        // Get the file scope of the struct
-        const struct_namespace = struct_ty.getNamespace(zcu).unwrap().?;
-        const struct_file_scope = zcu.namespacePtr(struct_namespace).file_scope;
+    if (!fieldNameIsPrivate(field_name_slice)) return;
 
-        // Get the current file scope
-        const current_file_scope = block.getFileScopeIndex(zcu);
+    // Get the file scope of the struct
+    const struct_namespace = struct_ty.getNamespace(zcu).unwrap().?;
+    const struct_file_scope = zcu.namespacePtr(struct_namespace).file_scope;
 
-        // If not in the same file, deny access
-        if (struct_file_scope != current_file_scope) {
-            return sema.fail(block, field_name_src, "field '{}' is private and cannot be accessed outside its defining file", .{field_name.fmt(ip)});
-        }
+    // Get the current file scope
+    const current_file_scope = block.getFileScopeIndex(zcu);
+
+    // If not in the same file, deny access
+    if (struct_file_scope != current_file_scope) {
+        return sema.fail(block, field_name_src, "field '{}' is private and cannot be accessed outside its defining file", .{field_name.fmt(ip)});
     }
 }
 
