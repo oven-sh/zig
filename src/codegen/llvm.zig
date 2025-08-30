@@ -1380,6 +1380,8 @@ pub const Object = struct {
 
             // `.coverage` value is only used when `.sancov` is enabled.
             .sancov = options.fuzz or comp.config.san_cov_trace_pc_guard,
+            .profile_arcs = comp.config.profile_arcs,
+            .test_coverage = comp.config.test_coverage,
             .coverage = .{
                 .CoverageType = .Edge,
                 // Works in tandem with Inline8bitCounters or InlineBoolFlag.

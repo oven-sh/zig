@@ -527,6 +527,8 @@ const usage_build_generic =
     \\  -fno-sanitize-thread      Disable Thread Sanitizer
     \\  -fsanitize-address         Enable Address Sanitizer
     \\  -fno-sanitize-address      Disable Address Sanitizer
+    \\  -fprofile-arcs
+    \\  -ftest-coverage
     \\  -ffuzz                    Enable fuzz testing instrumentation
     \\  -fno-fuzz                 Disable fuzz testing instrumentation
     \\  -fbuiltin                 Enable implicit builtin knowledge of functions
@@ -1489,6 +1491,12 @@ fn buildOutputType(
                         create_module.opts.san_cov_trace_pc_guard = true;
                     } else if (mem.eql(u8, arg, "-fno-sanitize-coverage-trace-pc-guard")) {
                         create_module.opts.san_cov_trace_pc_guard = false;
+                    } else if (mem.eql(u8, arg, "-fprofile-arcs")) {
+                        create_module.opts.profile_arcs = true;
+                        create_module.opts.test_coverage = true;
+                    } else if (mem.eql(u8, arg, "-ftest-coverage")) {
+                        create_module.opts.profile_arcs = true;
+                        create_module.opts.test_coverage = true;
                     } else if (mem.eql(u8, arg, "-freference-trace")) {
                         reference_trace = 256;
                     } else if (mem.startsWith(u8, arg, "-freference-trace=")) {

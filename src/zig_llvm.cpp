@@ -57,6 +57,7 @@
 #include <llvm/Transforms/Instrumentation/ThreadSanitizer.h>
 #include <llvm/Transforms/Instrumentation/AddressSanitizer.h>
 #include <llvm/Transforms/Instrumentation/SanitizerCoverage.h>
+#include <llvm/Transforms/Instrumentation/GCOVProfiler.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Utils.h>
 #include <llvm/Transforms/Utils/AddDiscriminators.h>
@@ -327,6 +328,14 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machi
 
     pass_builder.registerOptimizerEarlyEPCallback([&](ModulePassManager &module_pm, OptimizationLevel OL) {
         if (early_san) {
+            // GCOV profiling instrumentation.
+            if (options->profile_arcs || options->test_coverage) {
+                GCOVOptions GCOVOpts = GCOVOptions::getDefault();
+                GCOVOpts.EmitNotes = options->test_coverage;
+                GCOVOpts.EmitData = options->profile_arcs;
+                module_pm.addPass(GCOVProfilerPass(GCOVOpts));
+            }
+
             // Code coverage instrumentation.
             if (options->sancov) {
                 module_pm.addPass(SanitizerCoveragePass(getSanCovOptions(options->coverage)));
@@ -342,6 +351,14 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machi
 
     pass_builder.registerOptimizerLastEPCallback([&](ModulePassManager &module_pm, OptimizationLevel level) {
         if (!early_san) {
+            // GCOV profiling instrumentation.
+            if (options->profile_arcs || options->test_coverage) {
+                GCOVOptions GCOVOpts = GCOVOptions::getDefault();
+                GCOVOpts.EmitNotes = options->test_coverage;
+                GCOVOpts.EmitData = options->profile_arcs;
+                module_pm.addPass(GCOVProfilerPass(GCOVOpts));
+            }
+
             // Code coverage instrumentation.
             if (options->sancov) {
                 module_pm.addPass(SanitizerCoveragePass(getSanCovOptions(options->coverage)));

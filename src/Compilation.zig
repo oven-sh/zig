@@ -1433,6 +1433,8 @@ pub fn create(gpa: Allocator, arena: Allocator, options: CreateOptions) !*Compil
         cache.hash.addBytes(options.root_name);
         cache.hash.add(options.config.wasi_exec_model);
         cache.hash.add(options.config.san_cov_trace_pc_guard);
+        cache.hash.add(options.config.profile_arcs);
+        cache.hash.add(options.config.test_coverage);
         cache.hash.add(options.debug_compiler_runtime_libs);
         // TODO audit this and make sure everything is in it
 
@@ -6090,6 +6092,12 @@ pub fn addCCArgs(
 
                 if (comp.config.san_cov_trace_pc_guard) {
                     try argv.append("-fsanitize-coverage=trace-pc-guard");
+                }
+                if (comp.config.profile_arcs) {
+                    try argv.append("-fprofile-arcs");
+                }
+                if (comp.config.test_coverage) {
+                    try argv.append("-ftest-coverage");
                 }
             }
 

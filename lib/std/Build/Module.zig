@@ -32,6 +32,8 @@ pic: ?bool,
 red_zone: ?bool,
 omit_frame_pointer: ?bool,
 error_tracing: ?bool,
+profile_arcs: ?bool,
+test_coverage: ?bool,
 link_libc: ?bool,
 link_libcpp: ?bool,
 
@@ -266,6 +268,12 @@ pub const CreateOptions = struct {
     /// more difficult to obtain stack traces. Has target-dependent effects.
     omit_frame_pointer: ?bool = null,
     error_tracing: ?bool = null,
+    /// Generate code to update profiling arc counts. Used together with `test_coverage`
+    /// for GCOV-style coverage instrumentation (equivalent to -fprofile-arcs).
+    profile_arcs: ?bool = null,
+    /// Generate code to update coverage test counters. Used together with `profile_arcs`
+    /// for GCOV-style coverage instrumentation (equivalent to -ftest-coverage).
+    test_coverage: ?bool = null,
 };
 
 pub const Import = struct {
@@ -312,6 +320,8 @@ pub fn init(
                 .red_zone = options.red_zone,
                 .omit_frame_pointer = options.omit_frame_pointer,
                 .error_tracing = options.error_tracing,
+                .profile_arcs = options.profile_arcs,
+                .test_coverage = options.test_coverage,
                 .export_symbol_names = &.{},
             };
 
@@ -560,6 +570,8 @@ pub fn appendZigProcessFlags(
     try addFlag(zig_args, m.valgrind, "-fvalgrind", "-fno-valgrind");
     try addFlag(zig_args, m.pic, "-fPIC", "-fno-PIC");
     try addFlag(zig_args, m.red_zone, "-mred-zone", "-mno-red-zone");
+    try addFlag(zig_args, m.profile_arcs, "-fprofile-arcs", "-fno-profile-arcs");
+    try addFlag(zig_args, m.test_coverage, "-ftest-coverage", "-fno-test-coverage");
 
     if (m.dwarf_format) |dwarf_format| {
         try zig_args.append(switch (dwarf_format) {

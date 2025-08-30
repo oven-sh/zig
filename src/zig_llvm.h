@@ -60,6 +60,8 @@ struct ZigLLVMEmitOptions {
     bool tsan;
     bool asan;
     bool sancov;
+    bool profile_arcs;
+    bool test_coverage;
     bool lto;
     bool allow_fast_isel;
     const char *asm_filename;
