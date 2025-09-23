@@ -211,6 +211,9 @@ libunwind_static_lib: ?CrtFile = null,
 /// Populated when we build the TSAN library. A Job to build this is placed in the queue
 /// and resolved before calling linker.flush().
 tsan_lib: ?CrtFile = null,
+/// Populated when we build the ASAN library. A Job to build this is placed in the queue
+/// and resolved before calling linker.flush().
+asan_lib: ?CrtFile = null,
 /// Populated when we build the UBSAN library. A Job to build this is placed in the queue
 /// and resolved before calling linker.flush().
 ubsan_rt_lib: ?CrtFile = null,
@@ -1408,6 +1411,7 @@ pub const MiscTask = enum {
     libcxx,
     libcxxabi,
     libtsan,
+    libasan,
     libubsan,
     libfuzzer,
     wasi_libc_crt_file,
@@ -2649,6 +2653,10 @@ pub fn create(gpa: Allocator, arena: Allocator, diag: *CreateDiagnostic, options
             }
             if (build_options.have_llvm and is_exe_or_dyn_lib and comp.config.any_sanitize_thread) {
                 comp.queued_jobs.libtsan = true;
+            }
+            if (build_options.have_llvm and is_exe_or_dyn_lib and comp.config.any_sanitize_address) {
+                // TODO: build asan automatically
+                // try comp.queueJob(.libasan);
             }
 
             switch (comp.compiler_rt_strat) {
@@ -7171,6 +7179,10 @@ pub fn addCCArgs(
                 if (mod.sanitize_thread) {
                     if (san_arg.items.len == 0) try san_arg.appendSlice(arena, prefix);
                     try san_arg.appendSlice(arena, "thread,");
+                }
+                if (mod.sanitize_address) {
+                    if (san_arg.items.len == 0) try san_arg.appendSlice(arena, prefix);
+                    try san_arg.appendSlice(arena, "address,");
                 }
                 if (mod.fuzz) {
                     if (san_arg.items.len == 0) try san_arg.appendSlice(arena, prefix);

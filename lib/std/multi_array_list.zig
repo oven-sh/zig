@@ -153,7 +153,7 @@ pub fn MultiArrayList(comptime T: type) type {
 
             /// This function is used in the debugger pretty formatters in tools/ to fetch the
             /// child field order and entry type to facilitate fancy debug printing for this type.
-            fn dbHelper(self: *Slice, child: *Elem, field: *Field, entry: *Entry) void {
+            pub fn dbHelper(self: *Slice, child: *Elem, field: *Field, entry: *Entry) void {
                 _ = self;
                 _ = child;
                 _ = field;
@@ -631,7 +631,7 @@ pub fn MultiArrayList(comptime T: type) type {
         };
         /// This function is used in the debugger pretty formatters in tools/ to fetch the
         /// child field order and entry type to facilitate fancy debug printing for this type.
-        fn dbHelper(self: *Self, child: *Elem, field: *Field, entry: *Entry) void {
+        pub fn dbHelper(self: *Self, child: *Elem, field: *Field, entry: *Entry) void {
             _ = self;
             _ = child;
             _ = field;

@@ -1,0 +1,113 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches:
+      - 014-dev
+      - pfg/update-zig-6
+concurrency:
+  group: ${{ github.head_ref || github.run_id }}-${{ github.actor }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: linux-arm64-gh
+    strategy:
+      matrix:
+        target:
+          - x86_64-macos-none
+          - x86_64-linux-musl
+          - x86_64-windows-gnu
+          - aarch64-macos-none
+          - aarch64-linux-musl
+        safe: ["false", "true"]
+    steps:
+      - run: sudo apt-get install -y ninja-build
+      - uses: actions/checkout@v4
+        with:
+          repository: ziglang/zig-bootstrap
+          ref: 03a95efaf981b9cee59af8027304c37a59d36fc0
+      - run: rm -rf zig
+      - uses: actions/checkout@v4
+        with:
+          path: zig
+      - run: sed -i 's/ZIG_VERSION="0.14.0-dev.3299+31f353cd9"/ZIG_VERSION="0.14.1"/' build
+      - run: sed -i 's/Doptimize=ReleaseFast/Doptimize=ReleaseSafe/' build
+        if: matrix.safe == 'true'
+      - run: sed -i 's/Dstrip/Ddebug-extensions/' build
+        if: matrix.safe == 'true'
+      - run: sed -i 's/max_rss = 7_800_000_000/max_rss = 9_000_000_000/' zig/build.zig
+        if: matrix.safe == 'true'
+      - run: cat build
+      - run: CMAKE_GENERATOR=Ninja ./build ${{ matrix.target }} baseline
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-${{ matrix.target }}${{ matrix.safe == 'true' && '-ReleaseSafe' || '' }}
+          path: out/zig-${{ matrix.target }}-baseline
+  release:
+    needs: build
+    permissions:
+      contents: write
+    runs-on: linux-arm64-gh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: zigtools/zls
+          ref: 3733f39c8dadfd37bb2a5487894e3ed467a5d895
+      - uses: actions/download-artifact@v4
+      - name: chmod
+        run: |
+          chmod +x bootstrap-x86_64-macos-none/zig
+          chmod +x bootstrap-x86_64-macos-none-ReleaseSafe/zig
+          chmod +x bootstrap-x86_64-linux-musl/zig
+          chmod +x bootstrap-x86_64-linux-musl-ReleaseSafe/zig
+          chmod +x bootstrap-x86_64-windows-gnu/zig.exe
+          chmod +x bootstrap-x86_64-windows-gnu-ReleaseSafe/zig.exe
+          chmod +x bootstrap-aarch64-macos-none/zig
+          chmod +x bootstrap-aarch64-macos-none-ReleaseSafe/zig
+          chmod +x bootstrap-aarch64-linux-musl/zig
+          chmod +x bootstrap-aarch64-linux-musl-ReleaseSafe/zig
+      - name: Build ZLS
+        run: |
+          ./bootstrap-aarch64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos-none --prefix . --prefix-exe-dir ./bootstrap-x86_64-macos-none &
+          ./bootstrap-aarch64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos-none --prefix . --prefix-exe-dir ./bootstrap-x86_64-macos-none-ReleaseSafe &
+          ./bootstrap-aarch64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix . --prefix-exe-dir ./bootstrap-x86_64-linux-musl &
+          ./bootstrap-aarch64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix . --prefix-exe-dir ./bootstrap-x86_64-linux-musl-ReleaseSafe &
+          ./bootstrap-aarch64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu --prefix . --prefix-exe-dir ./bootstrap-x86_64-windows-gnu &
+          ./bootstrap-aarch64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows-gnu --prefix . --prefix-exe-dir ./bootstrap-x86_64-windows-gnu-ReleaseSafe &
+          ./bootstrap-aarch64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos-none --prefix . --prefix-exe-dir ./bootstrap-aarch64-macos-none &
+          ./bootstrap-aarch64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos-none --prefix . --prefix-exe-dir ./bootstrap-aarch64-macos-none-ReleaseSafe &
+          ./bootstrap-aarch64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl --prefix . --prefix-exe-dir ./bootstrap-aarch64-linux-musl &
+          ./bootstrap-aarch64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl --prefix . --prefix-exe-dir ./bootstrap-aarch64-linux-musl-ReleaseSafe &
+          wait
+      - name: Compress artifacts
+        run: |
+          zip -r bootstrap-x86_64-macos-none.zip bootstrap-x86_64-macos-none &
+          zip -r bootstrap-x86_64-macos-none-ReleaseSafe.zip bootstrap-x86_64-macos-none-ReleaseSafe &
+          zip -r bootstrap-x86_64-linux-musl.zip bootstrap-x86_64-linux-musl &
+          zip -r bootstrap-x86_64-linux-musl-ReleaseSafe.zip bootstrap-x86_64-linux-musl-ReleaseSafe &
+          zip -r bootstrap-x86_64-windows-gnu.zip bootstrap-x86_64-windows-gnu &
+          zip -r bootstrap-x86_64-windows-gnu-ReleaseSafe.zip bootstrap-x86_64-windows-gnu-ReleaseSafe &
+          zip -r bootstrap-aarch64-macos-none.zip bootstrap-aarch64-macos-none &
+          zip -r bootstrap-aarch64-macos-none-ReleaseSafe.zip bootstrap-aarch64-macos-none-ReleaseSafe &
+          zip -r bootstrap-aarch64-linux-musl.zip bootstrap-aarch64-linux-musl &
+          zip -r bootstrap-aarch64-linux-musl-ReleaseSafe.zip bootstrap-aarch64-linux-musl-ReleaseSafe &
+          wait
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        id: release
+        with:
+          generate_release_notes: true
+          tag_name: "autobuild-${{github.sha}}"
+          files: |
+            bootstrap-x86_64-macos-none.zip
+            bootstrap-x86_64-macos-none-ReleaseSafe.zip
+            bootstrap-x86_64-linux-musl.zip
+            bootstrap-x86_64-linux-musl-ReleaseSafe.zip
+            bootstrap-x86_64-windows-gnu.zip
+            bootstrap-x86_64-windows-gnu-ReleaseSafe.zip
+            bootstrap-aarch64-macos-none.zip
+            bootstrap-aarch64-macos-none-ReleaseSafe.zip
+            bootstrap-aarch64-linux-musl.zip
+            bootstrap-aarch64-linux-musl-ReleaseSafe.zip

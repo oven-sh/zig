@@ -531,6 +531,8 @@ const usage_build_generic =
     \\  -fno-sanitize-c           Disable C undefined behavior detection in safe builds
     \\  -fsanitize-thread         Enable Thread Sanitizer
     \\  -fno-sanitize-thread      Disable Thread Sanitizer
+    \\  -fsanitize-address         Enable Address Sanitizer
+    \\  -fno-sanitize-address      Disable Address Sanitizer
     \\  -ffuzz                    Enable fuzz testing instrumentation
     \\  -fno-fuzz                 Disable fuzz testing instrumentation
     \\  -fbuiltin                 Enable implicit builtin knowledge of functions
@@ -1468,6 +1470,10 @@ fn buildOutputType(
                         mod_opts.sanitize_thread = true;
                     } else if (mem.eql(u8, arg, "-fno-sanitize-thread")) {
                         mod_opts.sanitize_thread = false;
+                    } else if (mem.eql(u8, arg, "-fsanitize-address")) {
+                        mod_opts.sanitize_address = true;
+                    } else if (mem.eql(u8, arg, "-fno-sanitize-address")) {
+                        mod_opts.sanitize_address = false;
                     } else if (mem.eql(u8, arg, "-ffuzz")) {
                         mod_opts.fuzz = true;
                     } else if (mem.eql(u8, arg, "-fno-fuzz")) {
@@ -2236,6 +2242,9 @@ fn buildOutputType(
                             } else if (mem.eql(u8, sub_arg, "thread")) {
                                 mod_opts.sanitize_thread = enable;
                                 recognized_any = true;
+                            } else if (mem.eql(u8, sub_arg, "address")) {
+                                mod_opts.sanitize_address = true;
+                                recognized_any = true;
                             } else if (mem.eql(u8, sub_arg, "fuzzer") or mem.eql(u8, sub_arg, "fuzzer-no-link")) {
                                 mod_opts.fuzz = enable;
                                 recognized_any = true;
@@ -2965,6 +2974,8 @@ fn buildOutputType(
             },
             .full => create_module.opts.any_sanitize_c = .full,
         };
+        if (mod_opts.sanitize_address == true)
+            create_module.opts.any_sanitize_address = true;
         if (mod_opts.fuzz == true)
             create_module.opts.any_fuzz = true;
         if (mod_opts.unwind_tables) |uwt| switch (uwt) {
@@ -3997,6 +4008,7 @@ fn createModule(
             error.LtoRequiresLld => fatal("LTO requires using LLD", .{}),
             error.SanitizeThreadRequiresLibCpp => fatal("thread sanitization is (for now) implemented in C++, so it requires linking libc++", .{}),
             error.LibCRequiresLibUnwind => fatal("libc of the specified target requires linking libunwind", .{}),
+            error.SanitizeAddressRequiresLibCpp => fatal("address sanitization is (for now) implemented in C++, so it requires linking libc++", .{}),
             error.LibCppRequiresLibUnwind => fatal("libc++ requires linking libunwind", .{}),
             error.OsRequiresLibC => fatal("the target OS requires using libc as the stable syscall interface", .{}),
             error.LibCppRequiresLibC => fatal("libc++ requires linking libc", .{}),
@@ -4009,6 +4021,7 @@ fn createModule(
             error.DynamicLibraryPrecludesPie => fatal("dynamic libraries cannot be position independent executables", .{}),
             error.TargetRequiresPie => fatal("the specified target requires position independent executables", .{}),
             error.SanitizeThreadRequiresPie => fatal("thread sanitization requires position independent executables", .{}),
+            error.SanitizeAddressRequiresPie => fatal("address sanitization requires position independent executables", .{}),
             error.BackendLacksErrorTracing => fatal("the selected backend has not yet implemented error return tracing", .{}),
             error.LlvmLibraryUnavailable => fatal("zig was compiled without LLVM libraries", .{}),
             error.LldUnavailable => fatal("zig was compiled without LLD libraries", .{}),
@@ -7566,6 +7579,8 @@ fn handleModArg(
         },
         .full => create_module.opts.any_sanitize_c = .full,
     };
+    if (mod_opts.sanitize_address == true)
+        create_module.opts.any_sanitize_address = true;
     if (mod_opts.fuzz == true)
         create_module.opts.any_fuzz = true;
     if (mod_opts.unwind_tables) |uwt| switch (uwt) {

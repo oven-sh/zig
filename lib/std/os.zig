@@ -120,7 +120,7 @@ pub fn getFdPath(fd: std.posix.fd_t, out_buffer: *[max_path_bytes]u8) std.posix.
             @memset(out_buffer[0..max_path_bytes], 0);
             switch (posix.errno(posix.system.fcntl(fd, posix.F.GETPATH, out_buffer))) {
                 .SUCCESS => {},
-                .BADF => return error.FileNotFound,
+                .INVAL, .BADF => return error.FileNotFound,
                 .NOSPC => return error.NameTooLong,
                 .NOENT => return error.FileNotFound,
                 // TODO man pages for fcntl on macOS don't really tell you what

@@ -28,6 +28,7 @@ stack_protector: u32,
 red_zone: bool,
 sanitize_c: std.zig.SanitizeC,
 sanitize_thread: bool,
+sanitize_address: bool,
 fuzz: bool,
 unwind_tables: std.builtin.UnwindTables,
 cc_argv: []const []const u8,
@@ -78,6 +79,7 @@ pub const CreateOptions = struct {
         unwind_tables: ?std.builtin.UnwindTables = null,
         sanitize_c: ?std.zig.SanitizeC = null,
         sanitize_thread: ?bool = null,
+        sanitize_address: ?bool = null,
         fuzz: ?bool = null,
         structured_cfg: ?bool = null,
         no_builtin: ?bool = null,
@@ -109,6 +111,7 @@ pub const CreateError = error{
 /// At least one of `parent` and `resolved_target` must be non-null.
 pub fn create(arena: Allocator, options: CreateOptions) !*Package.Module {
     if (options.inherited.sanitize_thread == true) assert(options.global.any_sanitize_thread);
+    if (options.inherited.sanitize_address == true) assert(options.global.any_sanitize_address);
     if (options.inherited.fuzz == true) assert(options.global.any_fuzz);
     if (options.inherited.single_threaded == false) assert(options.global.any_non_single_threaded);
     if (options.inherited.unwind_tables) |uwt| if (uwt != .none) assert(options.global.any_unwind_tables);
@@ -217,6 +220,12 @@ pub fn create(arena: Allocator, options: CreateOptions) !*Package.Module {
         break :b false;
     };
 
+    const sanitize_address = b: {
+        if (options.inherited.sanitize_address) |x| break :b x;
+        if (options.parent) |p| break :b p.sanitize_address;
+        break :b false;
+    };
+
     const unwind_tables = b: {
         if (options.inherited.unwind_tables) |x| break :b x;
         if (options.parent) |p| break :b p.unwind_tables;
@@ -225,6 +234,7 @@ pub fn create(arena: Allocator, options: CreateOptions) !*Package.Module {
             target,
             options.global.link_libunwind,
             sanitize_thread or options.global.any_sanitize_thread,
+            sanitize_address or options.global.any_sanitize_address,
         );
     };
 
@@ -396,6 +406,7 @@ pub fn create(arena: Allocator, options: CreateOptions) !*Package.Module {
         .red_zone = red_zone,
         .sanitize_c = sanitize_c,
         .sanitize_thread = sanitize_thread,
+        .sanitize_address = sanitize_address,
         .fuzz = fuzz,
         .unwind_tables = unwind_tables,
         .cc_argv = options.cc_argv,
@@ -435,6 +446,7 @@ pub fn createLimited(gpa: Allocator, options: LimitedOptions) Allocator.Error!*P
         .red_zone = undefined,
         .sanitize_c = undefined,
         .sanitize_thread = undefined,
+        .sanitize_address = undefined,
         .fuzz = undefined,
         .unwind_tables = undefined,
         .cc_argv = undefined,

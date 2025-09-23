@@ -141,9 +141,9 @@ pub const dev_t = switch (native_os) {
 pub const mode_t = switch (native_os) {
     .linux => linux.mode_t,
     .emscripten => emscripten.mode_t,
-    .openbsd, .haiku, .netbsd, .solaris, .illumos, .wasi, .windows => u32,
+    .openbsd, .haiku, .netbsd, .solaris, .illumos, .wasi => u32,
     // https://github.com/SerenityOS/serenity/blob/b98f537f117b341788023ab82e0c11ca9ae29a57/Kernel/API/POSIX/sys/types.h#L44
-    .freebsd, .macos, .ios, .tvos, .watchos, .visionos, .dragonfly, .serenity => u16,
+    .freebsd, .macos, .ios, .tvos, .watchos, .visionos, .dragonfly, .serenity, .windows => u16,
     else => u0,
 };
 
@@ -10604,8 +10604,8 @@ pub const fork = switch (native_os) {
     => private.fork,
     else => {},
 };
-pub extern "c" fn access(path: [*:0]const u8, mode: c_uint) c_int;
-pub extern "c" fn faccessat(dirfd: fd_t, path: [*:0]const u8, mode: c_uint, flags: c_uint) c_int;
+pub extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
+pub extern "c" fn faccessat(dirfd: fd_t, path: [*:0]const u8, mode: c_int, flags: c_int) c_int;
 pub extern "c" fn pipe(fds: *[2]fd_t) c_int;
 pub extern "c" fn mkdir(path: [*:0]const u8, mode: mode_t) c_int;
 pub extern "c" fn mkdirat(dirfd: fd_t, path: [*:0]const u8, mode: mode_t) c_int;
@@ -11103,6 +11103,7 @@ pub const dispatch_semaphore_create = darwin.dispatch_semaphore_create;
 pub const dispatch_semaphore_signal = darwin.dispatch_semaphore_signal;
 pub const dispatch_semaphore_wait = darwin.dispatch_semaphore_wait;
 pub const dispatch_time = darwin.dispatch_time;
+pub const copyfile_state_t = darwin.copyfile_state_t;
 pub const fcopyfile = darwin.fcopyfile;
 pub const host_t = darwin.host_t;
 pub const ipc_space_t = darwin.ipc_space_t;

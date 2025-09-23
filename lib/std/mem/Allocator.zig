@@ -147,9 +147,19 @@ pub inline fn rawFree(a: Allocator, memory: []u8, alignment: Alignment, ret_addr
     return a.vtable.free(a.ptr, memory, alignment, ret_addr);
 }
 
+const bun_heap_breakdown = @hasDecl(@import("root"), "bun") and @import("root").bun.heap_breakdown.enabled;
+
 /// Returns a pointer to undefined memory.
 /// Call `destroy` with the result to free the memory.
 pub fn create(a: Allocator, comptime T: type) Error!*T {
+    // This assertion is in place to ensure that heap breakdown allocators are
+    // used instead of the standard library allocator. In Bun, the heap
+    // breakdown allocator is done per-type, and thus cannot use the
+    // type-erasing `std.mem.Allocator` interface.
+    if (bun_heap_breakdown and @typeInfo(T) == .@"struct" and @hasDecl(T, "ban_standard_library_allocator")) {
+        @compileError("Use " ++ @typeName(T) ++ ".new(...) instead of allocator.create() to ensure it participates in heap breakdown");
+    }
+
     if (@sizeOf(T) == 0) {
         const ptr = comptime std.mem.alignBackward(usize, math.maxInt(usize), @alignOf(T));
         return @ptrFromInt(ptr);
@@ -164,6 +174,11 @@ pub fn destroy(self: Allocator, ptr: anytype) void {
     const info = @typeInfo(@TypeOf(ptr)).pointer;
     if (info.size != .one) @compileError("ptr must be a single item pointer");
     const T = info.child;
+
+    if (bun_heap_breakdown and @typeInfo(T) == .@"struct" and @hasDecl(T, "ban_standard_library_allocator")) {
+        @compileError("Use " ++ @typeName(T) ++ ".destroy(...) instead of allocator.destroy() to ensure it participates in heap breakdown");
+    }
+
     if (@sizeOf(T) == 0) return;
     const non_const_ptr = @as([*]u8, @ptrCast(@constCast(ptr)));
     self.rawFree(non_const_ptr[0..@sizeOf(T)], .fromByteUnits(info.alignment), @returnAddress());

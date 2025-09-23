@@ -7,6 +7,7 @@ const mem = @This();
 const testing = std.testing;
 const Endian = std.builtin.Endian;
 const native_endian = builtin.cpu.arch.endian();
+const root = @import("root");
 
 /// The standard library currently thoroughly depends on byte size
 /// being 8 bits.  (see the use of u8 throughout allocation code as
@@ -234,7 +235,11 @@ test "Allocator alloc and remap with zero-bit type" {
 /// If the slices overlap, dest.ptr must be <= src.ptr.
 /// This function is deprecated; use @memmove instead.
 pub fn copyForwards(comptime T: type, dest: []T, source: []const T) void {
-    for (dest[0..source.len], source) |*d, s| d.* = s;
+    if (@hasDecl(root, "copyForwards")) {
+        root.copyForwards(T, dest, source);
+    } else {
+        for (dest[0..source.len], source) |*d, s| d.* = s;
+    }
 }
 
 /// Copy all of source into dest at position 0.
@@ -242,15 +247,19 @@ pub fn copyForwards(comptime T: type, dest: []T, source: []const T) void {
 /// If the slices overlap, dest.ptr must be >= src.ptr.
 /// This function is deprecated; use @memmove instead.
 pub fn copyBackwards(comptime T: type, dest: []T, source: []const T) void {
-    // TODO instead of manually doing this check for the whole array
-    // and turning off runtime safety, the compiler should detect loops like
-    // this and automatically omit safety checks for loops
-    @setRuntimeSafety(false);
-    assert(dest.len >= source.len);
-    var i = source.len;
-    while (i > 0) {
-        i -= 1;
-        dest[i] = source[i];
+    if (@hasDecl(root, "copyBackwards")) {
+        root.copyBackwards(T, dest, source);
+    } else {
+        // TODO instead of manually doing this check for the whole array
+        // and turning off runtime safety, the compiler should detect loops like
+        // this and automatically omit safety checks for loops
+        @setRuntimeSafety(false);
+        assert(dest.len >= source.len);
+        var i = source.len;
+        while (i > 0) {
+            i -= 1;
+            dest[i] = source[i];
+        }
     }
 }
 
@@ -731,6 +740,9 @@ fn eqlBytes(a: []const u8, b: []const u8) bool {
 
     if (a.len != b.len) return false;
     if (a.len == 0 or a.ptr == b.ptr) return true;
+    if (@hasDecl(root, "eqlBytes")) {
+        return root.eqlBytes(a, b);
+    }
 
     if (a.len <= 16) {
         if (a.len < 4) {
@@ -1089,7 +1101,17 @@ test len {
     try testing.expect(len(c_ptr) == 2);
 }
 
+extern "c" fn wcslen(s: [*:0]const u16) usize;
+extern "c" fn strlen(s: [*:0]const u8) usize;
+
 pub fn indexOfSentinel(comptime T: type, comptime sentinel: T, p: [*:sentinel]const T) usize {
+    if (comptime builtin.link_libc and T == u16 and sentinel == 0 and builtin.target.os.tag == .windows) {
+        return wcslen(p);
+    }
+    if (comptime builtin.link_libc and T == u8 and sentinel == 0) {
+        return strlen(p);
+    }
+
     var i: usize = 0;
 
     if (use_vectors_for_comparison and
