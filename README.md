@@ -12,7 +12,9 @@ git checkout -b upgrade-0.15.1
 git reset --soft 0.14.1
 git commit -m "our 0.14.1 patches"
 git config --global merge.conflictstyle zdiff3
-git rebase upstream/master
+git rev-parse HEAD # COMMIT_ID
+git reset --hard 0.15.1
+git cherry-pick COMMIT_ID 
 # to show the diff, `git diff 0.14.1 014-dev`
 # alternatively, the changes can be made into a patch file and manually applied
 ```
