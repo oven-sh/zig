@@ -7,11 +7,13 @@ Process:
 ```
 git fetch upstream
 git fetch upstream --tags
-git checkout -b UPGRADE_BRANCH_NAME
-git reset --soft $(git merge-base 0.15.1 014-dev)
-git commit -m "patches"
+git checkout -b upgrade-0.15.1
+git reset --soft 0.14.1
+git commit -m "our 0.14.1 patches"
 git config --global merge.conflictstyle zdiff3
-git rebase upstream/master # alternatively, the changes can be made into a patch file and manually applied
+git rebase upstream/master
+# to show the diff, `git diff 0.14.1 014-dev`
+# alternatively, the changes can be made into a patch file and manually applied
 ```
 
 if some parts fail (ie the file was renamed), remove them from the patch and apply them manually
