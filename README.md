@@ -7,6 +7,7 @@ Process:
 ```
 git fetch upstream
 git fetch upstream --tags
+git checkout 014-dev
 git checkout -b upgrade-0.15.1
 git reset --soft 0.14.1
 git commit -m "our 0.14.1 patches"
