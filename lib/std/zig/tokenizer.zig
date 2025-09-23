@@ -428,7 +428,7 @@ pub const Tokenizer = struct {
                     result.tag = .char_literal;
                     continue :state .char_literal;
                 },
-                'a'...'z', 'A'...'Z', '_' => {
+                'a'...'z', 'A'...'Z', '_', '#' => {
                     result.tag = .identifier;
                     continue :state .identifier;
                 },

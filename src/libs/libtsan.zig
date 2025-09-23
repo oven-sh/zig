@@ -91,6 +91,7 @@ pub fn buildTsan(comp: *Compilation, prog_node: std.Progress.Node) BuildError!vo
             .stack_protector = 0,
             .sanitize_c = .off,
             .sanitize_thread = false,
+            .sanitize_address = false,
             .red_zone = comp.root_mod.red_zone,
             .omit_frame_pointer = optimize_mode != .Debug and !target.os.tag.isDarwin(),
             .valgrind = false,

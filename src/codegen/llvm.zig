@@ -595,31 +595,31 @@ pub const Object = struct {
                     break :blk try zcu.main_mod.root.toAbsolute(comp.dirs, arena);
                 };
 
-                const debug_file = try builder.debugFile(
-                    try builder.metadataString(comp.root_name),
-                    try builder.metadataString(compile_unit_dir),
-                );
+            const debug_file = try builder.debugFile(
+                try builder.metadataString(comp.root_name),
+                try builder.metadataString(compile_unit_dir),
+            );
 
-                const debug_enums_fwd_ref = try builder.debugForwardReference();
-                const debug_globals_fwd_ref = try builder.debugForwardReference();
+            const debug_enums_fwd_ref = try builder.debugForwardReference();
+            const debug_globals_fwd_ref = try builder.debugForwardReference();
 
-                const debug_compile_unit = try builder.debugCompileUnit(
-                    debug_file,
-                    // Don't use the version string here; LLVM misparses it when it
-                    // includes the git revision.
-                    try builder.metadataStringFmt("zig {d}.{d}.{d}", .{
-                        build_options.semver.major,
-                        build_options.semver.minor,
-                        build_options.semver.patch,
-                    }),
-                    debug_enums_fwd_ref,
-                    debug_globals_fwd_ref,
-                    .{ .optimized = comp.root_mod.optimize_mode != .Debug },
-                );
+            const debug_compile_unit = try builder.debugCompileUnit(
+                debug_file,
+                // Don't use the version string here; LLVM misparses it when it
+                // includes the git revision.
+                try builder.metadataStringFmt("zig {d}.{d}.{d}", .{
+                    build_options.semver.major,
+                    build_options.semver.minor,
+                    build_options.semver.patch,
+                }),
+                debug_enums_fwd_ref,
+                debug_globals_fwd_ref,
+                .{ .optimized = comp.root_mod.optimize_mode != .Debug },
+            );
 
-                try builder.metadataNamed(try builder.metadataString("llvm.dbg.cu"), &.{debug_compile_unit});
-                break :debug_info .{ debug_compile_unit, debug_enums_fwd_ref, debug_globals_fwd_ref };
-            } else .{.none} ** 3;
+            try builder.metadataNamed(try builder.metadataString("llvm.dbg.cu"), &.{debug_compile_unit});
+            break :debug_info .{ debug_compile_unit, debug_enums_fwd_ref, debug_globals_fwd_ref };
+        } else .{.none} ** 3;
 
         const obj = try arena.create(Object);
         obj.* = .{
@@ -766,6 +766,7 @@ pub const Object = struct {
         is_small: bool,
         time_report: ?*Compilation.TimeReport,
         sanitize_thread: bool,
+        sanitize_address: bool,
         fuzz: bool,
         lto: std.zig.LtoMode,
     };
@@ -1065,6 +1066,7 @@ pub const Object = struct {
             .is_small = options.is_small,
             .time_report_out = null, // set below to make sure it's only set for a single `emitToFile`
             .tsan = options.sanitize_thread,
+            .asan = options.sanitize_address,
             .lto = switch (options.lto) {
                 .none => .None,
                 .thin => .ThinPreLink,
@@ -1185,6 +1187,11 @@ pub const Object = struct {
             try attributes.addFnAttr(.sanitize_thread, &o.builder);
         } else {
             _ = try attributes.removeFnAttr(.sanitize_thread);
+        }
+        if (owner_mod.sanitize_address and !func_analysis.disable_instrumentation) {
+            try attributes.addFnAttr(.sanitize_address, &o.builder);
+        } else {
+            _ = try attributes.removeFnAttr(.sanitize_address);
         }
         const is_naked = fn_info.cc == .naked;
         if (!func_analysis.disable_instrumentation and !is_naked) {
@@ -2557,9 +2564,9 @@ pub const Object = struct {
 
                 const full_fields: [2]Builder.Metadata =
                     if (layout.tag_align.compare(.gte, layout.payload_align))
-                        .{ debug_tag_type, debug_payload_type }
-                    else
-                        .{ debug_payload_type, debug_tag_type };
+                    .{ debug_tag_type, debug_payload_type }
+                else
+                    .{ debug_payload_type, debug_tag_type };
 
                 const debug_tagged_union_type = try o.builder.debugStructType(
                     try o.builder.metadataString(name),
@@ -9526,7 +9533,7 @@ pub const FuncGen = struct {
 
         if (llvm_dest_ty.isStruct(&o.builder) or
             ((operand_ty.zigTypeTag(zcu) == .vector or inst_ty.zigTypeTag(zcu) == .vector) and
-                operand_ty.bitSize(zcu) != inst_ty.bitSize(zcu)))
+            operand_ty.bitSize(zcu) != inst_ty.bitSize(zcu)))
         {
             // Both our operand and our result are values, not pointers,
             // but LLVM won't let us bitcast struct values or vectors with padding bits.

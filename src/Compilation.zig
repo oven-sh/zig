@@ -211,6 +211,9 @@ libunwind_static_lib: ?CrtFile = null,
 /// Populated when we build the TSAN library. A Job to build this is placed in the queue
 /// and resolved before calling linker.flush().
 tsan_lib: ?CrtFile = null,
+/// Populated when we build the ASAN library. A Job to build this is placed in the queue
+/// and resolved before calling linker.flush().
+asan_lib: ?CrtFile = null,
 /// Populated when we build the UBSAN library. A Job to build this is placed in the queue
 /// and resolved before calling linker.flush().
 ubsan_rt_lib: ?CrtFile = null,
@@ -1408,6 +1411,7 @@ pub const MiscTask = enum {
     libcxx,
     libcxxabi,
     libtsan,
+    libasan,
     libubsan,
     libfuzzer,
     wasi_libc_crt_file,
@@ -1476,6 +1480,7 @@ pub const cache_helpers = struct {
         hh.add(mod.red_zone);
         hh.add(mod.sanitize_c);
         hh.add(mod.sanitize_thread);
+        hh.add(mod.sanitize_address);
         hh.add(mod.fuzz);
         hh.add(mod.unwind_tables);
         hh.add(mod.structured_cfg);
@@ -1949,6 +1954,7 @@ pub fn create(gpa: Allocator, arena: Allocator, diag: *CreateDiagnostic, options
         const any_unwind_tables = options.config.any_unwind_tables or options.root_mod.unwind_tables != .none;
         const any_non_single_threaded = options.config.any_non_single_threaded or !options.root_mod.single_threaded;
         const any_sanitize_thread = options.config.any_sanitize_thread or options.root_mod.sanitize_thread;
+        const any_sanitize_address = options.config.any_sanitize_address or options.root_mod.sanitize_address;
         const any_sanitize_c: std.zig.SanitizeC = switch (options.config.any_sanitize_c) {
             .off => options.root_mod.sanitize_c,
             .trap => if (options.root_mod.sanitize_c == .full)
@@ -2139,6 +2145,7 @@ pub fn create(gpa: Allocator, arena: Allocator, diag: *CreateDiagnostic, options
         cache.hash.add(options.config.any_unwind_tables);
         cache.hash.add(options.config.any_non_single_threaded);
         cache.hash.add(options.config.any_sanitize_thread);
+        cache.hash.add(options.config.any_sanitize_address);
         cache.hash.add(options.config.any_sanitize_c);
         cache.hash.add(options.config.any_fuzz);
         cache.hash.add(options.function_sections);
@@ -2317,6 +2324,7 @@ pub fn create(gpa: Allocator, arena: Allocator, diag: *CreateDiagnostic, options
         comp.config.any_unwind_tables = any_unwind_tables;
         comp.config.any_non_single_threaded = any_non_single_threaded;
         comp.config.any_sanitize_thread = any_sanitize_thread;
+        comp.config.any_sanitize_address = any_sanitize_address;
         comp.config.any_sanitize_c = any_sanitize_c;
         comp.config.any_fuzz = any_fuzz;
 
@@ -2656,6 +2664,10 @@ pub fn create(gpa: Allocator, arena: Allocator, diag: *CreateDiagnostic, options
             }
             if (build_options.have_llvm and is_exe_or_dyn_lib and comp.config.any_sanitize_thread) {
                 comp.queued_jobs.libtsan = true;
+            }
+            if (build_options.have_llvm and is_exe_or_dyn_lib and comp.config.any_sanitize_address) {
+                // TODO: build asan automatically
+                // try comp.queueJob(.libasan);
             }
 
             switch (comp.compiler_rt_strat) {
@@ -3363,6 +3375,7 @@ fn flush(
                 .is_small = comp.root_mod.optimize_mode == .ReleaseSmall,
                 .time_report = if (comp.time_report) |*p| p else null,
                 .sanitize_thread = comp.config.any_sanitize_thread,
+                .sanitize_address = comp.config.any_sanitize_address,
                 .fuzz = comp.config.any_fuzz,
                 .lto = comp.config.lto,
             }) catch |err| switch (err) {
@@ -7184,6 +7197,10 @@ pub fn addCCArgs(
                     if (san_arg.items.len == 0) try san_arg.appendSlice(arena, prefix);
                     try san_arg.appendSlice(arena, "thread,");
                 }
+                if (mod.sanitize_address) {
+                    if (san_arg.items.len == 0) try san_arg.appendSlice(arena, prefix);
+                    try san_arg.appendSlice(arena, "address,");
+                }
                 if (mod.fuzz) {
                     if (san_arg.items.len == 0) try san_arg.appendSlice(arena, prefix);
                     try san_arg.appendSlice(arena, "fuzzer-no-link,");
@@ -7913,6 +7930,7 @@ pub fn build_crt_file(
             .stack_protector = 0,
             .sanitize_c = .off,
             .sanitize_thread = false,
+            .sanitize_address = false,
             .red_zone = comp.root_mod.red_zone,
             // Some libcs (e.g. musl) are opinionated about -fomit-frame-pointer.
             .omit_frame_pointer = options.omit_frame_pointer orelse comp.root_mod.omit_frame_pointer,

@@ -71,6 +71,7 @@ struct ZigLLVMEmitOptions {
     // JSON) time report data. The caller is responsible for freeing that memory.
     char **time_report_out;
     bool tsan;
+    bool asan;
     bool sancov;
     ZigLLVMThinOrFullLTOPhase lto;
     bool allow_fast_isel;

@@ -291,7 +291,7 @@ pub fn close(fd: fd_t) void {
         return;
     }
     switch (errno(system.close(fd))) {
-        .BADF => unreachable, // Always a race condition.
+        // .BADF => unreachable, // Always a race condition.
         .INTR => return, // This is still a success. See https://github.com/ziglang/zig/issues/2425
         else => return,
     }
@@ -320,9 +320,9 @@ pub fn fchmod(fd: fd_t, mode: mode_t) FChmodError!void {
         switch (errno(res)) {
             .SUCCESS => return,
             .INTR => continue,
-            .BADF => unreachable,
-            .FAULT => unreachable,
-            .INVAL => unreachable,
+            // .BADF => unreachable,
+            // .FAULT => unreachable,
+            // .INVAL => unreachable,
             .ACCES => return error.AccessDenied,
             .IO => return error.InputOutput,
             .LOOP => return error.SymLinkLoop,
@@ -393,9 +393,9 @@ fn fchmodat1(dirfd: fd_t, path: []const u8, mode: mode_t, flags: u32) FChmodAtEr
         switch (errno(res)) {
             .SUCCESS => return,
             .INTR => continue,
-            .BADF => unreachable,
-            .FAULT => unreachable,
-            .INVAL => unreachable,
+            // .BADF => unreachable,
+            // .FAULT => unreachable,
+            // .INVAL => unreachable,
             .ACCES => return error.AccessDenied,
             .IO => return error.InputOutput,
             .LOOP => return error.SymLinkLoop,
@@ -427,9 +427,9 @@ fn fchmodat2(dirfd: fd_t, path: []const u8, mode: mode_t, flags: u32) FChmodAtEr
         switch (E.init(res)) {
             .SUCCESS => return,
             .INTR => continue,
-            .BADF => unreachable,
-            .FAULT => unreachable,
-            .INVAL => unreachable,
+            // .BADF => unreachable,
+            // .FAULT => unreachable,
+            // .INVAL => unreachable,
             .ACCES => return error.AccessDenied,
             .IO => return error.InputOutput,
             .LOOP => return error.SymLinkLoop,
@@ -463,8 +463,8 @@ fn fchmodat2(dirfd: fd_t, path: []const u8, mode: mode_t, flags: u32) FChmodAtEr
                 break;
             },
             .INTR => continue,
-            .FAULT => unreachable,
-            .INVAL => unreachable,
+            // .FAULT => unreachable,
+            // .INVAL => unreachable,
             .ACCES => return error.AccessDenied,
             .PERM => return error.PermissionDenied,
             .LOOP => return error.SymLinkLoop,
@@ -497,9 +497,9 @@ fn fchmodat2(dirfd: fd_t, path: []const u8, mode: mode_t, flags: u32) FChmodAtEr
 
             .SUCCESS => return,
             .INTR => continue,
-            .BADF => unreachable,
-            .FAULT => unreachable,
-            .INVAL => unreachable,
+            // .BADF => unreachable,
+            // .FAULT => unreachable,
+            // .INVAL => unreachable,
             .ACCES => return error.AccessDenied,
             .IO => return error.InputOutput,
             .LOOP => return error.SymLinkLoop,
@@ -539,10 +539,10 @@ pub fn fchown(fd: fd_t, owner: ?uid_t, group: ?gid_t) FChownError!void {
         switch (errno(res)) {
             .SUCCESS => return,
             .INTR => continue,
-            .BADF => unreachable, // Can be reached if the fd refers to a directory opened without `Dir.OpenOptions{ .iterate = true }`
+            // .BADF => unreachable, // Can be reached if the fd refers to a directory opened without `Dir.OpenOptions{ .iterate = true }`
 
-            .FAULT => unreachable,
-            .INVAL => unreachable,
+            // .FAULT => unreachable,
+            // .INVAL => unreachable,
             .ACCES => return error.AccessDenied,
             .IO => return error.InputOutput,
             .LOOP => return error.SymLinkLoop,
@@ -641,8 +641,8 @@ pub fn getrandom(buffer: []u8) GetRandomError!void {
 
             switch (err) {
                 .SUCCESS => buf = buf[num_read..],
-                .INVAL => unreachable,
-                .FAULT => unreachable,
+                // .INVAL => unreachable,
+                // .FAULT => unreachable,
                 .INTR => continue,
                 else => return unexpectedErrno(err),
             }
@@ -766,7 +766,7 @@ pub const KillError = error{ ProcessNotFound, PermissionDenied } || UnexpectedEr
 pub fn kill(pid: pid_t, sig: u8) KillError!void {
     switch (errno(system.kill(pid, sig))) {
         .SUCCESS => return,
-        .INVAL => unreachable, // invalid signal
+        // .INVAL => unreachable, // invalid signal
         .PERM => return error.PermissionDenied,
         .SRCH => return error.ProcessNotFound,
         else => |err| return unexpectedErrno(err),
@@ -856,8 +856,8 @@ pub fn read(fd: fd_t, buf: []u8) ReadError!usize {
         switch (wasi.fd_read(fd, &iovs, iovs.len, &nread)) {
             .SUCCESS => return nread,
             .INTR => unreachable,
-            .INVAL => unreachable,
-            .FAULT => unreachable,
+            // .INVAL => unreachable,
+            // .FAULT => unreachable,
             .AGAIN => unreachable,
             .BADF => return error.NotOpenForReading, // Can be a race condition.
             .IO => return error.InputOutput,
@@ -883,8 +883,8 @@ pub fn read(fd: fd_t, buf: []u8) ReadError!usize {
         switch (errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
-            .INVAL => unreachable,
-            .FAULT => unreachable,
+            // .INVAL => unreachable,
+            // .FAULT => unreachable,
             .SRCH => return error.ProcessNotFound,
             .AGAIN => return error.WouldBlock,
             .CANCELED => return error.Canceled,
@@ -926,8 +926,8 @@ pub fn readv(fd: fd_t, iov: []const iovec) ReadError!usize {
         switch (wasi.fd_read(fd, iov.ptr, iov.len, &nread)) {
             .SUCCESS => return nread,
             .INTR => unreachable,
-            .INVAL => unreachable,
-            .FAULT => unreachable,
+            // .INVAL => unreachable,
+            // .FAULT => unreachable,
             .AGAIN => unreachable, // currently not support in WASI
             .BADF => return error.NotOpenForReading, // can be a race condition
             .IO => return error.InputOutput,
@@ -947,8 +947,8 @@ pub fn readv(fd: fd_t, iov: []const iovec) ReadError!usize {
         switch (errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
-            .INVAL => unreachable,
-            .FAULT => unreachable,
+            // .INVAL => unreachable,
+            // .FAULT => unreachable,
             .SRCH => return error.ProcessNotFound,
             .AGAIN => return error.WouldBlock,
             .BADF => return error.NotOpenForReading, // can be a race condition
@@ -995,8 +995,8 @@ pub fn pread(fd: fd_t, buf: []u8, offset: u64) PReadError!usize {
         switch (wasi.fd_pread(fd, &iovs, iovs.len, offset, &nread)) {
             .SUCCESS => return nread,
             .INTR => unreachable,
-            .INVAL => unreachable,
-            .FAULT => unreachable,
+            // .INVAL => unreachable,
+            // .FAULT => unreachable,
             .AGAIN => unreachable,
             .BADF => return error.NotOpenForReading, // Can be a race condition.
             .IO => return error.InputOutput,
@@ -1027,8 +1027,8 @@ pub fn pread(fd: fd_t, buf: []u8, offset: u64) PReadError!usize {
         switch (errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
-            .INVAL => unreachable,
-            .FAULT => unreachable,
+            // .INVAL => unreachable,
+            // .FAULT => unreachable,
             .SRCH => return error.ProcessNotFound,
             .AGAIN => return error.WouldBlock,
             .BADF => return error.NotOpenForReading, // Can be a race condition.
@@ -1077,7 +1077,7 @@ pub fn ftruncate(fd: fd_t, length: u64) TruncateError!void {
 
         switch (rc) {
             .SUCCESS => return,
-            .INVALID_HANDLE => unreachable, // Handle not open for writing
+            // .INVALID_HANDLE => unreachable, // Handle not open for writing
             .ACCESS_DENIED => return error.AccessDenied,
             .USER_MAPPED_FILE => return error.AccessDenied,
             .INVALID_PARAMETER => return error.FileTooBig,
@@ -1092,7 +1092,7 @@ pub fn ftruncate(fd: fd_t, length: u64) TruncateError!void {
             .IO => return error.InputOutput,
             .PERM => return error.PermissionDenied,
             .TXTBSY => return error.FileBusy,
-            .BADF => unreachable, // Handle not open for writing
+            // .BADF => unreachable, // Handle not open for writing
             .INVAL => return error.NonResizable,
             .NOTCAPABLE => return error.AccessDenied,
             else => |err| return unexpectedErrno(err),
@@ -1108,7 +1108,7 @@ pub fn ftruncate(fd: fd_t, length: u64) TruncateError!void {
             .IO => return error.InputOutput,
             .PERM => return error.PermissionDenied,
             .TXTBSY => return error.FileBusy,
-            .BADF => unreachable, // Handle not open for writing
+            // .BADF => unreachable, // Handle not open for writing
             .INVAL => return error.NonResizable, // This is returned for /dev/null for example.
             else => |err| return unexpectedErrno(err),
         }
@@ -1145,10 +1145,10 @@ pub fn preadv(fd: fd_t, iov: []const iovec, offset: u64) PReadError!usize {
         var nread: usize = undefined;
         switch (wasi.fd_pread(fd, iov.ptr, iov.len, offset, &nread)) {
             .SUCCESS => return nread,
-            .INTR => unreachable,
-            .INVAL => unreachable,
-            .FAULT => unreachable,
-            .AGAIN => unreachable,
+            // .INTR => unreachable,
+            // .INVAL => unreachable,
+            // .FAULT => unreachable,
+            // .AGAIN => unreachable,
             .BADF => return error.NotOpenForReading, // can be a race condition
             .IO => return error.InputOutput,
             .ISDIR => return error.IsDir,
@@ -1171,8 +1171,8 @@ pub fn preadv(fd: fd_t, iov: []const iovec, offset: u64) PReadError!usize {
         switch (errno(rc)) {
             .SUCCESS => return @bitCast(rc),
             .INTR => continue,
-            .INVAL => unreachable,
-            .FAULT => unreachable,
+            // .INVAL => unreachable,
+            // .FAULT => unreachable,
             .SRCH => return error.ProcessNotFound,
             .AGAIN => return error.WouldBlock,
             .BADF => return error.NotOpenForReading, // can be a race condition
@@ -1267,8 +1267,8 @@ pub fn write(fd: fd_t, bytes: []const u8) WriteError!usize {
         switch (wasi.fd_write(fd, &ciovs, ciovs.len, &nwritten)) {
             .SUCCESS => return nwritten,
             .INTR => unreachable,
-            .INVAL => unreachable,
-            .FAULT => unreachable,
+            // .INVAL => unreachable,
+            // .FAULT => unreachable,
             .AGAIN => unreachable,
             .BADF => return error.NotOpenForWriting, // can be a race condition.
             .DESTADDRREQ => unreachable, // `connect` was never called.
@@ -1294,11 +1294,11 @@ pub fn write(fd: fd_t, bytes: []const u8) WriteError!usize {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
             .INVAL => return error.InvalidArgument,
-            .FAULT => unreachable,
+            // .FAULT => unreachable,
             .SRCH => return error.ProcessNotFound,
             .AGAIN => return error.WouldBlock,
             .BADF => return error.NotOpenForWriting, // can be a race condition.
-            .DESTADDRREQ => unreachable, // `connect` was never called.
+            // .DESTADDRREQ => unreachable, // `connect` was never called.
             .DQUOT => return error.DiskQuota,
             .FBIG => return error.FileTooBig,
             .IO => return error.InputOutput,
@@ -1348,8 +1348,8 @@ pub fn writev(fd: fd_t, iov: []const iovec_const) WriteError!usize {
         switch (wasi.fd_write(fd, iov.ptr, iov.len, &nwritten)) {
             .SUCCESS => return nwritten,
             .INTR => unreachable,
-            .INVAL => unreachable,
-            .FAULT => unreachable,
+            // .INVAL => unreachable,
+            // .FAULT => unreachable,
             .AGAIN => unreachable,
             .BADF => return error.NotOpenForWriting, // can be a race condition.
             .DESTADDRREQ => unreachable, // `connect` was never called.
@@ -1370,7 +1370,7 @@ pub fn writev(fd: fd_t, iov: []const iovec_const) WriteError!usize {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
             .INVAL => return error.InvalidArgument,
-            .FAULT => unreachable,
+            // .FAULT => unreachable,
             .SRCH => return error.ProcessNotFound,
             .AGAIN => return error.WouldBlock,
             .BADF => return error.NotOpenForWriting, // Can be a race condition.
@@ -1426,12 +1426,12 @@ pub fn pwrite(fd: fd_t, bytes: []const u8, offset: u64) PWriteError!usize {
         var nwritten: usize = undefined;
         switch (wasi.fd_pwrite(fd, &ciovs, ciovs.len, offset, &nwritten)) {
             .SUCCESS => return nwritten,
-            .INTR => unreachable,
-            .INVAL => unreachable,
-            .FAULT => unreachable,
-            .AGAIN => unreachable,
+            // .INTR => unreachable,
+            // .INVAL => unreachable,
+            // .FAULT => unreachable,
+            // .AGAIN => unreachable,
             .BADF => return error.NotOpenForWriting, // can be a race condition.
-            .DESTADDRREQ => unreachable, // `connect` was never called.
+            // .DESTADDRREQ => unreachable, // `connect` was never called.
             .DQUOT => return error.DiskQuota,
             .FBIG => return error.FileTooBig,
             .IO => return error.InputOutput,
@@ -1460,7 +1460,7 @@ pub fn pwrite(fd: fd_t, bytes: []const u8, offset: u64) PWriteError!usize {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
             .INVAL => return error.InvalidArgument,
-            .FAULT => unreachable,
+            // .FAULT => unreachable,
             .SRCH => return error.ProcessNotFound,
             .AGAIN => return error.WouldBlock,
             .BADF => return error.NotOpenForWriting, // Can be a race condition.
@@ -1519,8 +1519,8 @@ pub fn pwritev(fd: fd_t, iov: []const iovec_const, offset: u64) PWriteError!usiz
         switch (wasi.fd_pwrite(fd, iov.ptr, iov.len, offset, &nwritten)) {
             .SUCCESS => return nwritten,
             .INTR => unreachable,
-            .INVAL => unreachable,
-            .FAULT => unreachable,
+            // .INVAL => unreachable,
+            // .FAULT => unreachable,
             .AGAIN => unreachable,
             .BADF => return error.NotOpenForWriting, // Can be a race condition.
             .DESTADDRREQ => unreachable, // `connect` was never called.
@@ -1545,11 +1545,11 @@ pub fn pwritev(fd: fd_t, iov: []const iovec_const, offset: u64) PWriteError!usiz
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
             .INVAL => return error.InvalidArgument,
-            .FAULT => unreachable,
+            // .FAULT => unreachable,
             .SRCH => return error.ProcessNotFound,
             .AGAIN => return error.WouldBlock,
             .BADF => return error.NotOpenForWriting, // Can be a race condition.
-            .DESTADDRREQ => unreachable, // `connect` was never called.
+            // .DESTADDRREQ => unreachable, // `connect` was never called.
             .DQUOT => return error.DiskQuota,
             .FBIG => return error.FileTooBig,
             .IO => return error.InputOutput,
@@ -1675,7 +1675,7 @@ pub fn openZ(file_path: [*:0]const u8, flags: O, perm: mode_t) OpenError!fd_t {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
 
-            .FAULT => unreachable,
+            // .FAULT => unreachable,
             .INVAL => return error.BadPathName,
             .ACCES => return error.AccessDenied,
             .FBIG => return error.FileTooBig,
@@ -1754,10 +1754,10 @@ pub fn openatWasi(
             .SUCCESS => return fd,
             .INTR => continue,
 
-            .FAULT => unreachable,
+            // .FAULT => unreachable,
             // Provides INVAL with a linux host on a bad path name, but NOENT on Windows
             .INVAL => return error.BadPathName,
-            .BADF => unreachable,
+            // .BADF => unreachable,
             .ACCES => return error.AccessDenied,
             .FBIG => return error.FileTooBig,
             .OVERFLOW => return error.FileTooBig,
@@ -1846,9 +1846,9 @@ pub fn openatZ(dir_fd: fd_t, file_path: [*:0]const u8, flags: O, mode: mode_t) O
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
 
-            .FAULT => unreachable,
+            // .FAULT => unreachable,
             .INVAL => return error.BadPathName,
-            .BADF => unreachable,
+            // .BADF => unreachable,
             .ACCES => return error.AccessDenied,
             .FBIG => return error.FileTooBig,
             .OVERFLOW => return error.FileTooBig,
@@ -1884,7 +1884,7 @@ pub fn dup(old_fd: fd_t) !fd_t {
     return switch (errno(rc)) {
         .SUCCESS => return @intCast(rc),
         .MFILE => error.ProcessFdQuotaExceeded,
-        .BADF => unreachable, // invalid file descriptor
+        // .BADF => unreachable, // invalid file descriptor
         else => |err| return unexpectedErrno(err),
     };
 }
@@ -1895,8 +1895,8 @@ pub fn dup2(old_fd: fd_t, new_fd: fd_t) !void {
             .SUCCESS => return,
             .BUSY, .INTR => continue,
             .MFILE => return error.ProcessFdQuotaExceeded,
-            .INVAL => unreachable, // invalid parameters passed to dup2
-            .BADF => unreachable, // invalid file descriptor
+            // .INVAL => unreachable, // invalid parameters passed to dup2
+            // .BADF => unreachable, // invalid file descriptor
             else => |err| return unexpectedErrno(err),
         }
     }
@@ -1925,7 +1925,7 @@ pub fn execveZ(
 ) ExecveError {
     switch (errno(system.execve(path, child_argv, envp))) {
         .SUCCESS => unreachable,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .@"2BIG" => return error.SystemResources,
         .MFILE => return error.ProcessFdQuotaExceeded,
         .NAMETOOLONG => return error.NameTooLong,
@@ -2104,8 +2104,8 @@ pub fn getcwd(out_buffer: []u8) GetCwdError![]u8 {
     };
     switch (err) {
         .SUCCESS => return mem.sliceTo(out_buffer, 0),
-        .FAULT => unreachable,
-        .INVAL => unreachable,
+        // .FAULT => unreachable,
+        // .INVAL => unreachable,
         .NOENT => return error.CurrentWorkingDirectoryUnlinked,
         .RANGE => return error.NameTooLong,
         else => return unexpectedErrno(err),
@@ -2167,8 +2167,8 @@ pub fn symlinkZ(target_path: [*:0]const u8, sym_link_path: [*:0]const u8) SymLin
     }
     switch (errno(system.symlink(target_path, sym_link_path))) {
         .SUCCESS => return,
-        .FAULT => unreachable,
-        .INVAL => unreachable,
+        // .FAULT => unreachable,
+        // .INVAL => unreachable,
         .ACCES => return error.AccessDenied,
         .PERM => return error.PermissionDenied,
         .DQUOT => return error.DiskQuota,
@@ -2214,9 +2214,9 @@ pub fn symlinkat(target_path: []const u8, newdirfd: fd_t, sym_link_path: []const
 pub fn symlinkatWasi(target_path: []const u8, newdirfd: fd_t, sym_link_path: []const u8) SymLinkError!void {
     switch (wasi.path_symlink(target_path.ptr, target_path.len, newdirfd, sym_link_path.ptr, sym_link_path.len)) {
         .SUCCESS => {},
-        .FAULT => unreachable,
-        .INVAL => unreachable,
-        .BADF => unreachable,
+        // .FAULT => unreachable,
+        // .INVAL => unreachable,
+        // .BADF => unreachable,
         .ACCES => return error.AccessDenied,
         .PERM => return error.PermissionDenied,
         .DQUOT => return error.DiskQuota,
@@ -2245,8 +2245,8 @@ pub fn symlinkatZ(target_path: [*:0]const u8, newdirfd: fd_t, sym_link_path: [*:
     }
     switch (errno(system.symlinkat(target_path, newdirfd, sym_link_path))) {
         .SUCCESS => return,
-        .FAULT => unreachable,
-        .INVAL => unreachable,
+        // .FAULT => unreachable,
+        // .INVAL => unreachable,
         .ACCES => return error.AccessDenied,
         .PERM => return error.PermissionDenied,
         .DQUOT => return error.DiskQuota,
@@ -2297,7 +2297,7 @@ pub fn linkZ(oldpath: [*:0]const u8, newpath: [*:0]const u8) LinkError!void {
         .ACCES => return error.AccessDenied,
         .DQUOT => return error.DiskQuota,
         .EXIST => return error.PathAlreadyExists,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .IO => return error.FileSystem,
         .LOOP => return error.SymLinkLoop,
         .MLINK => return error.LinkQuotaExceeded,
@@ -2308,7 +2308,7 @@ pub fn linkZ(oldpath: [*:0]const u8, newpath: [*:0]const u8) LinkError!void {
         .PERM => return error.PermissionDenied,
         .ROFS => return error.ReadOnlyFileSystem,
         .XDEV => return error.NotSameFileSystem,
-        .INVAL => unreachable,
+        // .INVAL => unreachable,
         .ILSEQ => |err| if (native_os == .wasi)
             return error.InvalidUtf8
         else
@@ -2350,7 +2350,7 @@ pub fn linkatZ(
         .ACCES => return error.AccessDenied,
         .DQUOT => return error.DiskQuota,
         .EXIST => return error.PathAlreadyExists,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .IO => return error.FileSystem,
         .LOOP => return error.SymLinkLoop,
         .MLINK => return error.LinkQuotaExceeded,
@@ -2362,7 +2362,7 @@ pub fn linkatZ(
         .PERM => return error.PermissionDenied,
         .ROFS => return error.ReadOnlyFileSystem,
         .XDEV => return error.NotSameFileSystem,
-        .INVAL => unreachable,
+        // .INVAL => unreachable,
         .ILSEQ => |err| if (native_os == .wasi)
             return error.InvalidUtf8
         else
@@ -2399,7 +2399,7 @@ pub fn linkat(
             .ACCES => return error.AccessDenied,
             .DQUOT => return error.DiskQuota,
             .EXIST => return error.PathAlreadyExists,
-            .FAULT => unreachable,
+            // .FAULT => unreachable,
             .IO => return error.FileSystem,
             .LOOP => return error.SymLinkLoop,
             .MLINK => return error.LinkQuotaExceeded,
@@ -2411,7 +2411,7 @@ pub fn linkat(
             .PERM => return error.PermissionDenied,
             .ROFS => return error.ReadOnlyFileSystem,
             .XDEV => return error.NotSameFileSystem,
-            .INVAL => unreachable,
+            // .INVAL => unreachable,
             .ILSEQ => return error.InvalidUtf8,
             else => |err| return unexpectedErrno(err),
         }
@@ -2485,8 +2485,8 @@ pub fn unlinkZ(file_path: [*:0]const u8) UnlinkError!void {
         .ACCES => return error.AccessDenied,
         .PERM => return error.PermissionDenied,
         .BUSY => return error.FileBusy,
-        .FAULT => unreachable,
-        .INVAL => unreachable,
+        // .FAULT => unreachable,
+        // .INVAL => unreachable,
         .IO => return error.FileSystem,
         .ISDIR => return error.IsDir,
         .LOOP => return error.SymLinkLoop,
@@ -2546,7 +2546,7 @@ pub fn unlinkatWasi(dirfd: fd_t, file_path: []const u8, flags: u32) UnlinkatErro
         .ACCES => return error.AccessDenied,
         .PERM => return error.PermissionDenied,
         .BUSY => return error.FileBusy,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .IO => return error.FileSystem,
         .ISDIR => return error.IsDir,
         .LOOP => return error.SymLinkLoop,
@@ -2559,8 +2559,8 @@ pub fn unlinkatWasi(dirfd: fd_t, file_path: []const u8, flags: u32) UnlinkatErro
         .NOTCAPABLE => return error.AccessDenied,
         .ILSEQ => return error.InvalidUtf8,
 
-        .INVAL => unreachable, // invalid flags, or pathname has . as last component
-        .BADF => unreachable, // always a race condition
+        // .INVAL => unreachable, // invalid flags, or pathname has . as last component
+        // .BADF => unreachable, // always a race condition
 
         else => |err| return unexpectedErrno(err),
     }
@@ -2579,7 +2579,7 @@ pub fn unlinkatZ(dirfd: fd_t, file_path_c: [*:0]const u8, flags: u32) UnlinkatEr
         .ACCES => return error.AccessDenied,
         .PERM => return error.PermissionDenied,
         .BUSY => return error.FileBusy,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .IO => return error.FileSystem,
         .ISDIR => return error.IsDir,
         .LOOP => return error.SymLinkLoop,
@@ -2595,8 +2595,8 @@ pub fn unlinkatZ(dirfd: fd_t, file_path_c: [*:0]const u8, flags: u32) UnlinkatEr
         else
             return unexpectedErrno(err),
 
-        .INVAL => unreachable, // invalid flags, or pathname has . as last component
-        .BADF => unreachable, // always a race condition
+        // .INVAL => unreachable, // invalid flags, or pathname has . as last component
+        // .BADF => unreachable, // always a race condition
 
         else => |err| return unexpectedErrno(err),
     }
@@ -2681,8 +2681,8 @@ pub fn renameZ(old_path: [*:0]const u8, new_path: [*:0]const u8) RenameError!voi
         .PERM => return error.PermissionDenied,
         .BUSY => return error.FileBusy,
         .DQUOT => return error.DiskQuota,
-        .FAULT => unreachable,
-        .INVAL => unreachable,
+        // .FAULT => unreachable,
+        // .INVAL => unreachable,
         .ISDIR => return error.IsDir,
         .LOOP => return error.SymLinkLoop,
         .MLINK => return error.LinkQuotaExceeded,
@@ -2744,8 +2744,8 @@ fn renameatWasi(old: RelativePathWasi, new: RelativePathWasi) RenameError!void {
         .PERM => return error.PermissionDenied,
         .BUSY => return error.FileBusy,
         .DQUOT => return error.DiskQuota,
-        .FAULT => unreachable,
-        .INVAL => unreachable,
+        // .FAULT => unreachable,
+        // .INVAL => unreachable,
         .ISDIR => return error.IsDir,
         .LOOP => return error.SymLinkLoop,
         .MLINK => return error.LinkQuotaExceeded,
@@ -2796,8 +2796,8 @@ pub fn renameatZ(
         .PERM => return error.PermissionDenied,
         .BUSY => return error.FileBusy,
         .DQUOT => return error.DiskQuota,
-        .FAULT => unreachable,
-        .INVAL => unreachable,
+        // .FAULT => unreachable,
+        // .INVAL => unreachable,
         .ISDIR => return error.IsDir,
         .LOOP => return error.SymLinkLoop,
         .MLINK => return error.LinkQuotaExceeded,
@@ -2945,11 +2945,11 @@ pub fn mkdiratWasi(dir_fd: fd_t, sub_dir_path: []const u8, mode: mode_t) MakeDir
     switch (wasi.path_create_directory(dir_fd, sub_dir_path.ptr, sub_dir_path.len)) {
         .SUCCESS => return,
         .ACCES => return error.AccessDenied,
-        .BADF => unreachable,
+        // .BADF => unreachable,
         .PERM => return error.PermissionDenied,
         .DQUOT => return error.DiskQuota,
         .EXIST => return error.PathAlreadyExists,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .LOOP => return error.SymLinkLoop,
         .MLINK => return error.LinkQuotaExceeded,
         .NAMETOOLONG => return error.NameTooLong,
@@ -2975,11 +2975,11 @@ pub fn mkdiratZ(dir_fd: fd_t, sub_dir_path: [*:0]const u8, mode: mode_t) MakeDir
     switch (errno(system.mkdirat(dir_fd, sub_dir_path, mode))) {
         .SUCCESS => return,
         .ACCES => return error.AccessDenied,
-        .BADF => unreachable,
+        // .BADF => unreachable,
         .PERM => return error.PermissionDenied,
         .DQUOT => return error.DiskQuota,
         .EXIST => return error.PathAlreadyExists,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .LOOP => return error.SymLinkLoop,
         .MLINK => return error.LinkQuotaExceeded,
         .NAMETOOLONG => return error.NameTooLong,
@@ -3077,7 +3077,7 @@ pub fn mkdirZ(dir_path: [*:0]const u8, mode: mode_t) MakeDirError!void {
         .PERM => return error.PermissionDenied,
         .DQUOT => return error.DiskQuota,
         .EXIST => return error.PathAlreadyExists,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .LOOP => return error.SymLinkLoop,
         .MLINK => return error.LinkQuotaExceeded,
         .NAMETOOLONG => return error.NameTooLong,
@@ -3170,7 +3170,7 @@ pub fn rmdirZ(dir_path: [*:0]const u8) DeleteDirError!void {
         .ACCES => return error.AccessDenied,
         .PERM => return error.PermissionDenied,
         .BUSY => return error.FileBusy,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .INVAL => return error.BadPathName,
         .LOOP => return error.SymLinkLoop,
         .NAMETOOLONG => return error.NameTooLong,
@@ -3251,7 +3251,7 @@ pub fn chdirZ(dir_path: [*:0]const u8) ChangeCurDirError!void {
     switch (errno(system.chdir(dir_path))) {
         .SUCCESS => return,
         .ACCES => return error.AccessDenied,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .IO => return error.FileSystem,
         .LOOP => return error.SymLinkLoop,
         .NAMETOOLONG => return error.NameTooLong,
@@ -3286,7 +3286,7 @@ pub fn fchdir(dirfd: fd_t) FchdirError!void {
         switch (errno(system.fchdir(dirfd))) {
             .SUCCESS => return,
             .ACCES => return error.AccessDenied,
-            .BADF => unreachable,
+            // .BADF => unreachable,
             .NOTDIR => return error.NotDir,
             .INTR => continue,
             .IO => return error.FileSystem,
@@ -3359,7 +3359,7 @@ pub fn readlinkZ(file_path: [*:0]const u8, out_buffer: []u8) ReadLinkError![]u8 
     switch (errno(rc)) {
         .SUCCESS => return out_buffer[0..@bitCast(rc)],
         .ACCES => return error.AccessDenied,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .INVAL => return error.NotLink,
         .IO => return error.FileSystem,
         .LOOP => return error.SymLinkLoop,
@@ -3403,7 +3403,7 @@ pub fn readlinkatWasi(dirfd: fd_t, file_path: []const u8, out_buffer: []u8) Read
     switch (wasi.path_readlink(dirfd, file_path.ptr, file_path.len, out_buffer.ptr, out_buffer.len, &bufused)) {
         .SUCCESS => return out_buffer[0..bufused],
         .ACCES => return error.AccessDenied,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .INVAL => return error.NotLink,
         .IO => return error.FileSystem,
         .LOOP => return error.SymLinkLoop,
@@ -3437,7 +3437,7 @@ pub fn readlinkatZ(dirfd: fd_t, file_path: [*:0]const u8, out_buffer: []u8) Read
     switch (errno(rc)) {
         .SUCCESS => return out_buffer[0..@bitCast(rc)],
         .ACCES => return error.AccessDenied,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .INVAL => return error.NotLink,
         .IO => return error.FileSystem,
         .LOOP => return error.SymLinkLoop,
@@ -3713,8 +3713,8 @@ pub fn shutdown(sock: socket_t, how: ShutdownHow) ShutdownError!void {
         });
         switch (errno(rc)) {
             .SUCCESS => return,
-            .BADF => unreachable,
-            .INVAL => unreachable,
+            // .BADF => unreachable,
+            // .INVAL => unreachable,
             .NOTCONN => return error.SocketNotConnected,
             .NOTSOCK => unreachable,
             .NOBUFS => return error.SystemResources,
@@ -3794,12 +3794,12 @@ pub fn bind(sock: socket_t, addr: *const sockaddr, len: socklen_t) BindError!voi
             .SUCCESS => return,
             .ACCES, .PERM => return error.AccessDenied,
             .ADDRINUSE => return error.AddressInUse,
-            .BADF => unreachable, // always a race condition if this error is returned
-            .INVAL => unreachable, // invalid parameters
+            // .BADF => unreachable, // always a race condition if this error is returned
+            // .INVAL => unreachable, // invalid parameters
             .NOTSOCK => unreachable, // invalid `sockfd`
             .AFNOSUPPORT => return error.AddressFamilyNotSupported,
             .ADDRNOTAVAIL => return error.AddressNotAvailable,
-            .FAULT => unreachable, // invalid `addr` pointer
+            // .FAULT => unreachable, // invalid `addr` pointer
             .LOOP => return error.SymLinkLoop,
             .NAMETOOLONG => return error.NameTooLong,
             .NOENT => return error.FileNotFound,
@@ -3863,7 +3863,7 @@ pub fn listen(sock: socket_t, backlog: u31) ListenError!void {
         switch (errno(rc)) {
             .SUCCESS => return,
             .ADDRINUSE => return error.AddressInUse,
-            .BADF => unreachable,
+            // .BADF => unreachable,
             .NOTSOCK => return error.FileDescriptorNotASocket,
             .OPNOTSUPP => return error.OperationNotSupported,
             else => |err| return unexpectedErrno(err),
@@ -3971,9 +3971,9 @@ pub fn accept(
                 .SUCCESS => break @intCast(rc),
                 .INTR => continue,
                 .AGAIN => return error.WouldBlock,
-                .BADF => unreachable, // always a race condition
+                // .BADF => unreachable, // always a race condition
                 .CONNABORTED => return error.ConnectionAborted,
-                .FAULT => unreachable,
+                // .FAULT => unreachable,
                 .INVAL => return error.SocketNotListening,
                 .NOTSOCK => unreachable,
                 .MFILE => return error.ProcessFdQuotaExceeded,
@@ -4076,7 +4076,7 @@ pub fn epoll_create1(flags: u32) EpollCreateError!i32 {
         .SUCCESS => return @intCast(rc),
         else => |err| return unexpectedErrno(err),
 
-        .INVAL => unreachable,
+        // .INVAL => unreachable,
         .MFILE => return error.ProcessFdQuotaExceeded,
         .NFILE => return error.SystemFdQuotaExceeded,
         .NOMEM => return error.SystemResources,
@@ -4115,9 +4115,9 @@ pub fn epoll_ctl(epfd: i32, op: u32, fd: i32, event: ?*system.epoll_event) Epoll
         .SUCCESS => return,
         else => |err| return unexpectedErrno(err),
 
-        .BADF => unreachable, // always a race condition if this happens
+        // .BADF => unreachable, // always a race condition if this happens
         .EXIST => return error.FileDescriptorAlreadyPresentInSet,
-        .INVAL => unreachable,
+        // .INVAL => unreachable,
         .LOOP => return error.OperationCausesCircularLoop,
         .NOENT => return error.FileDescriptorNotRegistered,
         .NOMEM => return error.SystemResources,
@@ -4136,9 +4136,9 @@ pub fn epoll_wait(epfd: i32, events: []system.epoll_event, timeout: i32) usize {
         switch (errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
-            .BADF => unreachable,
-            .FAULT => unreachable,
-            .INVAL => unreachable,
+            // .BADF => unreachable,
+            // .FAULT => unreachable,
+            // .INVAL => unreachable,
             else => unreachable,
         }
     }
@@ -4156,7 +4156,7 @@ pub fn eventfd(initval: u32, flags: u32) EventFdError!i32 {
         .SUCCESS => return @intCast(rc),
         else => |err| return unexpectedErrno(err),
 
-        .INVAL => unreachable, // invalid parameters
+        // .INVAL => unreachable, // invalid parameters
         .MFILE => return error.ProcessFdQuotaExceeded,
         .NFILE => return error.SystemFdQuotaExceeded,
         .NODEV => return error.SystemResources,
@@ -4197,9 +4197,9 @@ pub fn getsockname(sock: socket_t, addr: *sockaddr, addrlen: *socklen_t) GetSock
             .SUCCESS => return,
             else => |err| return unexpectedErrno(err),
 
-            .BADF => unreachable, // always a race condition
-            .FAULT => unreachable,
-            .INVAL => unreachable, // invalid parameters
+            // .BADF => unreachable, // always a race condition
+            // .FAULT => unreachable,
+            // .INVAL => unreachable, // invalid parameters
             .NOTSOCK => return error.FileDescriptorNotASocket,
             .NOBUFS => return error.SystemResources,
         }
@@ -4226,9 +4226,9 @@ pub fn getpeername(sock: socket_t, addr: *sockaddr, addrlen: *socklen_t) GetSock
             .SUCCESS => return,
             else => |err| return unexpectedErrno(err),
 
-            .BADF => unreachable, // always a race condition
-            .FAULT => unreachable,
-            .INVAL => unreachable, // invalid parameters
+            // .BADF => unreachable, // always a race condition
+            // .FAULT => unreachable,
+            // .INVAL => unreachable, // invalid parameters
             .NOTSOCK => return error.FileDescriptorNotASocket,
             .NOBUFS => return error.SystemResources,
         }
@@ -4324,10 +4324,10 @@ pub fn connect(sock: socket_t, sock_addr: *const sockaddr, len: socklen_t) Conne
             .AFNOSUPPORT => return error.AddressFamilyNotSupported,
             .AGAIN, .INPROGRESS => return error.WouldBlock,
             .ALREADY => return error.ConnectionPending,
-            .BADF => unreachable, // sockfd is not a valid open file descriptor.
+            // .BADF => unreachable, // sockfd is not a valid open file descriptor.
             .CONNREFUSED => return error.ConnectionRefused,
             .CONNRESET => return error.ConnectionResetByPeer,
-            .FAULT => unreachable, // The socket structure address is outside the user's address space.
+            // .FAULT => unreachable, // The socket structure address is outside the user's address space.
             .INTR => continue,
             .ISCONN => unreachable, // The socket is already connected.
             .HOSTUNREACH => return error.NetworkUnreachable,
@@ -4359,10 +4359,10 @@ pub fn getsockopt(fd: socket_t, level: i32, optname: u32, opt: []u8) GetSockOptE
         .SUCCESS => {
             std.debug.assert(len == opt.len);
         },
-        .BADF => unreachable,
+        // .BADF => unreachable,
         .NOTSOCK => unreachable,
-        .INVAL => unreachable,
-        .FAULT => unreachable,
+        // .INVAL => unreachable,
+        // .FAULT => unreachable,
         .NOPROTOOPT => return error.InvalidProtocolOption,
         .NOMEM => return error.SystemResources,
         .NOBUFS => return error.SystemResources,
@@ -4386,9 +4386,9 @@ pub fn getsockoptError(sockfd: fd_t) ConnectError!void {
             .AFNOSUPPORT => return error.AddressFamilyNotSupported,
             .AGAIN => return error.SystemResources,
             .ALREADY => return error.ConnectionPending,
-            .BADF => unreachable, // sockfd is not a valid open file descriptor.
+            // .BADF => unreachable, // sockfd is not a valid open file descriptor.
             .CONNREFUSED => return error.ConnectionRefused,
-            .FAULT => unreachable, // The socket structure address is outside the user's address space.
+            // .FAULT => unreachable, // The socket structure address is outside the user's address space.
             .ISCONN => unreachable, // The socket is already connected.
             .HOSTUNREACH => return error.NetworkUnreachable,
             .NETUNREACH => return error.NetworkUnreachable,
@@ -4398,9 +4398,9 @@ pub fn getsockoptError(sockfd: fd_t) ConnectError!void {
             .CONNRESET => return error.ConnectionResetByPeer,
             else => |err| return unexpectedErrno(err),
         },
-        .BADF => unreachable, // The argument sockfd is not a valid file descriptor.
-        .FAULT => unreachable, // The address pointed to by optval or optlen is not in a valid part of the process address space.
-        .INVAL => unreachable,
+        // .BADF => unreachable, // The argument sockfd is not a valid file descriptor.
+        // .FAULT => unreachable, // The address pointed to by optval or optlen is not in a valid part of the process address space.
+        // .INVAL => unreachable,
         .NOPROTOOPT => unreachable, // The option is unknown at the level indicated.
         .NOTSOCK => unreachable, // The file descriptor sockfd does not refer to a socket.
         else => |err| return unexpectedErrno(err),
@@ -4425,7 +4425,7 @@ pub fn waitpid(pid: pid_t, flags: u32) WaitPidResult {
             },
             .INTR => continue,
             .CHILD => unreachable, // The process specified does not exist. It would be a race condition to handle this error.
-            .INVAL => unreachable, // Invalid flags.
+            // .INVAL => unreachable, // Invalid flags.
             else => unreachable,
         }
     }
@@ -4442,7 +4442,7 @@ pub fn wait4(pid: pid_t, flags: u32, ru: ?*rusage) WaitPidResult {
             },
             .INTR => continue,
             .CHILD => unreachable, // The process specified does not exist. It would be a race condition to handle this error.
-            .INVAL => unreachable, // Invalid flags.
+            // .INVAL => unreachable, // Invalid flags.
             else => unreachable,
         }
     }
@@ -4470,8 +4470,6 @@ pub fn fstat(fd: fd_t) FStatError!Stat {
     var stat = mem.zeroes(Stat);
     switch (errno(fstat_sym(fd, &stat))) {
         .SUCCESS => return stat,
-        .INVAL => unreachable,
-        .BADF => unreachable, // Always a race condition.
         .NOMEM => return error.SystemResources,
         .ACCES => return error.AccessDenied,
         else => |err| return unexpectedErrno(err),
@@ -4519,12 +4517,12 @@ pub fn fstatatZ(dirfd: fd_t, pathname: [*:0]const u8, flags: u32) FStatAtError!S
     var stat = mem.zeroes(Stat);
     switch (errno(fstatat_sym(dirfd, pathname, &stat, flags))) {
         .SUCCESS => return stat,
-        .INVAL => unreachable,
-        .BADF => unreachable, // Always a race condition.
+        // .INVAL => unreachable,
+        // .BADF => unreachable, // Always a race condition.
         .NOMEM => return error.SystemResources,
         .ACCES => return error.AccessDenied,
         .PERM => return error.PermissionDenied,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .NAMETOOLONG => return error.NameTooLong,
         .LOOP => return error.SymLinkLoop,
         .NOENT => return error.FileNotFound,
@@ -4591,10 +4589,10 @@ pub fn kevent(
         switch (errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .ACCES => return error.AccessDenied,
-            .FAULT => unreachable,
-            .BADF => unreachable, // Always a race condition.
+            // .FAULT => unreachable,
+            // .BADF => unreachable, // Always a race condition.
             .INTR => continue,
-            .INVAL => unreachable,
+            // .INVAL => unreachable,
             .NOENT => return error.EventNotFound,
             .NOMEM => return error.SystemResources,
             .SRCH => return error.ProcessNotFound,
@@ -4614,7 +4612,7 @@ pub fn inotify_init1(flags: u32) INotifyInitError!i32 {
     const rc = system.inotify_init1(flags);
     switch (errno(rc)) {
         .SUCCESS => return @intCast(rc),
-        .INVAL => unreachable,
+        // .INVAL => unreachable,
         .MFILE => return error.ProcessFdQuotaExceeded,
         .NFILE => return error.SystemFdQuotaExceeded,
         .NOMEM => return error.SystemResources,
@@ -4644,9 +4642,9 @@ pub fn inotify_add_watchZ(inotify_fd: i32, pathname: [*:0]const u8, mask: u32) I
     switch (errno(rc)) {
         .SUCCESS => return @intCast(rc),
         .ACCES => return error.AccessDenied,
-        .BADF => unreachable,
-        .FAULT => unreachable,
-        .INVAL => unreachable,
+        // .BADF => unreachable,
+        // .FAULT => unreachable,
+        // .INVAL => unreachable,
         .NAMETOOLONG => return error.NameTooLong,
         .NOENT => return error.FileNotFound,
         .NOMEM => return error.SystemResources,
@@ -4661,8 +4659,8 @@ pub fn inotify_add_watchZ(inotify_fd: i32, pathname: [*:0]const u8, mask: u32) I
 pub fn inotify_rm_watch(inotify_fd: i32, wd: i32) void {
     switch (errno(system.inotify_rm_watch(inotify_fd, wd))) {
         .SUCCESS => return,
-        .BADF => unreachable,
-        .INVAL => unreachable,
+        // .BADF => unreachable,
+        // .INVAL => unreachable,
         else => unreachable,
     }
 }
@@ -4729,9 +4727,9 @@ pub fn fanotify_markZ(
     const rc = system.fanotify_mark(fanotify_fd, flags, mask, dirfd, pathname);
     switch (errno(rc)) {
         .SUCCESS => return,
-        .BADF => unreachable,
+        // .BADF => unreachable,
         .EXIST => return error.MarkAlreadyExists,
-        .INVAL => unreachable,
+        // .INVAL => unreachable,
         .ISDIR => return error.IsDir,
         .NODEV => return error.NotAssociatedWithFileSystem,
         .NOENT => return error.FileNotFound,
@@ -4779,7 +4777,7 @@ pub fn mprotect(memory: []align(page_size_min) u8, protection: u32) MProtectErro
     } else {
         switch (errno(system.mprotect(memory.ptr, memory.len, protection))) {
             .SUCCESS => return,
-            .INVAL => unreachable,
+            // .INVAL => unreachable,
             .ACCES => return error.AccessDenied,
             .NOMEM => return error.OutOfMemory,
             else => |err| return unexpectedErrno(err),
@@ -4850,10 +4848,10 @@ pub fn mmap(
         .ACCES => return error.AccessDenied,
         .PERM => return error.PermissionDenied,
         .AGAIN => return error.LockedMemoryLimitExceeded,
-        .BADF => unreachable, // Always a race condition.
+        // .BADF => unreachable, // Always a race condition.
         .OVERFLOW => unreachable, // The number of pages used for length + offset would overflow.
         .NODEV => return error.MemoryMappingNotSupported,
-        .INVAL => unreachable, // Invalid parameters to mmap()
+        // .INVAL => unreachable, // Invalid parameters to mmap()
         .MFILE => return error.ProcessFdQuotaExceeded,
         .NFILE => return error.SystemFdQuotaExceeded,
         .NOMEM => return error.OutOfMemory,
@@ -4871,7 +4869,7 @@ pub fn mmap(
 pub fn munmap(memory: []align(page_size_min) const u8) void {
     switch (errno(system.munmap(memory.ptr, memory.len))) {
         .SUCCESS => return,
-        .INVAL => unreachable, // Invalid parameters.
+        // .INVAL => unreachable, // Invalid parameters.
         .NOMEM => unreachable, // Attempted to unmap a region in the middle of an existing mapping.
         else => unreachable,
     }
@@ -4906,7 +4904,7 @@ pub fn mremap(
         .AGAIN => return error.LockedMemoryLimitExceeded,
         .INVAL => return error.InvalidSyscallParameters,
         .NOMEM => return error.OutOfMemory,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         else => return unexpectedErrno(err),
     }
 }
@@ -4921,7 +4919,7 @@ pub fn msync(memory: []align(page_size_min) u8, flags: i32) MSyncError!void {
         .SUCCESS => return,
         .PERM => return error.PermissionDenied,
         .NOMEM => return error.UnmappedMemory, // Unsuccessful, provided pointer does not point mapped memory
-        .INVAL => unreachable, // Invalid parameters.
+        // .INVAL => unreachable, // Invalid parameters.
         else => unreachable,
     }
 }
@@ -4942,6 +4940,8 @@ pub const AccessError = error{
     /// Windows-only; file paths provided by the user must be valid WTF-8.
     /// https://simonsapin.github.io/wtf-8/
     InvalidWtf8,
+    /// Windows-only
+    InvalidArgument,
 } || UnexpectedError;
 
 /// check user's permissions for a file
@@ -4952,7 +4952,7 @@ pub const AccessError = error{
 ///
 /// On Windows, `mode` is ignored. This is a POSIX API that is only partially supported by
 /// Windows. See `fs` for the cross-platform file system API.
-pub fn access(path: []const u8, mode: u32) AccessError!void {
+pub fn access(path: []const u8, mode: c_int) AccessError!void {
     if (native_os == .windows) {
         const path_w = try windows.sliceToPrefixedFileW(null, path);
         _ = try windows.GetFileAttributesW(path_w.span().ptr);
@@ -4965,7 +4965,7 @@ pub fn access(path: []const u8, mode: u32) AccessError!void {
 }
 
 /// Same as `access` except `path` is null-terminated.
-pub fn accessZ(path: [*:0]const u8, mode: u32) AccessError!void {
+pub fn accessZ(path: [*:0]const u8, mode: c_int) AccessError!void {
     if (native_os == .windows) {
         const path_w = try windows.cStrToPrefixedFileW(null, path);
         _ = try windows.GetFileAttributesW(path_w.span().ptr);
@@ -4983,8 +4983,8 @@ pub fn accessZ(path: [*:0]const u8, mode: u32) AccessError!void {
         .NOTDIR => return error.FileNotFound,
         .NOENT => return error.FileNotFound,
         .NAMETOOLONG => return error.NameTooLong,
-        .INVAL => unreachable,
-        .FAULT => unreachable,
+        // .INVAL => unreachable,
+        // .FAULT => unreachable,
         .IO => return error.InputOutput,
         .NOMEM => return error.SystemResources,
         .ILSEQ => |err| if (native_os == .wasi)
@@ -5003,7 +5003,7 @@ pub fn accessZ(path: [*:0]const u8, mode: u32) AccessError!void {
 ///
 /// On Windows, `mode` is ignored. This is a POSIX API that is only partially supported by
 /// Windows. See `fs` for the cross-platform file system API.
-pub fn faccessat(dirfd: fd_t, path: []const u8, mode: u32, flags: u32) AccessError!void {
+pub fn faccessat(dirfd: fd_t, path: []const u8, mode: c_int, flags: c_int) AccessError!void {
     if (native_os == .windows) {
         const path_w = try windows.sliceToPrefixedFileW(dirfd, path);
         return faccessatW(dirfd, path_w.span().ptr);
@@ -5047,7 +5047,7 @@ pub fn faccessat(dirfd: fd_t, path: []const u8, mode: u32, flags: u32) AccessErr
 }
 
 /// Same as `faccessat` except the path parameter is null-terminated.
-pub fn faccessatZ(dirfd: fd_t, path: [*:0]const u8, mode: u32, flags: u32) AccessError!void {
+pub fn faccessatZ(dirfd: fd_t, path: [*:0]const u8, mode: c_int, flags: c_int) AccessError!void {
     if (native_os == .windows) {
         const path_w = try windows.cStrToPrefixedFileW(dirfd, path);
         return faccessatW(dirfd, path_w.span().ptr);
@@ -5064,8 +5064,8 @@ pub fn faccessatZ(dirfd: fd_t, path: [*:0]const u8, mode: u32, flags: u32) Acces
         .NOTDIR => return error.FileNotFound,
         .NOENT => return error.FileNotFound,
         .NAMETOOLONG => return error.NameTooLong,
-        .INVAL => unreachable,
-        .FAULT => unreachable,
+        // .INVAL => unreachable,
+        // .FAULT => unreachable,
         .IO => return error.InputOutput,
         .NOMEM => return error.SystemResources,
         .ILSEQ => |err| if (native_os == .wasi)
@@ -5105,10 +5105,10 @@ pub fn faccessatW(dirfd: fd_t, sub_path_w: [*:0]const u16) AccessError!void {
         .SUCCESS => return,
         .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
         .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
-        .OBJECT_NAME_INVALID => unreachable,
-        .INVALID_PARAMETER => unreachable,
+        // .OBJECT_NAME_INVALID => unreachable,
+        // .INVALID_PARAMETER => unreachable,
         .ACCESS_DENIED => return error.AccessDenied,
-        .OBJECT_PATH_SYNTAX_BAD => unreachable,
+        // .OBJECT_PATH_SYNTAX_BAD => unreachable,
         else => |rc| return windows.unexpectedStatus(rc),
     }
 }
@@ -5123,8 +5123,8 @@ pub fn pipe() PipeError![2]fd_t {
     var fds: [2]fd_t = undefined;
     switch (errno(system.pipe(&fds))) {
         .SUCCESS => return fds,
-        .INVAL => unreachable, // Invalid parameters to pipe()
-        .FAULT => unreachable, // Invalid fds pointer
+        // .INVAL => unreachable, // Invalid parameters to pipe()
+        // .FAULT => unreachable, // Invalid fds pointer
         .NFILE => return error.SystemFdQuotaExceeded,
         .MFILE => return error.ProcessFdQuotaExceeded,
         else => |err| return unexpectedErrno(err),
@@ -5136,8 +5136,8 @@ pub fn pipe2(flags: O) PipeError![2]fd_t {
         var fds: [2]fd_t = undefined;
         switch (errno(system.pipe2(&fds, flags))) {
             .SUCCESS => return fds,
-            .INVAL => unreachable, // Invalid flags
-            .FAULT => unreachable, // Invalid fds pointer
+            // .INVAL => unreachable, // Invalid flags
+            // .FAULT => unreachable, // Invalid fds pointer
             .NFILE => return error.SystemFdQuotaExceeded,
             .MFILE => return error.ProcessFdQuotaExceeded,
             else => |err| return unexpectedErrno(err),
@@ -5160,8 +5160,8 @@ pub fn pipe2(flags: O) PipeError![2]fd_t {
         for (fds) |fd| {
             switch (errno(system.fcntl(fd, F.SETFD, @as(u32, FD_CLOEXEC)))) {
                 .SUCCESS => {},
-                .INVAL => unreachable, // Invalid flags
-                .BADF => unreachable, // Always a race condition
+                // .INVAL => unreachable, // Invalid flags
+                // .BADF => unreachable, // Always a race condition
                 else => |err| return unexpectedErrno(err),
             }
         }
@@ -5177,8 +5177,8 @@ pub fn pipe2(flags: O) PipeError![2]fd_t {
         for (fds) |fd| {
             switch (errno(system.fcntl(fd, F.SETFL, new_flags))) {
                 .SUCCESS => {},
-                .INVAL => unreachable, // Invalid flags
-                .BADF => unreachable, // Always a race condition
+                // .INVAL => unreachable, // Invalid flags
+                // .BADF => unreachable, // Always a race condition
                 else => |err| return unexpectedErrno(err),
             }
         }
@@ -5211,7 +5211,7 @@ pub fn sysctl(
     const name_len = cast(c_uint, name.len) orelse return error.NameTooLong;
     switch (errno(system.sysctl(name.ptr, name_len, oldp, oldlenp, newp, newlen))) {
         .SUCCESS => return,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .PERM => return error.PermissionDenied,
         .NOMEM => return error.SystemResources,
         .NOENT => return error.UnknownName,
@@ -5235,7 +5235,7 @@ pub fn sysctlbynameZ(
 
     switch (errno(system.sysctlbyname(name, oldp, oldlenp, newp, newlen))) {
         .SUCCESS => return,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .PERM => return error.PermissionDenied,
         .NOMEM => return error.SystemResources,
         .NOENT => return error.UnknownName,
@@ -5246,7 +5246,7 @@ pub fn sysctlbynameZ(
 pub fn gettimeofday(tv: ?*timeval, tz: ?*timezone) void {
     switch (errno(system.gettimeofday(tv, tz))) {
         .SUCCESS => return,
-        .INVAL => unreachable,
+        // .INVAL => unreachable,
         else => unreachable,
     }
 }
@@ -5265,7 +5265,7 @@ pub fn lseek_SET(fd: fd_t, offset: u64) SeekError!void {
         var result: u64 = undefined;
         switch (errno(system.llseek(fd, offset, &result, SEEK.SET))) {
             .SUCCESS => return,
-            .BADF => unreachable, // always a race condition
+            // .BADF => unreachable, // always a race condition
             .INVAL => return error.Unseekable,
             .OVERFLOW => return error.Unseekable,
             .SPIPE => return error.Unseekable,
@@ -5280,7 +5280,7 @@ pub fn lseek_SET(fd: fd_t, offset: u64) SeekError!void {
         var new_offset: wasi.filesize_t = undefined;
         switch (wasi.fd_seek(fd, @bitCast(offset), .SET, &new_offset)) {
             .SUCCESS => return,
-            .BADF => unreachable, // always a race condition
+            // .BADF => unreachable, // always a race condition
             .INVAL => return error.Unseekable,
             .OVERFLOW => return error.Unseekable,
             .SPIPE => return error.Unseekable,
@@ -5293,7 +5293,7 @@ pub fn lseek_SET(fd: fd_t, offset: u64) SeekError!void {
     const lseek_sym = if (lfs64_abi) system.lseek64 else system.lseek;
     switch (errno(lseek_sym(fd, @bitCast(offset), SEEK.SET))) {
         .SUCCESS => return,
-        .BADF => unreachable, // always a race condition
+        // .BADF => unreachable, // always a race condition
         .INVAL => return error.Unseekable,
         .OVERFLOW => return error.Unseekable,
         .SPIPE => return error.Unseekable,
@@ -5308,7 +5308,7 @@ pub fn lseek_CUR(fd: fd_t, offset: i64) SeekError!void {
         var result: u64 = undefined;
         switch (errno(system.llseek(fd, @bitCast(offset), &result, SEEK.CUR))) {
             .SUCCESS => return,
-            .BADF => unreachable, // always a race condition
+            // .BADF => unreachable, // always a race condition
             .INVAL => return error.Unseekable,
             .OVERFLOW => return error.Unseekable,
             .SPIPE => return error.Unseekable,
@@ -5323,7 +5323,7 @@ pub fn lseek_CUR(fd: fd_t, offset: i64) SeekError!void {
         var new_offset: wasi.filesize_t = undefined;
         switch (wasi.fd_seek(fd, offset, .CUR, &new_offset)) {
             .SUCCESS => return,
-            .BADF => unreachable, // always a race condition
+            // .BADF => unreachable, // always a race condition
             .INVAL => return error.Unseekable,
             .OVERFLOW => return error.Unseekable,
             .SPIPE => return error.Unseekable,
@@ -5335,7 +5335,7 @@ pub fn lseek_CUR(fd: fd_t, offset: i64) SeekError!void {
     const lseek_sym = if (lfs64_abi) system.lseek64 else system.lseek;
     switch (errno(lseek_sym(fd, @bitCast(offset), SEEK.CUR))) {
         .SUCCESS => return,
-        .BADF => unreachable, // always a race condition
+        // .BADF => unreachable, // always a race condition
         .INVAL => return error.Unseekable,
         .OVERFLOW => return error.Unseekable,
         .SPIPE => return error.Unseekable,
@@ -5350,7 +5350,7 @@ pub fn lseek_END(fd: fd_t, offset: i64) SeekError!void {
         var result: u64 = undefined;
         switch (errno(system.llseek(fd, @bitCast(offset), &result, SEEK.END))) {
             .SUCCESS => return,
-            .BADF => unreachable, // always a race condition
+            // .BADF => unreachable, // always a race condition
             .INVAL => return error.Unseekable,
             .OVERFLOW => return error.Unseekable,
             .SPIPE => return error.Unseekable,
@@ -5365,7 +5365,7 @@ pub fn lseek_END(fd: fd_t, offset: i64) SeekError!void {
         var new_offset: wasi.filesize_t = undefined;
         switch (wasi.fd_seek(fd, offset, .END, &new_offset)) {
             .SUCCESS => return,
-            .BADF => unreachable, // always a race condition
+            // .BADF => unreachable, // always a race condition
             .INVAL => return error.Unseekable,
             .OVERFLOW => return error.Unseekable,
             .SPIPE => return error.Unseekable,
@@ -5377,7 +5377,7 @@ pub fn lseek_END(fd: fd_t, offset: i64) SeekError!void {
     const lseek_sym = if (lfs64_abi) system.lseek64 else system.lseek;
     switch (errno(lseek_sym(fd, @bitCast(offset), SEEK.END))) {
         .SUCCESS => return,
-        .BADF => unreachable, // always a race condition
+        // .BADF => unreachable, // always a race condition
         .INVAL => return error.Unseekable,
         .OVERFLOW => return error.Unseekable,
         .SPIPE => return error.Unseekable,
@@ -5392,7 +5392,7 @@ pub fn lseek_CUR_get(fd: fd_t) SeekError!u64 {
         var result: u64 = undefined;
         switch (errno(system.llseek(fd, 0, &result, SEEK.CUR))) {
             .SUCCESS => return result,
-            .BADF => unreachable, // always a race condition
+            // .BADF => unreachable, // always a race condition
             .INVAL => return error.Unseekable,
             .OVERFLOW => return error.Unseekable,
             .SPIPE => return error.Unseekable,
@@ -5407,7 +5407,7 @@ pub fn lseek_CUR_get(fd: fd_t) SeekError!u64 {
         var new_offset: wasi.filesize_t = undefined;
         switch (wasi.fd_seek(fd, 0, .CUR, &new_offset)) {
             .SUCCESS => return new_offset,
-            .BADF => unreachable, // always a race condition
+            // .BADF => unreachable, // always a race condition
             .INVAL => return error.Unseekable,
             .OVERFLOW => return error.Unseekable,
             .SPIPE => return error.Unseekable,
@@ -5420,7 +5420,7 @@ pub fn lseek_CUR_get(fd: fd_t) SeekError!u64 {
     const rc = lseek_sym(fd, 0, SEEK.CUR);
     switch (errno(rc)) {
         .SUCCESS => return @bitCast(rc),
-        .BADF => unreachable, // always a race condition
+        // .BADF => unreachable, // always a race condition
         .INVAL => return error.Unseekable,
         .OVERFLOW => return error.Unseekable,
         .SPIPE => return error.Unseekable,
@@ -5445,9 +5445,9 @@ pub fn fcntl(fd: fd_t, cmd: i32, arg: usize) FcntlError!usize {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
             .AGAIN, .ACCES => return error.Locked,
-            .BADF => unreachable,
+            // .BADF => unreachable,
             .BUSY => return error.FileBusy,
-            .INVAL => unreachable, // invalid parameters
+            // .INVAL => unreachable, // invalid parameters
             .PERM => return error.PermissionDenied,
             .MFILE => return error.ProcessFdQuotaExceeded,
             .NOTDIR => unreachable, // invalid parameter
@@ -5475,9 +5475,9 @@ pub fn flock(fd: fd_t, operation: i32) FlockError!void {
         const rc = system.flock(fd, operation);
         switch (errno(rc)) {
             .SUCCESS => return,
-            .BADF => unreachable,
+            // .BADF => unreachable,
             .INTR => continue,
-            .INVAL => unreachable, // invalid parameters
+            // .INVAL => unreachable, // invalid parameters
             .NOLCK => return error.SystemResources,
             .AGAIN => return error.WouldBlock, // TODO: integrate with async instead of just returning an error
             .OPNOTSUPP => return error.FileLocksNotSupported,
@@ -5594,9 +5594,9 @@ pub fn realpathZ(pathname: [*:0]const u8, out_buffer: *[max_path_bytes]u8) RealP
     }
     const result_path = std.c.realpath(pathname, out_buffer) orelse switch (@as(E, @enumFromInt(std.c._errno().*))) {
         .SUCCESS => unreachable,
-        .INVAL => unreachable,
-        .BADF => unreachable,
-        .FAULT => unreachable,
+        // .INVAL => unreachable,
+        // .BADF => unreachable,
+        // .FAULT => unreachable,
         .ACCES => return error.AccessDenied,
         .NOENT => return error.FileNotFound,
         .OPNOTSUPP => return error.NotSupported,
@@ -5616,6 +5616,10 @@ pub fn realpathZ(pathname: [*:0]const u8, out_buffer: *[max_path_bytes]u8) RealP
 /// Calling this function is usually a bug.
 pub fn realpathW(pathname: []const u16, out_buffer: *[max_path_bytes]u8) RealPathError![]u8 {
     const w = windows;
+
+    if (pathname.len == 1 and pathname[0] == '.') {
+        return std.os.getFdPath(std.fs.cwd().fd, out_buffer);
+    }
 
     const dir = fs.cwd().fd;
     const access_mask = w.GENERIC_READ | w.SYNCHRONIZE;
@@ -5648,7 +5652,7 @@ pub fn nanosleep(seconds: u64, nanoseconds: u64) void {
     var rem: timespec = undefined;
     while (true) {
         switch (errno(system.nanosleep(&req, &rem))) {
-            .FAULT => unreachable,
+            // .FAULT => unreachable,
             .INVAL => {
                 // Sometimes Darwin returns EINVAL for no reason.
                 // We treat it as a spurious wakeup.
@@ -5774,7 +5778,7 @@ pub fn clock_gettime(clock_id: clockid_t) ClockGetTimeError!timespec {
 
     switch (errno(system.clock_gettime(clock_id, &tp))) {
         .SUCCESS => return tp,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .INVAL => return error.UnsupportedClock,
         else => |err| return unexpectedErrno(err),
     }
@@ -5796,7 +5800,7 @@ pub fn clock_getres(clock_id: clockid_t, res: *timespec) ClockGetTimeError!void 
 
     switch (errno(system.clock_getres(clock_id, res))) {
         .SUCCESS => return,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .INVAL => return error.UnsupportedClock,
         else => |err| return unexpectedErrno(err),
     }
@@ -5808,8 +5812,8 @@ pub fn sched_getaffinity(pid: pid_t) SchedGetAffinityError!cpu_set_t {
     var set: cpu_set_t = undefined;
     switch (errno(system.sched_getaffinity(pid, @sizeOf(cpu_set_t), &set))) {
         .SUCCESS => return set,
-        .FAULT => unreachable,
-        .INVAL => unreachable,
+        // .FAULT => unreachable,
+        // .INVAL => unreachable,
         .SRCH => unreachable,
         .PERM => return error.PermissionDenied,
         else => |err| return unexpectedErrno(err),
@@ -5827,8 +5831,8 @@ pub const SigaltstackError = error{
 pub fn sigaltstack(ss: ?*stack_t, old_ss: ?*stack_t) SigaltstackError!void {
     switch (errno(system.sigaltstack(ss, old_ss))) {
         .SUCCESS => return,
-        .FAULT => unreachable,
-        .INVAL => unreachable,
+        // .FAULT => unreachable,
+        // .INVAL => unreachable,
         .NOMEM => return error.SizeTooSmall,
         .PERM => return error.PermissionDenied,
         else => |err| return unexpectedErrno(err),
@@ -5897,7 +5901,7 @@ pub fn sigaction(sig: u8, noalias act: ?*const Sigaction, noalias oact: ?*Sigact
         // EINVAL means the signal is either invalid or some signal that cannot have its action
         // changed. For POSIX, this means SIGKILL/SIGSTOP. For e.g. Solaris, this also includes the
         // non-standard SIGWAITING, SIGCANCEL, and SIGLWP. Either way, programmer error.
-        .INVAL => unreachable,
+        // .INVAL => unreachable,
         else => unreachable,
     }
 }
@@ -5906,8 +5910,8 @@ pub fn sigaction(sig: u8, noalias act: ?*const Sigaction, noalias oact: ?*Sigact
 pub fn sigprocmask(flags: u32, noalias set: ?*const sigset_t, noalias oldset: ?*sigset_t) void {
     switch (errno(system.sigprocmask(@bitCast(flags), set, oldset))) {
         .SUCCESS => return,
-        .FAULT => unreachable,
-        .INVAL => unreachable,
+        // .FAULT => unreachable,
+        // .INVAL => unreachable,
         else => unreachable,
     }
 }
@@ -5960,9 +5964,9 @@ pub fn futimens(fd: fd_t, times: ?*const [2]timespec) FutimensError!void {
             .SUCCESS => return,
             .ACCES => return error.AccessDenied,
             .PERM => return error.PermissionDenied,
-            .BADF => unreachable, // always a race condition
-            .FAULT => unreachable,
-            .INVAL => unreachable,
+            // .BADF => unreachable, // always a race condition
+            // .FAULT => unreachable,
+            // .INVAL => unreachable,
             .ROFS => return error.ReadOnlyFileSystem,
             else => |err| return unexpectedErrno(err),
         }
@@ -5972,9 +5976,9 @@ pub fn futimens(fd: fd_t, times: ?*const [2]timespec) FutimensError!void {
         .SUCCESS => return,
         .ACCES => return error.AccessDenied,
         .PERM => return error.PermissionDenied,
-        .BADF => unreachable, // always a race condition
-        .FAULT => unreachable,
-        .INVAL => unreachable,
+        // .BADF => unreachable, // always a race condition
+        // .FAULT => unreachable,
+        // .INVAL => unreachable,
         .ROFS => return error.ReadOnlyFileSystem,
         else => |err| return unexpectedErrno(err),
     }
@@ -5986,7 +5990,7 @@ pub fn gethostname(name_buffer: *[HOST_NAME_MAX]u8) GetHostNameError![]u8 {
     if (builtin.link_libc) {
         switch (errno(system.gethostname(name_buffer, name_buffer.len))) {
             .SUCCESS => return mem.sliceTo(name_buffer, 0),
-            .FAULT => unreachable,
+            // .FAULT => unreachable,
             .NAMETOOLONG => unreachable, // HOST_NAME_MAX prevents this
             .PERM => return error.PermissionDenied,
             else => |err| return unexpectedErrno(err),
@@ -6007,7 +6011,7 @@ pub fn uname() utsname {
     var uts: utsname = undefined;
     switch (errno(system.uname(&uts))) {
         .SUCCESS => return uts,
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         else => unreachable,
     }
 }
@@ -6173,12 +6177,12 @@ pub fn sendmsg(
                 .ACCES => return error.AccessDenied,
                 .AGAIN => return error.WouldBlock,
                 .ALREADY => return error.FastOpenAlreadyInProgress,
-                .BADF => unreachable, // always a race condition
+                // .BADF => unreachable, // always a race condition
                 .CONNRESET => return error.ConnectionResetByPeer,
                 .DESTADDRREQ => unreachable, // The socket is not connection-mode, and no peer address is set.
-                .FAULT => unreachable, // An invalid user space address was specified for an argument.
+                // .FAULT => unreachable, // An invalid user space address was specified for an argument.
                 .INTR => continue,
-                .INVAL => unreachable, // Invalid argument passed.
+                // .INVAL => unreachable, // Invalid argument passed.
                 .ISCONN => unreachable, // connection-mode socket was connected already but a recipient was specified
                 .MSGSIZE => return error.MessageTooBig,
                 .NOBUFS => return error.SystemResources,
@@ -6277,11 +6281,11 @@ pub fn sendto(
             .ACCES => return error.AccessDenied,
             .AGAIN => return error.WouldBlock,
             .ALREADY => return error.FastOpenAlreadyInProgress,
-            .BADF => unreachable, // always a race condition
+            // .BADF => unreachable, // always a race condition
             .CONNREFUSED => return error.ConnectionRefused,
             .CONNRESET => return error.ConnectionResetByPeer,
             .DESTADDRREQ => unreachable, // The socket is not connection-mode, and no peer address is set.
-            .FAULT => unreachable, // An invalid user space address was specified for an argument.
+            // .FAULT => unreachable, // An invalid user space address was specified for an argument.
             .INTR => continue,
             .INVAL => return error.UnreachableAddress,
             .ISCONN => unreachable, // connection-mode socket was connected already but a recipient was specified
@@ -6462,9 +6466,9 @@ pub fn poll(fds: []pollfd, timeout: i32) PollError!usize {
         const rc = system.poll(fds.ptr, fds_count, timeout);
         switch (errno(rc)) {
             .SUCCESS => return @intCast(rc),
-            .FAULT => unreachable,
+            // .FAULT => unreachable,
             .INTR => continue,
-            .INVAL => unreachable,
+            // .INVAL => unreachable,
             .NOMEM => return error.SystemResources,
             else => |err| return unexpectedErrno(err),
         }
@@ -6491,9 +6495,9 @@ pub fn ppoll(fds: []pollfd, timeout: ?*const timespec, mask: ?*const sigset_t) P
     const rc = system.ppoll(fds.ptr, fds_count, ts_ptr, mask);
     switch (errno(rc)) {
         .SUCCESS => return @intCast(rc),
-        .FAULT => unreachable,
+        // .FAULT => unreachable,
         .INTR => return error.SignalInterrupt,
-        .INVAL => unreachable,
+        // .INVAL => unreachable,
         .NOMEM => return error.SystemResources,
         else => |err| return unexpectedErrno(err),
     }
@@ -6562,9 +6566,9 @@ pub fn recvfrom(
         } else {
             switch (errno(rc)) {
                 .SUCCESS => return @intCast(rc),
-                .BADF => unreachable, // always a race condition
-                .FAULT => unreachable,
-                .INVAL => unreachable,
+                // .BADF => unreachable, // always a race condition
+                // .FAULT => unreachable,
+                // .INVAL => unreachable,
                 .NOTCONN => return error.SocketNotConnected,
                 .NOTSOCK => unreachable,
                 .INTR => continue,
@@ -6670,10 +6674,10 @@ pub fn setsockopt(fd: socket_t, level: i32, optname: u32, opt: []const u8) SetSo
     } else {
         switch (errno(system.setsockopt(fd, level, optname, opt.ptr, @intCast(opt.len)))) {
             .SUCCESS => {},
-            .BADF => unreachable, // always a race condition
+            // .BADF => unreachable, // always a race condition
             .NOTSOCK => unreachable, // always a race condition
-            .INVAL => unreachable,
-            .FAULT => unreachable,
+            // .INVAL => unreachable,
+            // .FAULT => unreachable,
             .DOM => return error.TimeoutTooBig,
             .ISCONN => return error.AlreadyConnected,
             .NOPROTOOPT => return error.InvalidProtocolOption,
@@ -6705,7 +6709,7 @@ pub fn memfd_createZ(name: [*:0]const u8, flags: u32) MemFdCreateError!fd_t {
             const rc = sys.memfd_create(name, flags);
             switch (errno(rc)) {
                 .SUCCESS => return @intCast(rc),
-                .FAULT => unreachable, // name has invalid memory
+                // .FAULT => unreachable, // name has invalid memory
                 .INVAL => return error.NameTooLong, // or, program has a bug and flags are faulty
                 .NFILE => return error.SystemFdQuotaExceeded,
                 .MFILE => return error.ProcessFdQuotaExceeded,
@@ -6719,8 +6723,8 @@ pub fn memfd_createZ(name: [*:0]const u8, flags: u32) MemFdCreateError!fd_t {
             const rc = system.memfd_create(name, flags);
             switch (errno(rc)) {
                 .SUCCESS => return rc,
-                .BADF => unreachable, // name argument NULL
-                .INVAL => unreachable, // name too long or invalid/unsupported flags.
+                // .BADF => unreachable, // name argument NULL
+                // .INVAL => unreachable, // name too long or invalid/unsupported flags.
                 .MFILE => return error.ProcessFdQuotaExceeded,
                 .NFILE => return error.SystemFdQuotaExceeded,
                 .NOSYS => return error.SystemOutdated,
@@ -6744,8 +6748,8 @@ pub fn getrusage(who: i32) rusage {
     const rc = system.getrusage(who, &result);
     switch (errno(rc)) {
         .SUCCESS => return result,
-        .INVAL => unreachable,
-        .FAULT => unreachable,
+        // .INVAL => unreachable,
+        // .FAULT => unreachable,
         else => unreachable,
     }
 }
@@ -6760,7 +6764,7 @@ pub fn tcgetattr(handle: fd_t) TermiosGetError!termios {
         switch (errno(system.tcgetattr(handle, &term))) {
             .SUCCESS => return term,
             .INTR => continue,
-            .BADF => unreachable,
+            // .BADF => unreachable,
             .NOTTY => return error.NotATerminal,
             else => |err| return unexpectedErrno(err),
         }
@@ -6773,9 +6777,9 @@ pub fn tcsetattr(handle: fd_t, optional_action: TCSA, termios_p: termios) Termio
     while (true) {
         switch (errno(system.tcsetattr(handle, optional_action, &termios_p))) {
             .SUCCESS => return,
-            .BADF => unreachable,
+            // .BADF => unreachable,
             .INTR => continue,
-            .INVAL => unreachable,
+            // .INVAL => unreachable,
             .NOTTY => return error.NotATerminal,
             .IO => return error.ProcessOrphaned,
             else => |err| return unexpectedErrno(err),
@@ -6791,8 +6795,8 @@ pub fn tcgetpgrp(handle: fd_t) TermioGetPgrpError!pid_t {
         var pgrp: pid_t = undefined;
         switch (errno(system.tcgetpgrp(handle, &pgrp))) {
             .SUCCESS => return pgrp,
-            .BADF => unreachable,
-            .INVAL => unreachable,
+            // .BADF => unreachable,
+            // .INVAL => unreachable,
             .INTR => continue,
             .NOTTY => return error.NotATerminal,
             else => |err| return unexpectedErrno(err),
@@ -6810,8 +6814,8 @@ pub fn tcsetpgrp(handle: fd_t, pgrp: pid_t) TermioSetPgrpError!void {
     while (true) {
         switch (errno(system.tcsetpgrp(handle, &pgrp))) {
             .SUCCESS => return,
-            .BADF => unreachable,
-            .INVAL => unreachable,
+            // .BADF => unreachable,
+            // .INVAL => unreachable,
             .INTR => continue,
             .NOTTY => return error.NotATerminal,
             .PERM => return TermioSetPgrpError.NotAPgrpMember,
@@ -6838,7 +6842,7 @@ pub fn signalfd(fd: fd_t, mask: *const sigset_t, flags: u32) !fd_t {
     const rc = system.signalfd(fd, mask, flags);
     switch (errno(rc)) {
         .SUCCESS => return @intCast(rc),
-        .BADF, .INVAL => unreachable,
+        // .BADF, .INVAL => unreachable,
         .NFILE => return error.SystemFdQuotaExceeded,
         .NOMEM => return error.SystemResources,
         .MFILE => return error.ProcessResources,
@@ -6948,7 +6952,7 @@ pub fn prctl(option: PR, args: anytype) PrctlError!u31 {
         .ACCES => return error.AccessDenied,
         .BADF => return error.InvalidFileDescriptor,
         .FAULT => return error.InvalidAddress,
-        .INVAL => unreachable,
+        // .INVAL => unreachable,
         .NODEV, .NXIO => return error.UnsupportedFeature,
         .OPNOTSUPP => return error.OperationNotSupported,
         .PERM, .BUSY => return error.PermissionDenied,
@@ -6965,8 +6969,8 @@ pub fn getrlimit(resource: rlimit_resource) GetrlimitError!rlimit {
     var limits: rlimit = undefined;
     switch (errno(getrlimit_sym(resource, &limits))) {
         .SUCCESS => return limits,
-        .FAULT => unreachable, // bogus pointer
-        .INVAL => unreachable,
+        // .FAULT => unreachable, // bogus pointer
+        // .INVAL => unreachable,
         else => |err| return unexpectedErrno(err),
     }
 }
@@ -6978,7 +6982,7 @@ pub fn setrlimit(resource: rlimit_resource, limits: rlimit) SetrlimitError!void 
 
     switch (errno(setrlimit_sym(resource, &limits))) {
         .SUCCESS => return,
-        .FAULT => unreachable, // bogus pointer
+        // .FAULT => unreachable, // bogus pointer
         .INVAL => return error.LimitTooBig, // this could also mean "invalid resource", but that would be unreachable
         .PERM => return error.PermissionDenied,
         else => |err| return unexpectedErrno(err),
@@ -7054,7 +7058,7 @@ pub fn madvise(ptr: [*]align(page_size_min) u8, length: usize, advice: u32) Madv
         .PERM => return error.PermissionDenied,
         .ACCES => return error.AccessDenied,
         .AGAIN => return error.SystemResources,
-        .BADF => unreachable, // The map exists, but the area maps something that isn't a file.
+        // .BADF => unreachable, // The map exists, but the area maps something that isn't a file.
         .INVAL => return error.InvalidSyscall,
         .IO => return error.WouldExceedMaximumResidentSetSize,
         .NOMEM => return error.OutOfMemory,
@@ -7131,10 +7135,10 @@ pub fn perf_event_open(
             .SUCCESS => return @intCast(rc),
             .@"2BIG" => return error.TooBig,
             .ACCES => return error.PermissionDenied,
-            .BADF => unreachable, // group_fd file descriptor is not valid.
+            // .BADF => unreachable, // group_fd file descriptor is not valid.
             .BUSY => return error.DeviceBusy,
-            .FAULT => unreachable, // Segmentation fault.
-            .INVAL => unreachable, // Bad attr settings.
+            // .FAULT => unreachable, // Segmentation fault.
+            // .INVAL => unreachable, // Bad attr settings.
             .INTR => unreachable, // Mixed perf and ftrace handling for a uprobe.
             .MFILE => return error.ProcessResources,
             .NODEV => return error.EventRequiresUnsupportedCpuFeature,
@@ -7165,7 +7169,7 @@ pub fn timerfd_create(clock_id: system.timerfd_clockid_t, flags: system.TFD) Tim
     const rc = system.timerfd_create(clock_id, @bitCast(flags));
     return switch (errno(rc)) {
         .SUCCESS => @intCast(rc),
-        .INVAL => unreachable,
+        // .INVAL => unreachable,
         .MFILE => return error.ProcessFdQuotaExceeded,
         .NFILE => return error.SystemFdQuotaExceeded,
         .NODEV => return error.NoDevice,
@@ -7185,8 +7189,8 @@ pub fn timerfd_settime(
     return switch (errno(rc)) {
         .SUCCESS => {},
         .BADF => error.InvalidHandle,
-        .FAULT => unreachable,
-        .INVAL => unreachable,
+        // .FAULT => unreachable,
+        // .INVAL => unreachable,
         .CANCELED => error.Canceled,
         else => |err| return unexpectedErrno(err),
     };
@@ -7198,8 +7202,8 @@ pub fn timerfd_gettime(fd: i32) TimerFdGetError!system.itimerspec {
     return switch (errno(rc)) {
         .SUCCESS => return curr_value,
         .BADF => error.InvalidHandle,
-        .FAULT => unreachable,
-        .INVAL => unreachable,
+        // .FAULT => unreachable,
+        // .INVAL => unreachable,
         else => |err| return unexpectedErrno(err),
     };
 }
@@ -7219,8 +7223,8 @@ pub fn ptrace(request: u32, pid: pid_t, addr: usize, signal: usize) PtraceError!
         .linux => switch (errno(linux.ptrace(request, pid, addr, signal, 0))) {
             .SUCCESS => {},
             .SRCH => error.ProcessNotFound,
-            .FAULT => unreachable,
-            .INVAL => unreachable,
+            // .FAULT => unreachable,
+            // .INVAL => unreachable,
             .IO => return error.InputOutput,
             .PERM => error.PermissionDenied,
             .BUSY => error.DeviceBusy,
@@ -7235,7 +7239,7 @@ pub fn ptrace(request: u32, pid: pid_t, addr: usize, signal: usize) PtraceError!
         ))) {
             .SUCCESS => {},
             .SRCH => error.ProcessNotFound,
-            .INVAL => unreachable,
+            // .INVAL => unreachable,
             .PERM => error.PermissionDenied,
             .BUSY => error.DeviceBusy,
             else => |err| return unexpectedErrno(err),
@@ -7244,7 +7248,7 @@ pub fn ptrace(request: u32, pid: pid_t, addr: usize, signal: usize) PtraceError!
         else => switch (errno(system.ptrace(request, pid, addr, signal))) {
             .SUCCESS => {},
             .SRCH => error.ProcessNotFound,
-            .INVAL => unreachable,
+            // .INVAL => unreachable,
             .PERM => error.PermissionDenied,
             .BUSY => error.DeviceBusy,
             else => |err| return unexpectedErrno(err),
@@ -7280,8 +7284,8 @@ pub fn name_to_handle_atZ(
 ) NameToFileHandleAtError!void {
     switch (errno(system.name_to_handle_at(dirfd, pathname_z, handle, mount_id, flags))) {
         .SUCCESS => {},
-        .FAULT => unreachable, // pathname, mount_id, or handle outside accessible address space
-        .INVAL => unreachable, // bad flags, or handle_bytes too big
+        // .FAULT => unreachable, // pathname, mount_id, or handle outside accessible address space
+        // .INVAL => unreachable, // bad flags, or handle_bytes too big
         .NOENT => return error.FileNotFound,
         .NOTDIR => return error.NotDir,
         .OPNOTSUPP => return error.OperationNotSupported,
@@ -7299,11 +7303,11 @@ pub fn ioctl_SIOCGIFINDEX(fd: fd_t, ifr: *ifreq) IoCtl_SIOCGIFINDEX_Error!void {
     while (true) {
         switch (errno(system.ioctl(fd, SIOCGIFINDEX, @intFromPtr(ifr)))) {
             .SUCCESS => return,
-            .INVAL => unreachable, // Bad parameters.
+            // .INVAL => unreachable, // Bad parameters.
             .NOTTY => unreachable,
             .NXIO => unreachable,
-            .BADF => unreachable, // Always a race condition.
-            .FAULT => unreachable, // Bad pointer parameter.
+            // .BADF => unreachable, // Always a race condition.
+            // .FAULT => unreachable, // Bad pointer parameter.
             .INTR => continue,
             .IO => return error.FileSystem,
             .NODEV => return error.InterfaceNotFound,

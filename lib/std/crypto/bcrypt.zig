@@ -742,7 +742,10 @@ const CryptFormatHasher = struct {
             .rounds_log = rounds_log,
             .silently_truncate_password = silently_truncate_password,
         });
-        if (!mem.eql(u8, wanted_s[0..], str[0..])) return HasherError.PasswordVerificationFailed;
+
+        // From [3..] to skip comparing version prefix. The input can have any version,
+        // and `strHashInternal` always prefixes with the current version $2b.
+        if (!mem.eql(u8, wanted_s[3..], str[3..])) return HasherError.PasswordVerificationFailed;
     }
 };
 

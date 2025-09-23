@@ -128,17 +128,16 @@ pub fn OpenFile(sub_path_w: []const u16, options: OpenFileOptions) OpenError!HAN
             .BAD_NETWORK_PATH => return error.NetworkNotFound, // \\server was not found
             .BAD_NETWORK_NAME => return error.NetworkNotFound, // \\server was found but \\server\share wasn't
             .NO_MEDIA_IN_DEVICE => return error.NoDevice,
-            .INVALID_PARAMETER => unreachable,
             .SHARING_VIOLATION => return error.AccessDenied,
             .ACCESS_DENIED => return error.AccessDenied,
             .PIPE_BUSY => return error.PipeBusy,
             .PIPE_NOT_AVAILABLE => return error.NoDevice,
-            .OBJECT_PATH_SYNTAX_BAD => unreachable,
+            .OBJECT_PATH_SYNTAX_BAD => return error.BadPathName,
             .OBJECT_NAME_COLLISION => return error.PathAlreadyExists,
             .FILE_IS_A_DIRECTORY => return error.IsDir,
             .NOT_A_DIRECTORY => return error.NotDir,
             .USER_MAPPED_FILE => return error.AccessDenied,
-            .INVALID_HANDLE => unreachable,
+            // .INVALID_HANDLE => unreachable,
             .DELETE_PENDING => {
                 // This error means that there *was* a file in this location on
                 // the file system, but it was deleted. However, the OS is not
@@ -272,7 +271,6 @@ pub fn CreatePipe(rd: *HANDLE, wr: *HANDLE, sattr: *const SECURITY_ATTRIBUTES) C
         @constCast(&default_timeout),
     )) {
         .SUCCESS => {},
-        .INVALID_PARAMETER => unreachable,
         .INSUFFICIENT_RESOURCES => return error.SystemResources,
         else => |e| return unexpectedStatus(e),
     }
@@ -381,7 +379,6 @@ pub fn DeviceIoControl(
         .PRIVILEGE_NOT_HELD => return error.AccessDenied,
         .ACCESS_DENIED => return error.AccessDenied,
         .INVALID_DEVICE_REQUEST => return error.AccessDenied, // Not supported by the underlying filesystem
-        .INVALID_PARAMETER => unreachable,
         .UNRECOGNIZED_VOLUME => return error.UnrecognizedVolume,
         else => return unexpectedStatus(rc),
     }
@@ -495,7 +492,6 @@ pub fn CreateIoCompletionPort(
 ) CreateIoCompletionPortError!HANDLE {
     const handle = kernel32.CreateIoCompletionPort(file_handle, existing_completion_port, completion_key, concurrent_thread_count) orelse {
         switch (GetLastError()) {
-            .INVALID_PARAMETER => unreachable,
             else => |err| return unexpectedError(err),
         }
     };
@@ -735,7 +731,6 @@ pub fn SetCurrentDirectory(path_name: []const u16) SetCurrentDirectoryError!void
         .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
         .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
         .NO_MEDIA_IN_DEVICE => return error.NoDevice,
-        .INVALID_PARAMETER => unreachable,
         .ACCESS_DENIED => return error.AccessDenied,
         .OBJECT_PATH_SYNTAX_BAD => unreachable,
         .NOT_A_DIRECTORY => return error.NotDir,
@@ -927,19 +922,19 @@ pub fn ReadLink(dir: ?HANDLE, sub_path_w: []const u16, out_buffer: []u8) ReadLin
     );
     switch (rc) {
         .SUCCESS => {},
-        .OBJECT_NAME_INVALID => unreachable,
+        // .OBJECT_NAME_INVALID => unreachable,
         .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
         .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
         .NO_MEDIA_IN_DEVICE => return error.FileNotFound,
         .BAD_NETWORK_PATH => return error.NetworkNotFound, // \\server was not found
         .BAD_NETWORK_NAME => return error.NetworkNotFound, // \\server was found but \\server\share wasn't
-        .INVALID_PARAMETER => unreachable,
+        // .INVALID_PARAMETER => unreachable,
         .SHARING_VIOLATION => return error.AccessDenied,
         .ACCESS_DENIED => return error.AccessDenied,
         .PIPE_BUSY => return error.AccessDenied,
-        .OBJECT_PATH_SYNTAX_BAD => unreachable,
-        .OBJECT_NAME_COLLISION => unreachable,
-        .FILE_IS_A_DIRECTORY => unreachable,
+        // .OBJECT_PATH_SYNTAX_BAD => unreachable,
+        // .OBJECT_NAME_COLLISION => unreachable,
+        // .FILE_IS_A_DIRECTORY => unreachable,
         else => return unexpectedStatus(rc),
     }
     defer CloseHandle(result_handle);
@@ -1001,6 +996,7 @@ pub const DeleteFileError = error{
     IsDir,
     DirNotEmpty,
     NetworkNotFound,
+    BadPathName,
 };
 
 pub const DeleteFileOptions = struct {
@@ -1056,17 +1052,15 @@ pub fn DeleteFile(sub_path_w: []const u16, options: DeleteFileOptions) DeleteFil
     );
     switch (rc) {
         .SUCCESS => {},
-        .OBJECT_NAME_INVALID => unreachable,
         .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
         .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
         .BAD_NETWORK_PATH => return error.NetworkNotFound, // \\server was not found
         .BAD_NETWORK_NAME => return error.NetworkNotFound, // \\server was found but \\server\share wasn't
-        .INVALID_PARAMETER => unreachable,
         .FILE_IS_A_DIRECTORY => return error.IsDir,
         .NOT_A_DIRECTORY => return error.NotDir,
         .SHARING_VIOLATION => return error.FileBusy,
-        .ACCESS_DENIED => return error.AccessDenied,
-        .DELETE_PENDING => return,
+        .CANNOT_DELETE, .ACCESS_DENIED => return error.AccessDenied,
+        .FILE_DELETED, .DELETE_PENDING => return,
         else => return unexpectedStatus(rc),
     }
     defer CloseHandle(tmp_handle);
@@ -1118,7 +1112,7 @@ pub fn DeleteFile(sub_path_w: []const u16, options: DeleteFileOptions) DeleteFil
     switch (rc) {
         .SUCCESS => {},
         .DIRECTORY_NOT_EMPTY => return error.DirNotEmpty,
-        .INVALID_PARAMETER => unreachable,
+        // .INVALID_PARAMETER => unreachable,
         .CANNOT_DELETE => return error.AccessDenied,
         .MEDIA_WRITE_PROTECTED => return error.AccessDenied,
         .ACCESS_DENIED => return error.AccessDenied,
@@ -1174,8 +1168,8 @@ pub fn SetFilePointerEx_BEGIN(handle: HANDLE, offset: u64) SetFilePointerError!v
         switch (GetLastError()) {
             .INVALID_FUNCTION => return error.Unseekable,
             .NEGATIVE_SEEK => return error.Unseekable,
-            .INVALID_PARAMETER => unreachable,
-            .INVALID_HANDLE => unreachable,
+            // .INVALID_PARAMETER => unreachable,
+            // .INVALID_HANDLE => unreachable,
             else => |err| return unexpectedError(err),
         }
     }
@@ -1187,8 +1181,8 @@ pub fn SetFilePointerEx_CURRENT(handle: HANDLE, offset: i64) SetFilePointerError
         switch (GetLastError()) {
             .INVALID_FUNCTION => return error.Unseekable,
             .NEGATIVE_SEEK => return error.Unseekable,
-            .INVALID_PARAMETER => unreachable,
-            .INVALID_HANDLE => unreachable,
+            // .INVALID_PARAMETER => unreachable,
+            // .INVALID_HANDLE => unreachable,
             else => |err| return unexpectedError(err),
         }
     }
@@ -1200,8 +1194,8 @@ pub fn SetFilePointerEx_END(handle: HANDLE, offset: i64) SetFilePointerError!voi
         switch (GetLastError()) {
             .INVALID_FUNCTION => return error.Unseekable,
             .NEGATIVE_SEEK => return error.Unseekable,
-            .INVALID_PARAMETER => unreachable,
-            .INVALID_HANDLE => unreachable,
+            // .INVALID_PARAMETER => unreachable,
+            // .INVALID_HANDLE => unreachable,
             else => |err| return unexpectedError(err),
         }
     }
@@ -1214,8 +1208,8 @@ pub fn SetFilePointerEx_CURRENT_get(handle: HANDLE) SetFilePointerError!u64 {
         switch (GetLastError()) {
             .INVALID_FUNCTION => return error.Unseekable,
             .NEGATIVE_SEEK => return error.Unseekable,
-            .INVALID_PARAMETER => unreachable,
-            .INVALID_HANDLE => unreachable,
+            // .INVALID_PARAMETER => unreachable,
+            // .INVALID_HANDLE => unreachable,
             else => |err| return unexpectedError(err),
         }
     }
@@ -1248,7 +1242,7 @@ pub fn QueryObjectName(handle: HANDLE, out_buffer: []u16) QueryObjectNameError![
             break :blk info.Name.Buffer.?[0..path_length_unterminated];
         },
         .ACCESS_DENIED => error.AccessDenied,
-        .INVALID_HANDLE => error.InvalidHandle,
+        .OBJECT_PATH_INVALID, .INVALID_HANDLE => error.InvalidHandle,
         // triggered when the buffer is too small for the OBJECT_NAME_INFORMATION object (.INFO_LENGTH_MISMATCH),
         // or if the buffer is too small for the file path returned (.BUFFER_OVERFLOW, .BUFFER_TOO_SMALL)
         .INFO_LENGTH_MISMATCH, .BUFFER_OVERFLOW, .BUFFER_TOO_SMALL => error.NameTooLong,
@@ -1913,6 +1907,7 @@ pub const CreateProcessError = error{
     InvalidExe,
     SystemResources,
     Unexpected,
+    BadPathName,
 };
 
 pub const CreateProcessFlags = packed struct(u32) {
@@ -1979,7 +1974,7 @@ pub fn CreateProcessW(
             .PATH_NOT_FOUND => return error.FileNotFound,
             .DIRECTORY => return error.FileNotFound,
             .ACCESS_DENIED => return error.AccessDenied,
-            .INVALID_PARAMETER => unreachable,
+            .INVALID_PARAMETER => return error.BadPathName,
             .INVALID_NAME => return error.InvalidName,
             .FILENAME_EXCED_RANGE => return error.NameTooLong,
             // These are all the system errors that are mapped to ENOEXEC by
@@ -5041,7 +5036,6 @@ pub fn GetProcessMemoryInfo(hProcess: HANDLE) GetProcessMemoryInfoError!VM_COUNT
         .SUCCESS => return vmc,
         .ACCESS_DENIED => return error.AccessDenied,
         .INVALID_HANDLE => return error.InvalidHandle,
-        .INVALID_PARAMETER => unreachable,
         else => return unexpectedStatus(rc),
     }
 }
@@ -5712,7 +5706,6 @@ pub fn ProcessBaseAddress(handle: HANDLE) ProcessBaseAddressError!HMODULE {
         .SUCCESS => {},
         .ACCESS_DENIED => return error.AccessDenied,
         .INVALID_HANDLE => return error.InvalidHandle,
-        .INVALID_PARAMETER => unreachable,
         else => return unexpectedStatus(rc),
     }
 
