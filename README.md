@@ -7,10 +7,10 @@ Process:
 ```
 git fetch upstream
 git fetch upstream --tags
-git diff (git merge-base 0.15.1 HEAD) HEAD > ourchanges.patch
 git checkout -b UPGRADE_BRANCH_NAME
-git reset --hard upstream/master
-git apply ourchanges.patch --3way
+git reset --soft $(git merge-base 0.15.1 014-dev)
+git commit -m "patches"
+git rebase upstream/master # alternatively, the changes can be made into a patch file and manually applied
 ```
 
 if some parts fail (ie the file was renamed), remove them from the patch and apply them manually
