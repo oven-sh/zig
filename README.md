@@ -10,6 +10,7 @@ git fetch upstream --tags
 git checkout -b UPGRADE_BRANCH_NAME
 git reset --soft $(git merge-base 0.15.1 014-dev)
 git commit -m "patches"
+git config --global merge.conflictstyle zdiff3
 git rebase upstream/master # alternatively, the changes can be made into a patch file and manually applied
 ```
 
