@@ -385,11 +385,6 @@ pub fn flush(
         try positionals.append(try link.openObjectInput(diags, comp.tsan_lib.?.full_object_path));
     }
 
-    // TODO: build asan automatically
-    // if (comp.config.any_sanitize_address) {
-    //     try positionals.append(try link.openObjectInput(diags, comp.asan_lib.?.full_object_path));
-    // }
-
     if (comp.config.any_fuzz) {
         try positionals.append(try link.openArchiveInput(diags, comp.fuzzer_lib.?.full_object_path, false, false));
     }
@@ -763,12 +758,6 @@ fn dumpArgv(self: *MachO, comp: *Compilation) !void {
             const path = try comp.tsan_lib.?.full_object_path.toString(arena);
             try argv.appendSlice(&.{ path, "-rpath", std.fs.path.dirname(path) orelse "." });
         }
-
-        // TODO: build asan automatically
-        // if (comp.config.any_sanitize_address) {
-        //     const path = try comp.asan_lib.?.full_object_path.toString(arena);
-        //     try argv.appendSlice(&.{ path, "-rpath", std.fs.path.dirname(path) orelse "." });
-        // }
 
         if (comp.config.any_fuzz) {
             try argv.append(try comp.fuzzer_lib.?.full_object_path.toString(arena));
@@ -2896,14 +2885,6 @@ fn writeLoadCommands(self: *MachO) !struct { usize, usize, u64 } {
         try load_commands.writeRpathLC(rpath, writer);
         ncmds += 1;
     }
-    // TODO: link asan automatically
-    // if (comp.config.any_sanitize_address) {
-    //     const path = try comp.asan_lib.?.full_object_path.toString(gpa);
-    //     defer gpa.free(path);
-    //     const rpath = std.fs.path.dirname(path) orelse ".";
-    //     try load_commands.writeRpathLC(rpath, writer);
-    //     ncmds += 1;
-    // }
 
     try writer.writeStruct(macho.source_version_command{ .version = 0 });
     ncmds += 1;

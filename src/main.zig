@@ -2967,6 +2967,8 @@ fn buildOutputType(
             create_module.opts.any_non_single_threaded = true;
         if (mod_opts.sanitize_thread == true)
             create_module.opts.any_sanitize_thread = true;
+        if (mod_opts.sanitize_address == true)
+            create_module.opts.any_sanitize_address = true;
         if (mod_opts.sanitize_c) |sc| switch (sc) {
             .off => {},
             .trap => if (create_module.opts.any_sanitize_c == .off) {
@@ -2974,8 +2976,6 @@ fn buildOutputType(
             },
             .full => create_module.opts.any_sanitize_c = .full,
         };
-        if (mod_opts.sanitize_address == true)
-            create_module.opts.any_sanitize_address = true;
         if (mod_opts.fuzz == true)
             create_module.opts.any_fuzz = true;
         if (mod_opts.unwind_tables) |uwt| switch (uwt) {
@@ -7572,6 +7572,8 @@ fn handleModArg(
         create_module.opts.any_non_single_threaded = true;
     if (mod_opts.sanitize_thread == true)
         create_module.opts.any_sanitize_thread = true;
+    if (mod_opts.sanitize_address == true)
+        create_module.opts.any_sanitize_address = true;
     if (mod_opts.sanitize_c) |sc| switch (sc) {
         .off => {},
         .trap => if (create_module.opts.any_sanitize_c == .off) {
@@ -7579,8 +7581,6 @@ fn handleModArg(
         },
         .full => create_module.opts.any_sanitize_c = .full,
     };
-    if (mod_opts.sanitize_address == true)
-        create_module.opts.any_sanitize_address = true;
     if (mod_opts.fuzz == true)
         create_module.opts.any_fuzz = true;
     if (mod_opts.unwind_tables) |uwt| switch (uwt) {
