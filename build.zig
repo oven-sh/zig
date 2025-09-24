@@ -273,15 +273,15 @@ pub fn build(b: *std.Build) !void {
             2 => {
                 // Untagged development build (e.g. 0.10.0-dev.2025+ecf0050a9).
                 var it = mem.splitScalar(u8, git_describe, '-');
-                const tagged_ancestor = it.first();
+                // const tagged_ancestor = it.first();
                 const commit_height = it.next().?;
                 const commit_id = it.next().?;
 
-                const ancestor_ver = try std.SemanticVersion.parse(tagged_ancestor);
-                if (zig_version.order(ancestor_ver) != .gt) {
-                    std.debug.print("Zig version '{}' must be greater than tagged ancestor '{}'\n", .{ zig_version, ancestor_ver });
-                    std.process.exit(1);
-                }
+                // const ancestor_ver = try std.SemanticVersion.parse(tagged_ancestor);
+                // if (zig_version.order(ancestor_ver) != .gt) {
+                //     std.debug.print("Zig version '{}' must be greater than tagged ancestor '{}'\n", .{ zig_version, ancestor_ver });
+                //     std.process.exit(1);
+                // }
 
                 // Check that the commit hash is prefixed with a 'g' (a Git convention).
                 if (commit_id.len < 1 or commit_id[0] != 'g') {

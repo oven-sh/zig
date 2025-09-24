@@ -40,7 +40,7 @@ build/stage3/bin/zig build -p stage4 -Denable-llvm -Dno-lib
 Once that is done, if only zig source is modified, future builds can be done using:
 
 ```
-build/stage3/bin/zig build -p stage4 -Denable-llvm -Dno-lib
+./build/stage3/bin/zig build -p build/stage4 -Denable-llvm -Dno-lib
 ```
 
 Binary is `build/stage4/bin/zig`. If rebuilding C++ many times, remove `-DCMAKE_BUILD_TYPE=Release`
