@@ -39044,11 +39044,6 @@ pub fn trackNavDefinition(sema: *Sema, nav_index: InternPool.Nav.Index) !void {
     // Get the module name
     const file = src_loc.file_scope;
 
-    // Get line and column info
-    const tree = file.tree.?;
-    const token_index = src_loc.baseSrcToken();
-    const token_loc = tree.tokenLocation(0, token_index);
-
     const gop = try usage_report.usages.getOrPut(zcu.gpa, nav_index);
     if (!gop.found_existing) {
         gop.value_ptr.* = .{
@@ -39056,6 +39051,20 @@ pub fn trackNavDefinition(sema: *Sema, nav_index: InternPool.Nav.Index) !void {
             .references = .{},
         };
     }
+
+    // Get line and column info
+    const tree = file.tree orelse {
+        // If no tree available, use default location
+        gop.value_ptr.definition = .{
+            .module_name = file.mod.fully_qualified_name,
+            .file_path = file.sub_file_path,
+            .line = 1,
+            .column = 1,
+        };
+        return;
+    };
+    const token_index = src_loc.baseSrcToken();
+    const token_loc = tree.tokenLocation(0, token_index);
 
     // Get the fully qualified module name
     const module_name = file.mod.fully_qualified_name;
@@ -39079,11 +39088,6 @@ fn trackNavReference(sema: *Sema, src: LazySrcLoc, nav_index: InternPool.Nav.Ind
     const src_loc = src.upgrade(zcu);
     const file = src_loc.file_scope;
 
-    // Get line and column info
-    const tree = file.tree.?;
-    const token_index = src_loc.baseSrcToken();
-    const token_loc = tree.tokenLocation(0, token_index);
-
     const gop = try usage_report.usages.getOrPut(zcu.gpa, nav_index);
     if (!gop.found_existing) {
         gop.value_ptr.* = .{
@@ -39091,6 +39095,20 @@ fn trackNavReference(sema: *Sema, src: LazySrcLoc, nav_index: InternPool.Nav.Ind
             .references = .{},
         };
     }
+
+    // Get line and column info
+    const tree = file.tree orelse {
+        // If no tree available, use default location
+        try gop.value_ptr.references.append(zcu.gpa, .{
+            .module_name = file.mod.fully_qualified_name,
+            .file_path = file.sub_file_path,
+            .line = 1,
+            .column = 1,
+        });
+        return;
+    };
+    const token_index = src_loc.baseSrcToken();
+    const token_loc = tree.tokenLocation(0, token_index);
 
     // Get the fully qualified module name
     const module_name = file.mod.fully_qualified_name;
