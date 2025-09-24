@@ -32506,6 +32506,9 @@ fn analyzeNavRefInner(sema: *Sema, src: LazySrcLoc, orig_nav_index: InternPool.N
 
     try sema.ensureNavResolved(src, orig_nav_index, if (is_ref) .type else .fully);
 
+    // Track the reference to this Nav in the usage report
+    try sema.trackNavReference(src, orig_nav_index);
+
     const nav_index = nav: {
         if (ip.getNav(orig_nav_index).isExternOrFn(ip)) {
             // Getting a pointer to this `Nav` might mean we actually get a pointer to something else!
@@ -39024,6 +39027,80 @@ pub fn analyzeMemoizedState(sema: *Sema, block: *Block, simple_src: LazySrcLoc, 
     }
 
     return any_changed;
+}
+
+/// Track the definition of a Nav (declaration) in the usage report.
+pub fn trackNavDefinition(sema: *Sema, nav_index: InternPool.Nav.Index) !void {
+    const pt = sema.pt;
+    const zcu = pt.zcu;
+    const comp = zcu.comp;
+    const usage_report = &(comp.usage_report orelse return);
+    const ip = &zcu.intern_pool;
+
+    _ = ip.getNav(nav_index);
+    const nav_src_loc = zcu.navSrcLoc(nav_index);
+    const src_loc = nav_src_loc.upgrade(zcu);
+
+    // Get the module name
+    const file = src_loc.file_scope;
+
+    // Get line and column info
+    const tree = file.tree.?;
+    const token_index = src_loc.baseSrcToken();
+    const token_loc = tree.tokenLocation(0, token_index);
+
+    const gop = try usage_report.usages.getOrPut(zcu.gpa, nav_index);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{
+            .definition = null,
+            .references = .{},
+        };
+    }
+
+    // Use a simple module name for now
+    const module_name = if (file.mod == zcu.root_mod) "root" else "module";
+
+    gop.value_ptr.definition = .{
+        .module_name = module_name,
+        .file_path = file.sub_file_path,
+        .line = @intCast(token_loc.line + 1), // Convert to 1-based
+        .column = @intCast(token_loc.column + 1), // Convert to 1-based
+    };
+}
+
+/// Track a reference to a Nav (declaration) in the usage report.
+fn trackNavReference(sema: *Sema, src: LazySrcLoc, nav_index: InternPool.Nav.Index) !void {
+    const pt = sema.pt;
+    const zcu = pt.zcu;
+    const comp = zcu.comp;
+    const usage_report = &(comp.usage_report orelse return);
+
+    // Get the module and location info for the reference
+    const src_loc = src.upgrade(zcu);
+    const file = src_loc.file_scope;
+
+    // Get line and column info
+    const tree = file.tree.?;
+    const token_index = src_loc.baseSrcToken();
+    const token_loc = tree.tokenLocation(0, token_index);
+
+    const gop = try usage_report.usages.getOrPut(zcu.gpa, nav_index);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{
+            .definition = null,
+            .references = .{},
+        };
+    }
+
+    // Use a simple module name for now
+    const module_name = if (file.mod == zcu.root_mod) "root" else "module";
+
+    try gop.value_ptr.references.append(zcu.gpa, .{
+        .module_name = module_name,
+        .file_path = file.sub_file_path,
+        .line = @intCast(token_loc.line + 1), // Convert to 1-based
+        .column = @intCast(token_loc.column + 1), // Convert to 1-based
+    });
 }
 
 /// Given that `decl.kind() == .func`, get the type expected of the function.

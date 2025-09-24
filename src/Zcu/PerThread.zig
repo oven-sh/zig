@@ -1021,6 +1021,9 @@ fn analyzeNavVal(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu.CompileErr
     };
     defer sema.deinit();
 
+    // Track the definition of this Nav in the usage report
+    try sema.trackNavDefinition(nav_id);
+
     // Every `Nav` declares a dependency on the source of the corresponding declaration.
     try sema.declareDependency(.{ .src_hash = old_nav.analysis.?.zir_index });
 

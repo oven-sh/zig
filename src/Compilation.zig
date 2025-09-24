@@ -2011,6 +2011,7 @@ pub fn destroy(comp: *Compilation) void {
 
     if (comp.bin_file) |lf| lf.destroy();
     if (comp.zcu) |zcu| zcu.deinit();
+    if (comp.usage_report) |*usage_report| usage_report.deinit(gpa);
     comp.cache_use.deinit();
     for (comp.work_queues) |work_queue| work_queue.deinit();
     comp.c_object_work_queue.deinit();
