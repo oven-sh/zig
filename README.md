@@ -34,12 +34,16 @@ mkdir build
 cd build
 cmake .. -DZIG_STATIC_LLVM=ON -DZIG_STATIC_ZSTD=ON -DCMAKE_PREFIX_PATH="$(brew --prefix llvm@20);$(brew --prefix lld);$(brew --prefix zstd)" -DCMAKE_BUILD_TYPE=Release -GNinja -DZIG_NO_LIB=ON
 ninja install
+build/stage3/bin/zig build -p stage4 -Denable-llvm -Dno-lib
 ```
 
-Building zig only given stage3
+Once that is done, if only zig source is modified, future builds can be done using:
+
 ```
-stage3/bin/zig build -p stage4 -Denable-llvm -Dno-lib
+build/stage3/bin/zig build -p stage4 -Denable-llvm -Dno-lib
 ```
+
+Binary is `build/stage4/bin/zig`
 
 Updating CI:
 - If there was an llvm upgrade, need to upgrade zig-bootstrap ref and check that the sed commands will still work
