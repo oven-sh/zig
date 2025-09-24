@@ -191,6 +191,7 @@ verbose_link: bool,
 disable_c_depfile: bool,
 time_report: bool,
 stack_report: bool,
+usage_report_path: ?[]const u8,
 debug_compiler_runtime_libs: bool,
 debug_compile_errors: bool,
 incremental: bool,
@@ -262,6 +263,9 @@ crt_files: std.StringHashMapUnmanaged(CrtFile) = .empty,
 /// Null means only show snippet on first error.
 reference_trace: ?u32 = null,
 
+/// Tracks usage information for declarations when -fusage-report is enabled.
+usage_report: ?UsageReport = null,
+
 /// This mutex guards all `Compilation` mutable state.
 /// Disabled in single-threaded mode because the thread pool spawns in the same thread.
 mutex: if (builtin.single_threaded) struct {
@@ -313,6 +317,33 @@ const QueuedJobs = struct {
 
 pub const default_stack_protector_buffer_size = target_util.default_stack_protector_buffer_size;
 pub const SemaError = Zcu.SemaError;
+
+pub const UsageReport = struct {
+    /// Map from declaration index to its usage information
+    usages: std.AutoHashMapUnmanaged(InternPool.Nav.Index, Usage) = .{},
+
+    pub const Usage = struct {
+        /// Where the declaration is defined
+        definition: ?SourceLocation = null,
+        /// List of locations where the declaration is referenced
+        references: std.ArrayListUnmanaged(SourceLocation) = .{},
+    };
+
+    pub const SourceLocation = struct {
+        module_name: []const u8,
+        file_path: []const u8,
+        line: u32,
+        column: u32,
+    };
+
+    pub fn deinit(self: *UsageReport, gpa: Allocator) void {
+        var iter = self.usages.iterator();
+        while (iter.next()) |entry| {
+            entry.value_ptr.references.deinit(gpa);
+        }
+        self.usages.deinit(gpa);
+    }
+};
 
 pub const CrtFile = struct {
     lock: Cache.Lock,
@@ -1081,6 +1112,7 @@ pub const CreateOptions = struct {
     data_sections: bool = false,
     time_report: bool = false,
     stack_report: bool = false,
+    usage_report_path: ?[]const u8 = null,
     link_eh_frame_hdr: bool = false,
     link_emit_relocs: bool = false,
     linker_script: ?[]const u8 = null,
@@ -1541,6 +1573,7 @@ pub fn create(gpa: Allocator, arena: Allocator, options: CreateOptions) !*Compil
             .reference_trace = options.reference_trace,
             .time_report = options.time_report,
             .stack_report = options.stack_report,
+            .usage_report_path = options.usage_report_path,
             .test_filters = options.test_filters,
             .test_name_prefix = options.test_name_prefix,
             .debug_compiler_runtime_libs = options.debug_compiler_runtime_libs,
@@ -1964,6 +1997,11 @@ pub fn create(gpa: Allocator, arena: Allocator, options: CreateOptions) !*Compil
         comp.remaining_prelink_tasks += 1;
     }
     log.debug("total prelink tasks: {d}", .{comp.remaining_prelink_tasks});
+
+    // Initialize usage report if requested
+    if (comp.usage_report_path != null) {
+        comp.usage_report = UsageReport{};
+    }
 
     return comp;
 }
@@ -2464,6 +2502,11 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) !void {
                 .sub_path = o_sub_path,
             }, .main, main_progress_node);
 
+            // Write usage report if requested
+            if (comp.usage_report_path) |report_path| {
+                try comp.writeUsageReport(report_path);
+            }
+
             // Calling `flush` may have produced errors, in which case the
             // cache manifest must not be written.
             if (anyErrors(comp)) return;
@@ -2485,6 +2528,11 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) !void {
             try flush(comp, arena, .{
                 .root_dir = incremental.artifact_directory,
             }, .main, main_progress_node);
+
+            // Write usage report if requested
+            if (comp.usage_report_path) |report_path| {
+                try comp.writeUsageReport(report_path);
+            }
         },
     }
 }
@@ -6974,4 +7022,51 @@ pub fn compilerRtOptMode(comp: Compilation) std.builtin.OptimizeMode {
 /// compiler-rt, libcxx, libc, libunwind, etc.
 pub fn compilerRtStrip(comp: Compilation) bool {
     return comp.root_mod.strip;
+}
+
+/// Write the usage report to the specified file path.
+pub fn writeUsageReport(comp: *Compilation, report_path: []const u8) !void {
+    const usage_report = comp.usage_report orelse return;
+    const file = try std.fs.cwd().createFile(report_path, .{});
+    defer file.close();
+
+    const writer = file.writer();
+
+    // Note: For now, we're writing a placeholder report format
+    // The actual implementation would need to track declarations during compilation
+    // and format them according to the specification
+    try writer.print("# Usage Report\n", .{});
+    try writer.print("# Format: <module_name> <path_within_module>:<line_no>:<col_no>: DEFINED\n", .{});
+    try writer.print("# Format: <module_name> <path_within_module>:<line_no>:<col_no>: REFERENCED AT <module_name> <path_within_module>:<line_no>:<col_no>\n\n", .{});
+
+    var iter = usage_report.usages.iterator();
+    while (iter.next()) |entry| {
+        const usage = entry.value_ptr.*;
+
+        // Write definition if available
+        if (usage.definition) |def| {
+            try writer.print("{s} {s}:{d}:{d}: DEFINED\n", .{
+                def.module_name,
+                def.file_path,
+                def.line,
+                def.column,
+            });
+        }
+
+        // Write all references
+        for (usage.references.items) |ref| {
+            if (usage.definition) |def| {
+                try writer.print("{s} {s}:{d}:{d}: REFERENCED AT {s} {s}:{d}:{d}\n", .{
+                    def.module_name,
+                    def.file_path,
+                    def.line,
+                    def.column,
+                    ref.module_name,
+                    ref.file_path,
+                    ref.line,
+                    ref.column,
+                });
+            }
+        }
+    }
 }

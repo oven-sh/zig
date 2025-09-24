@@ -849,6 +849,7 @@ fn buildOutputType(
     var verbose_llvm_cpu_features = false;
     var time_report = false;
     var stack_report = false;
+    var usage_report_path: ?[]const u8 = null;
     var show_builtin = false;
     var emit_bin: EmitBin = .yes_default_path;
     var emit_asm: Emit = .no;
@@ -1406,6 +1407,8 @@ fn buildOutputType(
                         time_report = true;
                     } else if (mem.eql(u8, arg, "-fstack-report")) {
                         stack_report = true;
+                    } else if (mem.startsWith(u8, arg, "-fusage-report=")) {
+                        usage_report_path = arg["-fusage-report=".len..];
                     } else if (mem.eql(u8, arg, "-fPIC")) {
                         mod_opts.pic = true;
                     } else if (mem.eql(u8, arg, "-fno-PIC")) {
@@ -3605,6 +3608,7 @@ fn buildOutputType(
         .verbose_llvm_cpu_features = verbose_llvm_cpu_features,
         .time_report = time_report,
         .stack_report = stack_report,
+        .usage_report_path = usage_report_path,
         .build_id = build_id,
         .test_filters = test_filters.items,
         .test_name_prefix = test_name_prefix,
