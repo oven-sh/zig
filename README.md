@@ -32,7 +32,7 @@ Building a Release build locally:
 ```
 mkdir build
 cd build
-cmake .. -DZIG_STATIC_LLVM=ON -DZIG_STATIC_ZSTD=ON -DCMAKE_PREFIX_PATH="$(brew --prefix llvm@20);$(brew --prefix lld);$(brew --prefix zstd)" -DCMAKE_BUILD_TYPE=Release -GNinja -DZIG_NO_LIB=ON
+cmake .. -DZIG_STATIC_LLVM=ON -DZIG_STATIC_ZSTD=ON -DCMAKE_PREFIX_PATH="$(brew --prefix llvm@20);$(brew --prefix lld);$(brew --prefix zstd)" -GNinja -DZIG_NO_LIB=ON -DZIG_VERSION=0.14.1 -DCMAKE_BUILD_TYPE=Release
 ninja install
 build/stage3/bin/zig build -p stage4 -Denable-llvm -Dno-lib
 ```
@@ -43,7 +43,7 @@ Once that is done, if only zig source is modified, future builds can be done usi
 build/stage3/bin/zig build -p stage4 -Denable-llvm -Dno-lib
 ```
 
-Binary is `build/stage4/bin/zig`
+Binary is `build/stage4/bin/zig`. If rebuilding C++ many times, remove `-DCMAKE_BUILD_TYPE=Release`
 
 Updating CI:
 - If there was an llvm upgrade, need to upgrade zig-bootstrap ref and check that the sed commands will still work
