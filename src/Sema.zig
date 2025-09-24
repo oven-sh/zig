@@ -39057,8 +39057,8 @@ pub fn trackNavDefinition(sema: *Sema, nav_index: InternPool.Nav.Index) !void {
         };
     }
 
-    // Use a simple module name for now
-    const module_name = if (file.mod == zcu.root_mod) "root" else "module";
+    // Get the fully qualified module name
+    const module_name = file.mod.fully_qualified_name;
 
     gop.value_ptr.definition = .{
         .module_name = module_name,
@@ -39092,8 +39092,8 @@ fn trackNavReference(sema: *Sema, src: LazySrcLoc, nav_index: InternPool.Nav.Ind
         };
     }
 
-    // Use a simple module name for now
-    const module_name = if (file.mod == zcu.root_mod) "root" else "module";
+    // Get the fully qualified module name
+    const module_name = file.mod.fully_qualified_name;
 
     try gop.value_ptr.references.append(zcu.gpa, .{
         .module_name = module_name,
