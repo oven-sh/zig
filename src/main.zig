@@ -439,6 +439,7 @@ const usage_build_generic =
     \\  -fno-emit-docs            (default) Do not produce docs/ dir with html documentation
     \\  -femit-implib[=path]      (default) Produce an import .lib when building a Windows DLL
     \\  -fno-emit-implib          Do not produce an import .lib when building a Windows DLL
+    \\  -femit-usage-report[=path] Produce a usage report file
     \\  --show-builtin            Output the source of @import("builtin") then exit
     \\  --cache-dir [path]        Override the local cache directory
     \\  --global-cache-dir [path] Override the global cache directory
@@ -1407,8 +1408,8 @@ fn buildOutputType(
                         time_report = true;
                     } else if (mem.eql(u8, arg, "-fstack-report")) {
                         stack_report = true;
-                    } else if (mem.startsWith(u8, arg, "-fusage-report=")) {
-                        usage_report_path = arg["-fusage-report=".len..];
+                    } else if (mem.startsWith(u8, arg, "-femitusage-report=")) {
+                        usage_report_path = arg["-femitusage-report=".len..];
                     } else if (mem.eql(u8, arg, "-fPIC")) {
                         mod_opts.pic = true;
                     } else if (mem.eql(u8, arg, "-fno-PIC")) {
