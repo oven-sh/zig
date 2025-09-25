@@ -1021,8 +1021,8 @@ fn analyzeNavVal(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu.CompileErr
     };
     defer sema.deinit();
 
-    // Track the definition of this Nav in the usage report
-    try sema.trackNavDefinition(nav_id);
+    // Track that this Nav is being referenced (analyzed means it's used)
+    try pt.trackNavReferenceUnknownLocation(nav_id);
 
     // Every `Nav` declares a dependency on the source of the corresponding declaration.
     try sema.declareDependency(.{ .src_hash = old_nav.analysis.?.zir_index });
@@ -2586,6 +2586,26 @@ fn trackNavDefinitionDuringScan(pt: Zcu.PerThread, nav_index: InternPool.Nav.Ind
         .line = @intCast(token_loc.line + 1),
         .column = @intCast(token_loc.column + 1),
     };
+}
+
+/// Track that a Nav (declaration) is being referenced but without a specific location.
+/// This happens when a Nav is analyzed, which means it's being used somewhere.
+fn trackNavReferenceUnknownLocation(pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) !void {
+    const zcu = pt.zcu;
+    const comp = zcu.comp;
+    const usage_report = &(comp.usage_report orelse return);
+
+    const gop = try usage_report.usages.getOrPut(zcu.gpa, nav_index);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{
+            .definition = null,
+            .references = .{},
+            .has_unknown_reference = false,
+        };
+    }
+
+    // Mark that this Nav is referenced
+    gop.value_ptr.has_unknown_reference = true;
 }
 
 fn analyzeFnBodyInner(pt: Zcu.PerThread, func_index: InternPool.Index) Zcu.SemaError!Air {

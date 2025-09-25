@@ -327,6 +327,8 @@ pub const UsageReport = struct {
         definition: ?SourceLocation = null,
         /// List of locations where the declaration is referenced
         references: std.ArrayListUnmanaged(SourceLocation) = .{},
+        /// Whether the declaration is referenced (used) but location is unknown
+        has_unknown_reference: bool = false,
     };
 
     pub const SourceLocation = struct {
@@ -7053,7 +7055,19 @@ pub fn writeUsageReport(comp: *Compilation, report_path: []const u8) !void {
             });
         }
 
-        // Write all references
+        // Write unknown reference if present
+        if (usage.has_unknown_reference) {
+            if (usage.definition) |def| {
+                try writer.print("{s} {s}:{d}:{d}: REFERENCED\n", .{
+                    def.module_name,
+                    def.file_path,
+                    def.line,
+                    def.column,
+                });
+            }
+        }
+
+        // Write all references with known locations
         for (usage.references.items) |ref| {
             if (usage.definition) |def| {
                 try writer.print("{s} {s}:{d}:{d}: REFERENCED AT {s} {s}:{d}:{d}\n", .{
