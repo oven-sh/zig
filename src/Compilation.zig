@@ -7031,11 +7031,10 @@ pub fn writeUsageReport(comp: *Compilation, report_path: []const u8) !void {
     const file = try std.fs.cwd().createFile(report_path, .{});
     defer file.close();
 
-    const writer = file.writer();
+    var buffered_writer = std.io.bufferedWriter(file.writer());
+    const writer = buffered_writer.writer();
 
-    // Note: For now, we're writing a placeholder report format
-    // The actual implementation would need to track declarations during compilation
-    // and format them according to the specification
+    // Write header
     try writer.print("# Usage Report\n", .{});
     try writer.print("# Format: <module_name> <path_within_module>:<line_no>:<col_no>: DEFINED\n", .{});
     try writer.print("# Format: <module_name> <path_within_module>:<line_no>:<col_no>: REFERENCED AT <module_name> <path_within_module>:<line_no>:<col_no>\n\n", .{});
@@ -7070,4 +7069,7 @@ pub fn writeUsageReport(comp: *Compilation, report_path: []const u8) !void {
             }
         }
     }
+
+    // Flush the buffered writer
+    try buffered_writer.flush();
 }
