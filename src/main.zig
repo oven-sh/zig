@@ -1408,8 +1408,8 @@ fn buildOutputType(
                         time_report = true;
                     } else if (mem.eql(u8, arg, "-fstack-report")) {
                         stack_report = true;
-                    } else if (mem.startsWith(u8, arg, "-femitusage-report=")) {
-                        usage_report_path = arg["-femitusage-report=".len..];
+                    } else if (mem.startsWith(u8, arg, "-femit-usage-report=")) {
+                        usage_report_path = arg["-femit-usage-report=".len..];
                     } else if (mem.eql(u8, arg, "-fPIC")) {
                         mod_opts.pic = true;
                     } else if (mem.eql(u8, arg, "-fno-PIC")) {

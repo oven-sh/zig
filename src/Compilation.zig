@@ -263,7 +263,7 @@ crt_files: std.StringHashMapUnmanaged(CrtFile) = .empty,
 /// Null means only show snippet on first error.
 reference_trace: ?u32 = null,
 
-/// Tracks usage information for declarations when -fusage-report is enabled.
+/// Tracks usage information for declarations when -femit-usage-report is enabled.
 usage_report: ?UsageReport = null,
 
 /// This mutex guards all `Compilation` mutable state.
