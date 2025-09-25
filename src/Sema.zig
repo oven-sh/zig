@@ -39053,8 +39053,8 @@ pub fn trackNavDefinition(sema: *Sema, nav_index: InternPool.Nav.Index) !void {
     }
 
     // Get line and column info
-    const tree = file.tree orelse {
-        // If no tree available, use default location
+    const tree = file.getTree(zcu.gpa) catch {
+        // If tree can't be loaded, use default location
         gop.value_ptr.definition = .{
             .module_name = file.mod.fully_qualified_name,
             .file_path = file.sub_file_path,
@@ -39097,8 +39097,8 @@ fn trackNavReference(sema: *Sema, src: LazySrcLoc, nav_index: InternPool.Nav.Ind
     }
 
     // Get line and column info
-    const tree = file.tree orelse {
-        // If no tree available, use default location
+    const tree = file.getTree(zcu.gpa) catch {
+        // If tree can't be loaded, use default location
         try gop.value_ptr.references.append(zcu.gpa, .{
             .module_name = file.mod.fully_qualified_name,
             .file_path = file.sub_file_path,
