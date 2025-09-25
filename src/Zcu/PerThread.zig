@@ -2485,6 +2485,11 @@ const ScanDeclIter = struct {
                 assert(ip.getNav(nav).name == name);
                 assert(ip.getNav(nav).fqn == fqn);
 
+                // Track the definition of this Nav in the usage report immediately when created
+                if (comp.usage_report != null and existing_unit == null) {
+                    try pt.trackNavDefinitionDuringScan(nav);
+                }
+
                 const want_analysis = switch (decl.kind) {
                     .@"comptime" => unreachable,
                     .@"usingnamespace" => a: {
@@ -2539,6 +2544,49 @@ const ScanDeclIter = struct {
         }
     }
 };
+
+/// Track the definition of a Nav (declaration) in the usage report during scanning.
+/// This is a simpler version of Sema.trackNavDefinition that doesn't require a full Sema context.
+fn trackNavDefinitionDuringScan(pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) !void {
+    const zcu = pt.zcu;
+    const comp = zcu.comp;
+    const usage_report = &(comp.usage_report orelse return);
+
+    const nav_src_loc = zcu.navSrcLoc(nav_index);
+    const src_loc = nav_src_loc.upgrade(zcu);
+
+    // Get the module name
+    const file = src_loc.file_scope;
+
+    const gop = try usage_report.usages.getOrPut(zcu.gpa, nav_index);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{
+            .definition = null,
+            .references = .{},
+        };
+    }
+
+    // Get line and column info
+    const tree = file.getTree(zcu.gpa) catch {
+        // If tree can't be loaded, use default location
+        gop.value_ptr.definition = .{
+            .module_name = file.mod.fully_qualified_name,
+            .file_path = file.sub_file_path,
+            .line = 1,
+            .column = 1,
+        };
+        return;
+    };
+    const token_index = src_loc.baseSrcToken();
+    const token_loc = tree.tokenLocation(0, token_index);
+
+    gop.value_ptr.definition = .{
+        .module_name = file.mod.fully_qualified_name,
+        .file_path = file.sub_file_path,
+        .line = @intCast(token_loc.line + 1),
+        .column = @intCast(token_loc.column + 1),
+    };
+}
 
 fn analyzeFnBodyInner(pt: Zcu.PerThread, func_index: InternPool.Index) Zcu.SemaError!Air {
     const tracy = trace(@src());
