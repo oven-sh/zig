@@ -32,7 +32,7 @@ Building a Release build locally:
 ```
 mkdir build
 cd build
-cmake .. -DZIG_STATIC_LLVM=ON -DZIG_STATIC_ZSTD=ON -DCMAKE_PREFIX_PATH="$(brew --prefix llvm@20);$(brew --prefix lld);$(brew --prefix zstd)" -DCMAKE_BUILD_TYPE=Release -GNinja -DZIG_NO_LIB=ON
+cmake .. -DZIG_STATIC_LLVM=ON -DZIG_STATIC_ZSTD=ON -DCMAKE_PREFIX_PATH="$(brew --prefix llvm@20);$(brew --prefix lld@20);$(brew --prefix zstd)" -DCMAKE_BUILD_TYPE=Release -GNinja -DZIG_NO_LIB=ON
 ninja install
 ```
 
