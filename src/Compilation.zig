@@ -1954,7 +1954,7 @@ pub fn create(gpa: Allocator, arena: Allocator, diag: *CreateDiagnostic, options
         const any_unwind_tables = options.config.any_unwind_tables or options.root_mod.unwind_tables != .none;
         const any_non_single_threaded = options.config.any_non_single_threaded or !options.root_mod.single_threaded;
         const any_sanitize_thread = options.config.any_sanitize_thread or options.root_mod.sanitize_thread;
-        const any_sanitize_address = options.config.any_sanitize_address or options.root_mod.any_sanitize_address;
+        const any_sanitize_address = options.config.any_sanitize_address or options.root_mod.sanitize_address;
         const any_sanitize_c: std.zig.SanitizeC = switch (options.config.any_sanitize_c) {
             .off => options.root_mod.sanitize_c,
             .trap => if (options.root_mod.sanitize_c == .full)

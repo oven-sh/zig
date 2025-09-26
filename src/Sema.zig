@@ -27485,7 +27485,7 @@ fn ensureFieldVisible(
 
     // If not in the same file, deny access
     if (struct_file_scope != current_file_scope) {
-        return sema.fail(block, field_name_src, "field '{}' is private and cannot be accessed outside its defining file", .{field_name.fmt(ip)});
+        return sema.fail(block, field_name_src, "field '{f}' is private and cannot be accessed outside its defining file", .{field_name.fmt(ip)});
     }
 }
 

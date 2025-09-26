@@ -88,6 +88,7 @@ pub const Options = struct {
     any_non_single_threaded: bool = false,
     any_sanitize_thread: bool = false,
     any_sanitize_address: bool = false,
+    any_sanitize_c: std.zig.SanitizeC = .off,
     any_fuzz: bool = false,
     any_unwind_tables: bool = false,
     any_dyn_libs: bool = false,
