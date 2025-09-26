@@ -45,3 +45,4 @@ Updating CI:
 - If there was an llvm upgrade, need to upgrade zig-bootstrap ref and check that the sed commands will still work
 - Update zls
 - zls will silently be missing if the build fails in CI so test the build locally
+- search for /tsan|sanitize_thread/g. make sure every instance has the equivalent version for asan below it
