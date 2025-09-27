@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - 014-dev
-      - pfg/update-zig-6
+      - upgrade-0.15.1
 concurrency:
   group: ${{ github.head_ref || github.run_id }}-${{ github.actor }}
   cancel-in-progress: true
@@ -27,17 +27,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ziglang/zig-bootstrap
-          ref: 03a95efaf981b9cee59af8027304c37a59d36fc0
+          ref: c6bc9398c72c7a63fe9420a9055dcfd1845bc266
       - run: rm -rf zig
       - uses: actions/checkout@v4
         with:
           path: zig
-      - run: sed -i 's/ZIG_VERSION="0.14.0-dev.3299+31f353cd9"/ZIG_VERSION="0.14.1"/' build
+      - run: sed -i 's/ZIG_VERSION="0.15.0-dev.1601+c1483eb05"/ZIG_VERSION="0.15.1"/' build
       - run: sed -i 's/Doptimize=ReleaseFast/Doptimize=ReleaseSafe/' build
         if: matrix.safe == 'true'
       - run: sed -i 's/Dstrip/Ddebug-extensions/' build
         if: matrix.safe == 'true'
-      - run: sed -i 's/max_rss = 7_800_000_000/max_rss = 9_000_000_000/' zig/build.zig
+      - run: sed -i 's/max_rss = 7_800_000_000/max_rss = 10_000_000_000/' zig/build.zig
         if: matrix.safe == 'true'
       - run: cat build
       - run: CMAKE_GENERATOR=Ninja ./build ${{ matrix.target }} baseline
@@ -54,7 +54,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: zigtools/zls
-          ref: 3733f39c8dadfd37bb2a5487894e3ed467a5d895
+          ref: 1383eefe3f4010d3c3113c7b93885672ce0819f3
       - uses: actions/download-artifact@v4
       - name: chmod
         run: |
