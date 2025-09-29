@@ -839,6 +839,11 @@ fn flushModuleInner(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id) !void {
     const gpa = comp.gpa;
     const diags = &comp.link_diags;
 
+    // Skip linking entirely if --no-link flag is set
+    if (comp.no_link_obj) {
+        return;
+    }
+
     const module_obj_path: ?Path = if (self.base.zcu_object_sub_path) |path| .{
         .root_dir = self.base.emit.root_dir,
         .sub_path = if (fs.path.dirname(self.base.emit.sub_path)) |dirname|
@@ -848,11 +853,6 @@ fn flushModuleInner(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id) !void {
     } else null;
 
     if (self.zigObjectPtr()) |zig_object| try zig_object.flush(self, tid);
-
-    // Skip linking if --no-link flag is set (after ZigObject flush, before parsing objects)
-    if (comp.no_link_obj) {
-        return;
-    }
 
     // Parse LLVM-generated object file(s)
     if (module_obj_path) |path| {
