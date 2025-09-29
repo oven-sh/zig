@@ -849,7 +849,7 @@ fn flushModuleInner(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id) !void {
 
     if (self.zigObjectPtr()) |zig_object| try zig_object.flush(self, tid);
 
-    // Skip linking if --no-link flag is set
+    // Skip linking if --no-link flag is set (after ZigObject flush, before parsing objects)
     if (comp.no_link_obj) {
         return;
     }
