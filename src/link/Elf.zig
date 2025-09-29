@@ -849,6 +849,11 @@ fn flushModuleInner(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id) !void {
 
     if (self.zigObjectPtr()) |zig_object| try zig_object.flush(self, tid);
 
+    // Skip linking if --no-link flag is set
+    if (comp.no_link_obj) {
+        return;
+    }
+
     // Parse LLVM-generated object file(s)
     if (module_obj_path) |path| {
         const partition_count = self.base.zcu_object_partition_count;
@@ -874,11 +879,6 @@ fn flushModuleInner(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id) !void {
 
     switch (comp.config.output_mode) {
         .Obj => {
-            // Skip linking if --no-link flag is set
-            if (comp.no_link_obj) {
-                return;
-            }
-
             return relocatable.flushObject(self, comp);
         },
         .Lib => switch (comp.config.link_mode) {
