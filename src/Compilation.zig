@@ -281,6 +281,8 @@ link_task_wait_group: WaitGroup = .{},
 work_queue_progress_node: std.Progress.Node = .none,
 
 llvm_opt_bisect_limit: c_int,
+llvm_codegen_threads: u32,
+no_link_obj: bool,
 
 file_system_inputs: ?*std.ArrayListUnmanaged(u8),
 
@@ -1103,6 +1105,8 @@ pub const CreateOptions = struct {
     linker_print_icf_sections: bool = false,
     linker_print_map: bool = false,
     llvm_opt_bisect_limit: i32 = -1,
+    llvm_codegen_threads: u32 = 0,
+    no_link_obj: bool = false,
     build_id: ?std.zig.BuildId = null,
     disable_c_depfile: bool = false,
     linker_z_nodelete: bool = false,
@@ -1556,6 +1560,8 @@ pub fn create(gpa: Allocator, arena: Allocator, options: CreateOptions) !*Compil
             .link_inputs = options.link_inputs,
             .framework_dirs = options.framework_dirs,
             .llvm_opt_bisect_limit = options.llvm_opt_bisect_limit,
+            .llvm_codegen_threads = options.llvm_codegen_threads,
+            .no_link_obj = options.no_link_obj,
             .skip_linker_dependencies = options.skip_linker_dependencies,
             .queued_jobs = .{
                 .update_builtin_zig = have_zcu,
@@ -1614,6 +1620,7 @@ pub fn create(gpa: Allocator, arena: Allocator, options: CreateOptions) !*Compil
             .print_gc_sections = options.linker_print_gc_sections,
             .print_icf_sections = options.linker_print_icf_sections,
             .print_map = options.linker_print_map,
+            .llvm_codegen_threads = options.llvm_codegen_threads,
             .tsaware = options.linker_tsaware,
             .nxcompat = options.linker_nxcompat,
             .dynamicbase = options.linker_dynamicbase,
@@ -2532,7 +2539,18 @@ fn flush(
         try link.File.C.flushEmitH(zcu);
 
         if (zcu.llvm_object) |llvm_object| {
-            try emitLlvmObject(comp, arena, default_artifact_directory, null, llvm_object, prog_node);
+            // With --no-link, write LLVM output directly to final location
+            const bin_emit = if (comp.bin_file) |bf| blk: {
+                const basename = if (comp.no_link_obj)
+                    bf.emit.sub_path  // Direct to final output (skip flushObject)
+                else
+                    bf.zcu_object_sub_path orelse bf.emit.sub_path;  // To intermediate (flushObject will copy)
+                break :blk EmitLoc{
+                    .directory = null,
+                    .basename = basename,
+                };
+            } else null;
+            try emitLlvmObject(comp, arena, default_artifact_directory, bin_emit, llvm_object, prog_node);
         }
     }
 }
@@ -2821,10 +2839,32 @@ pub fn emitLlvmObject(
     const sub_prog_node = prog_node.start("LLVM Emit Object", 0);
     defer sub_prog_node.end();
 
+    const base_bin_path = try resolveEmitLoc(arena, default_artifact_directory, bin_emit_loc);
+
+    // Generate parallel codegen output filenames if enabled
+    const bin_path_list: ?[]const [*:0]const u8 = if (comp.llvm_codegen_threads > 1 and base_bin_path != null) blk: {
+        const num_threads = comp.llvm_codegen_threads;
+        const list = try arena.alloc([*:0]const u8, num_threads);
+        const base_path = base_bin_path.?;
+
+        // Strip .o extension if present
+        const base_path_slice = std.mem.span(base_path);
+        const base_name: []const u8 = if (std.mem.endsWith(u8, base_path_slice, ".o"))
+            base_path_slice[0 .. base_path_slice.len - 2]
+        else
+            base_path_slice;
+
+        for (0..num_threads) |i| {
+            list[i] = (try std.fmt.allocPrintZ(arena, "{s}.{d}.o", .{base_name, i})).ptr;
+        }
+        break :blk list;
+    } else null;
+
     try llvm_object.emit(.{
         .pre_ir_path = comp.verbose_llvm_ir,
         .pre_bc_path = comp.verbose_llvm_bc,
-        .bin_path = try resolveEmitLoc(arena, default_artifact_directory, bin_emit_loc),
+        .bin_path = base_bin_path,
+        .bin_path_list = bin_path_list,
         .asm_path = try resolveEmitLoc(arena, default_artifact_directory, comp.emit_asm),
         .post_ir_path = try resolveEmitLoc(arena, default_artifact_directory, comp.emit_llvm_ir),
         .post_bc_path = try resolveEmitLoc(arena, default_artifact_directory, comp.emit_llvm_bc),
@@ -6090,6 +6130,11 @@ pub fn addCCArgs(
 
                 if (comp.config.san_cov_trace_pc_guard) {
                     try argv.append("-fsanitize-coverage=trace-pc-guard");
+                }
+                
+                if (comp.config.gcov_profiling) {
+                    try argv.append("-fprofile-arcs");
+                    try argv.append("-ftest-coverage");
                 }
             }
 

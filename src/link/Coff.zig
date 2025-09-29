@@ -254,6 +254,7 @@ pub fn createEmpty(
             .comp = comp,
             .emit = emit,
             .zcu_object_sub_path = zcu_object_sub_path,
+            .zcu_object_partition_count = @intCast(options.llvm_codegen_threads),
             .stack_size = options.stack_size orelse 16777216,
             .gc_sections = options.gc_sections orelse (optimize_mode != .Debug),
             .print_gc_sections = options.print_gc_sections,

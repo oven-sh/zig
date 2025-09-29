@@ -1071,6 +1071,7 @@ pub const Object = struct {
     }
 
     pub const EmitOptions = struct {
+        bin_path_list: ?[]const [*:0]const u8 = null,
         pre_ir_path: ?[]const u8,
         pre_bc_path: ?[]const u8,
         bin_path: ?[*:0]const u8,
@@ -1364,6 +1365,17 @@ pub const Object = struct {
         // Unfortunately, LLVM shits the bed when we ask for both binary and assembly.
         // So we call the entire pipeline multiple times if this is requested.
         // var error_message: [*:0]const u8 = undefined;
+
+        // Convert bin_path_list to NULL-terminated C array if provided
+        const bin_filename_list: ?[*:null]const ?[*:0]const u8 = if (options.bin_path_list) |list| blk: {
+            const null_term = try comp.gpa.alloc(?[*:0]const u8, list.len + 1);
+            for (list, 0..) |path, i| {
+                null_term[i] = path;
+            }
+            null_term[list.len] = null;
+            break :blk @ptrCast(null_term.ptr);
+        } else null;
+
         var lowered_options: llvm.TargetMachine.EmitOptions = .{
             .is_debug = options.is_debug,
             .is_small = options.is_small,
@@ -1380,6 +1392,8 @@ pub const Object = struct {
 
             // `.coverage` value is only used when `.sancov` is enabled.
             .sancov = options.fuzz or comp.config.san_cov_trace_pc_guard,
+            .gcov_profiling = comp.config.gcov_profiling,
+            .bin_filename_list = bin_filename_list,
             .coverage = .{
                 .CoverageType = .Edge,
                 // Works in tandem with Inline8bitCounters or InlineBoolFlag.

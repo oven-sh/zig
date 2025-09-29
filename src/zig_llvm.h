@@ -67,6 +67,11 @@ struct ZigLLVMEmitOptions {
     const char *llvm_ir_filename;
     const char *bitcode_filename;
     ZigLLVMCoverageOptions coverage;
+    bool gcov_profiling;
+    // For parallel codegen: array of output filenames (NULL-terminated)
+    // If NULL, use single-threaded with bin_filename
+    // If set, array length determines number of threads
+    const char **bin_filename_list;
 };
 
 // synchronize with llvm/include/Object/Archive.h::Object::Archive::Kind

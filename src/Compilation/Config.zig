@@ -64,6 +64,7 @@ root_error_tracing: bool,
 dll_export_fns: bool,
 rdynamic: bool,
 san_cov_trace_pc_guard: bool,
+gcov_profiling: bool,
 
 pub const CFrontend = enum { clang, aro };
 
@@ -117,6 +118,7 @@ pub const Options = struct {
     dll_export_fns: ?bool = null,
     rdynamic: ?bool = null,
     san_cov_trace_pc_guard: bool = false,
+    gcov_profiling: bool = false,
 };
 
 pub const ResolveError = error{
@@ -495,6 +497,7 @@ pub fn resolve(options: Options) ResolveError!Config {
         .any_sanitize_c = options.any_sanitize_c,
         .any_fuzz = options.any_fuzz,
         .san_cov_trace_pc_guard = options.san_cov_trace_pc_guard,
+        .gcov_profiling = options.gcov_profiling,
         .root_error_tracing = root_error_tracing,
         .pie = pie,
         .lto = lto,

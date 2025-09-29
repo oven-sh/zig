@@ -390,6 +390,8 @@ pub const File = struct {
     /// When linking with LLD, this linker code will output an object file only at
     /// this location, and then this path can be placed on the LLD linker line.
     zcu_object_sub_path: ?[]const u8 = null,
+    /// Number of parallel codegen partitions (0 or 1 = single file)
+    zcu_object_partition_count: u32 = 0,
     disable_lld_caching: bool,
     gc_sections: bool,
     print_gc_sections: bool,
@@ -454,6 +456,7 @@ pub const File = struct {
         print_gc_sections: bool,
         print_icf_sections: bool,
         print_map: bool,
+        llvm_codegen_threads: u32,
 
         /// Use a wrapper function for symbol. Any undefined reference to symbol
         /// will be resolved to __wrap_symbol. Any undefined reference to

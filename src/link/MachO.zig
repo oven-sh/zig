@@ -192,6 +192,7 @@ pub fn createEmpty(
             .comp = comp,
             .emit = emit,
             .zcu_object_sub_path = zcu_object_sub_path,
+            .zcu_object_partition_count = @intCast(options.llvm_codegen_threads),
             .gc_sections = options.gc_sections orelse (optimize_mode != .Debug),
             .print_gc_sections = options.print_gc_sections,
             .stack_size = options.stack_size orelse 16777216,
@@ -386,8 +387,15 @@ pub fn flushModule(
     if (comp.verbose_link) try self.dumpArgv(comp);
 
     if (self.getZigObject()) |zo| try zo.flushModule(self, tid);
+
     if (self.base.isStaticLib()) return relocatable.flushStaticLib(self, comp, module_obj_path);
-    if (self.base.isObject()) return relocatable.flushObject(self, comp, module_obj_path);
+    if (self.base.isObject()) {
+        // Skip linker if --no-link flag is set
+        if (comp.no_link_obj) {
+            return;
+        }
+        return relocatable.flushObject(self, comp, module_obj_path);
+    }
 
     var positionals = std.ArrayList(link.Input).init(gpa);
     defer positionals.deinit();
@@ -409,7 +417,27 @@ pub fn flushModule(
         positionals.appendAssumeCapacity(try link.openObjectInput(diags, key.status.success.object_path));
     }
 
-    if (module_obj_path) |path| try positionals.append(try link.openObjectInput(diags, path));
+    // Parse LLVM-generated object file(s) - handle parallel codegen partitions
+    if (module_obj_path) |path| {
+        const partition_count = self.base.zcu_object_partition_count;
+        if (partition_count > 1) {
+            const base_path = path.sub_path;
+            const base_name = if (std.mem.endsWith(u8, base_path, ".o"))
+                base_path[0 .. base_path.len - 2]
+            else
+                base_path;
+
+            for (0..partition_count) |i| {
+                const partition_path: Path = .{
+                    .root_dir = path.root_dir,
+                    .sub_path = try std.fmt.allocPrint(arena, "{s}.{d}.o", .{ base_name, i }),
+                };
+                try positionals.append(try link.openObjectInput(diags, partition_path));
+            }
+        } else {
+            try positionals.append(try link.openObjectInput(diags, path));
+        }
+    }
 
     if (comp.config.any_sanitize_thread) {
         try positionals.append(try link.openObjectInput(diags, comp.tsan_lib.?.full_object_path));
