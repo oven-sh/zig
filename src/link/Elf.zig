@@ -1553,6 +1553,11 @@ fn linkWithLLD(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: s
         }
     } else null;
 
+    // Skip LLD invocation if --no-link flag is set (flushModule already wrote objects)
+    if (comp.no_link_obj) {
+        return;
+    }
+
     const sub_prog_node = prog_node.start("LLD Link", 0);
     defer sub_prog_node.end();
 
