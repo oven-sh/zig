@@ -826,7 +826,7 @@ pub fn flushModule(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id, prog_nod
                 .sub_path = std.fs.path.dirname(self.base.emit.sub_path) orelse "",
             }, .{
                 .directory = null,
-                .basename = self.base.emit.sub_path,
+                .basename = std.fs.path.basename(self.base.emit.sub_path),
             }, llvm_object, prog_node);
         } else {
             // Normal case: write to intermediate path (linker will process it)
