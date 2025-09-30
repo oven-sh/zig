@@ -817,8 +817,21 @@ pub fn flushModule(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id, prog_nod
     const diags = &comp.link_diags;
 
     if (self.llvm_object) |llvm_object| {
-        try self.base.emitLlvmObject(arena, llvm_object, prog_node);
         const use_lld = build_options.have_llvm and comp.config.use_lld;
+
+        // With --no-link, write LLVM object directly to final output path
+        if (comp.no_link_obj and use_lld) {
+            try comp.emitLlvmObject(arena, .{
+                .root_dir = self.base.emit.root_dir,
+                .sub_path = std.fs.path.dirname(self.base.emit.sub_path) orelse "",
+            }, .{
+                .directory = null,
+                .basename = self.base.emit.sub_path,
+            }, llvm_object, prog_node);
+        } else {
+            try self.base.emitLlvmObject(arena, llvm_object, prog_node);
+        }
+
         if (use_lld) return;
     }
 
