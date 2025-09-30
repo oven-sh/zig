@@ -819,8 +819,8 @@ pub fn flushModule(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id, prog_nod
     if (self.llvm_object) |llvm_object| {
         const use_lld = build_options.have_llvm and comp.config.use_lld;
 
-        // With --no-link, write LLVM object directly to final output path
-        if (comp.no_link_obj and use_lld) {
+        // With --no-link, write LLVM object directly to final output path (no linker will move it)
+        if (comp.no_link_obj) {
             try comp.emitLlvmObject(arena, .{
                 .root_dir = self.base.emit.root_dir,
                 .sub_path = std.fs.path.dirname(self.base.emit.sub_path) orelse "",
@@ -829,6 +829,7 @@ pub fn flushModule(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id, prog_nod
                 .basename = self.base.emit.sub_path,
             }, llvm_object, prog_node);
         } else {
+            // Normal case: write to intermediate path (linker will process it)
             try self.base.emitLlvmObject(arena, llvm_object, prog_node);
         }
 
