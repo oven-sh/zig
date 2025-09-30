@@ -797,6 +797,12 @@ pub fn loadInput(self: *Elf, input: link.Input) !void {
 
 pub fn flush(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Progress.Node) link.File.FlushError!void {
     const comp = self.base.comp;
+
+    // Skip all linking work if --no-link is set
+    if (comp.no_link_obj) {
+        return;
+    }
+
     const use_lld = build_options.have_llvm and comp.config.use_lld;
     const diags = &comp.link_diags;
     if (use_lld) {
