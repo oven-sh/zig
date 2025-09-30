@@ -368,7 +368,19 @@ pub fn flushModule(
     const diags = &self.base.comp.link_diags;
 
     if (self.llvm_object) |llvm_object| {
-        try self.base.emitLlvmObject(arena, llvm_object, prog_node);
+        // With --no-link, write LLVM object directly to final output path (no linker will move it)
+        if (comp.no_link_obj) {
+            try comp.emitLlvmObject(arena, .{
+                .root_dir = self.base.emit.root_dir,
+                .sub_path = std.fs.path.dirname(self.base.emit.sub_path) orelse "",
+            }, .{
+                .directory = null,
+                .basename = std.fs.path.basename(self.base.emit.sub_path),
+            }, llvm_object, prog_node);
+        } else {
+            // Normal case: write to intermediate path (linker will process it)
+            try self.base.emitLlvmObject(arena, llvm_object, prog_node);
+        }
     }
 
     const sub_prog_node = prog_node.start("MachO Flush", 0);
