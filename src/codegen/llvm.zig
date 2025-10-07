@@ -9802,15 +9802,16 @@ pub const FuncGen = struct {
             }
 
             const len = try o.builder.intValue(try o.lowerType(Type.usize), operand_ty.abiSize(zcu));
+            const should_init = safety and !owner_mod.no_init_undefined;
             _ = try self.wip.callMemSet(
                 dest_ptr,
                 ptr_ty.ptrAlignment(zcu).toLlvm(),
-                if (safety) try o.builder.intValue(.i8, 0xaa) else try o.builder.undefValue(.i8),
+                if (should_init) try o.builder.intValue(.i8, 0xaa) else try o.builder.undefValue(.i8),
                 len,
                 if (ptr_ty.isVolatilePtr(zcu)) .@"volatile" else .normal,
                 self.disable_intrinsics,
             );
-            if (safety and owner_mod.valgrind) {
+            if (should_init and owner_mod.valgrind) {
                 try self.valgrindMarkUndef(dest_ptr, len);
             }
             return .none;
@@ -10110,7 +10111,9 @@ pub const FuncGen = struct {
                 // Even if safety is disabled, we still emit a memset to undefined since it conveys
                 // extra information to LLVM. However, safety makes the difference between using
                 // 0xaa or actual undefined for the fill byte.
-                const fill_byte = if (safety)
+                const owner_mod = self.ng.ownerModule();
+                const should_init = safety and !owner_mod.no_init_undefined;
+                const fill_byte = if (should_init)
                     try o.builder.intValue(.i8, 0xaa)
                 else
                     try o.builder.undefValue(.i8);
@@ -10133,8 +10136,7 @@ pub const FuncGen = struct {
                         self.disable_intrinsics,
                     );
                 }
-                const owner_mod = self.ng.ownerModule();
-                if (safety and owner_mod.valgrind) {
+                if (should_init and owner_mod.valgrind) {
                     try self.valgrindMarkUndef(dest_ptr, len);
                 }
                 return .none;

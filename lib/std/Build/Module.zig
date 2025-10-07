@@ -34,6 +34,7 @@ omit_frame_pointer: ?bool,
 error_tracing: ?bool,
 link_libc: ?bool,
 link_libcpp: ?bool,
+no_init_undefined: ?bool,
 
 /// Symbols to be exported when compiling to WebAssembly.
 export_symbol_names: []const []const u8 = &.{},
@@ -266,6 +267,7 @@ pub const CreateOptions = struct {
     /// more difficult to obtain stack traces. Has target-dependent effects.
     omit_frame_pointer: ?bool = null,
     error_tracing: ?bool = null,
+    no_init_undefined: ?bool = null,
 };
 
 pub const Import = struct {
@@ -312,6 +314,7 @@ pub fn init(
                 .red_zone = options.red_zone,
                 .omit_frame_pointer = options.omit_frame_pointer,
                 .error_tracing = options.error_tracing,
+                .no_init_undefined = options.no_init_undefined,
                 .export_symbol_names = &.{},
             };
 
@@ -558,6 +561,7 @@ pub fn appendZigProcessFlags(
     try addFlag(zig_args, m.sanitize_address, "-fsanitize-address", "-fno-sanitize-address");
     try addFlag(zig_args, m.fuzz, "-ffuzz", "-fno-fuzz");
     try addFlag(zig_args, m.valgrind, "-fvalgrind", "-fno-valgrind");
+    try addFlag(zig_args, m.no_init_undefined, "-fno-init-undefined", "-finit-undefined");
     try addFlag(zig_args, m.pic, "-fPIC", "-fno-PIC");
     try addFlag(zig_args, m.red_zone, "-mred-zone", "-mno-red-zone");
 

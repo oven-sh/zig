@@ -533,6 +533,8 @@ const usage_build_generic =
     \\  -fno-fuzz                 Disable fuzz testing instrumentation
     \\  -fbuiltin                 Enable implicit builtin knowledge of functions
     \\  -fno-builtin              Disable implicit builtin knowledge of functions
+    \\  -finit-undefined          Write 0xaa to undefined memory in ReleaseSafe mode
+    \\  -fno-init-undefined       Disable writing 0xaa to undefined memory
     \\  -funwind-tables           Always produce unwind table entries for all functions
     \\  -fasync-unwind-tables     Always produce asynchronous unwind table entries for all functions
     \\  -fno-unwind-tables        Never produce unwind table entries
@@ -1608,6 +1610,10 @@ fn buildOutputType(
                         mod_opts.no_builtin = false;
                     } else if (mem.eql(u8, arg, "-fno-builtin")) {
                         mod_opts.no_builtin = true;
+                    } else if (mem.eql(u8, arg, "-finit-undefined")) {
+                        mod_opts.no_init_undefined = false;
+                    } else if (mem.eql(u8, arg, "-fno-init-undefined")) {
+                        mod_opts.no_init_undefined = true;
                     } else if (mem.startsWith(u8, arg, "-fopt-bisect-limit=")) {
                         const next_arg = arg["-fopt-bisect-limit=".len..];
                         llvm_opt_bisect_limit = std.fmt.parseInt(c_int, next_arg, 0) catch |err|
@@ -2040,6 +2046,8 @@ fn buildOutputType(
                     .no_data_sections => data_sections = false,
                     .builtin => mod_opts.no_builtin = false,
                     .no_builtin => mod_opts.no_builtin = true,
+                    .init_undefined => mod_opts.no_init_undefined = false,
+                    .no_init_undefined => mod_opts.no_init_undefined = true,
                     .color_diagnostics => color = .on,
                     .no_color_diagnostics => color = .off,
                     .stack_check => mod_opts.stack_check = true,
@@ -5947,6 +5955,8 @@ pub const ClangArgIterator = struct {
         no_data_sections,
         builtin,
         no_builtin,
+        init_undefined,
+        no_init_undefined,
         color_diagnostics,
         no_color_diagnostics,
         stack_check,
