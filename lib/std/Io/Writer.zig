@@ -1038,6 +1038,11 @@ pub fn printValue(
 ) Error!void {
     const T = @TypeOf(value);
 
+    // TODO: this is temporary for migration. remove once we
+    if (std.meta.hasMethod(T, "format")) {
+        return value.format(w);
+    }
+
     switch (fmt.len) {
         1 => switch (fmt[0]) {
             '*' => return w.printAddress(value),
