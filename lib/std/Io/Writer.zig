@@ -1038,7 +1038,7 @@ pub fn printValue(
 ) Error!void {
     const T = @TypeOf(value);
 
-    // TODO: this is temporary for migration. remove once we
+    // TODO: this is temporary for migration. change to compileError unless fmt == "f"
     if (std.meta.hasMethod(T, "format")) {
         return value.format(w);
     }
