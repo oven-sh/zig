@@ -1028,6 +1028,11 @@ pub fn printAddress(w: *Writer, value: anytype) Error!void {
     @compileError("cannot format non-pointer type " ++ @typeName(T) ++ " with * specifier");
 }
 
+const root_format_mode = switch (@hasDecl(@import("root"), "format_mode")) {
+    true => @import("root").format_mode,
+    false => .final,
+};
+
 /// Asserts `buffer` capacity of at least 2 if `value` is a union.
 pub fn printValue(
     w: *Writer,
@@ -1038,9 +1043,23 @@ pub fn printValue(
 ) Error!void {
     const T = @TypeOf(value);
 
-    // TODO: this is temporary for migration. change to compileError unless fmt == "f"
-    if (std.meta.hasMethod(T, "format")) {
-        return value.format(w);
+    switch (root_format_mode) {
+        .always_call_format => {
+            // TODO: this is temporary for migration. change to compileError unless fmt == "f"
+            if (std.meta.hasMethod(T, "format")) {
+                return value.format(w);
+            }
+        },
+        .require_f => {
+            if (std.meta.hasMethod(T, "format")) {
+                if (std.mem.eql(u8, fmt, "f")) {
+                    return value.format(w);
+                } else {
+                    @compileError("Ambiguous format string. Must specify {f} to call format fn.");
+                }
+            }
+        },
+        .final => {},
     }
 
     switch (fmt.len) {
