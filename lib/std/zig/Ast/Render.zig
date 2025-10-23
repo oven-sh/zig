@@ -43,6 +43,8 @@ pub const Fixups = struct {
     replace_nodes_with_node: std.AutoHashMapUnmanaged(Ast.Node.Index, Ast.Node.Index) = .empty,
     /// Change all identifier names matching the key to be value instead.
     rename_identifiers: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    /// Convert .#field to .@"#field"
+    upstream: bool,
 
     /// All `@import` builtin calls which refer to a file path will be prefixed
     /// with this path.
@@ -2930,6 +2932,18 @@ fn renderIdentifier(r: *Render, token_index: Ast.TokenIndex, space: Space, quote
 
     if (r.fixups.rename_identifiers.get(lexeme)) |mangled| {
         try r.ais.writeAll(mangled);
+        try renderSpace(r, token_index, lexeme.len, space);
+        return;
+    }
+
+    if (r.fixups.upstream and lexeme[0] == '#') {
+        const ais = r.ais;
+        assert(tree.tokenTag(token_index) == .identifier);
+
+        try ais.writeAll("@\"");
+        try renderIdentifierContents(ais, lexeme);
+        try ais.writeByte('\"');
+
         try renderSpace(r, token_index, lexeme.len, space);
         return;
     }

@@ -203,10 +203,10 @@ pub fn parse(gpa: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error!A
 
 /// `gpa` is used for allocating the resulting formatted source code.
 /// Caller owns the returned slice of bytes, allocated with `gpa`.
-pub fn renderAlloc(tree: Ast, gpa: Allocator) error{OutOfMemory}![]u8 {
+pub fn renderAlloc(tree: Ast, gpa: Allocator, fixups: Render.Fixups) error{OutOfMemory}![]u8 {
     var aw: std.io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
-    render(tree, gpa, &aw.writer, .{}) catch |err| switch (err) {
+    render(tree, gpa, &aw.writer, fixups) catch |err| switch (err) {
         error.WriteFailed, error.OutOfMemory => return error.OutOfMemory,
     };
     return aw.toOwnedSlice();

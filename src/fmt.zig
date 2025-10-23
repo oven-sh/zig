@@ -22,6 +22,7 @@ const usage_fmt =
     \\  --ast-check            Run zig ast-check on every file
     \\  --exclude [file]       Exclude file or directory from formatting
     \\  --zon                  Treat all input files as ZON, regardless of file extension
+    \\  --upstream            Revert bun-specific changes
     \\
     \\
 ;
@@ -32,6 +33,7 @@ const Fmt = struct {
     check_ast: bool,
     force_zon: bool,
     color: Color,
+    upstream: bool,
     gpa: Allocator,
     arena: Allocator,
     out_buffer: std.Io.Writer.Allocating,
@@ -46,6 +48,7 @@ pub fn run(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
     var check_flag = false;
     var check_ast_flag = false;
     var force_zon = false;
+    var upstream_flag = false;
     var input_files = std.array_list.Managed([]const u8).init(gpa);
     defer input_files.deinit();
     var excluded_files = std.array_list.Managed([]const u8).init(gpa);
@@ -83,6 +86,8 @@ pub fn run(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
                     try excluded_files.append(next_arg);
                 } else if (mem.eql(u8, arg, "--zon")) {
                     force_zon = true;
+                } else if (mem.eql(u8, arg, "--upstream")) {
+                    upstream_flag = true;
                 } else {
                     fatal("unrecognized parameter: '{s}'", .{arg});
                 }
@@ -144,7 +149,7 @@ pub fn run(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
             try std.zig.printAstErrorsToStderr(gpa, tree, "<stdin>", color);
             process.exit(2);
         }
-        const formatted = try tree.renderAlloc(gpa);
+        const formatted = try tree.renderAlloc(gpa, .{ .upstream = upstream_flag });
         defer gpa.free(formatted);
 
         if (check_flag) {
@@ -170,6 +175,7 @@ pub fn run(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
         .check_ast = check_ast_flag,
         .force_zon = force_zon,
         .color = color,
+        .upstream = upstream_flag,
         .out_buffer = .init(gpa),
         .stdout_writer = &stdout_writer,
     };
@@ -338,7 +344,7 @@ fn fmtPathFile(
     fmt.out_buffer.clearRetainingCapacity();
     try fmt.out_buffer.ensureTotalCapacity(source_code.len);
 
-    tree.render(gpa, &fmt.out_buffer.writer, .{}) catch |err| switch (err) {
+    tree.render(gpa, &fmt.out_buffer.writer, .{ .upstream = fmt.upstream }) catch |err| switch (err) {
         error.WriteFailed, error.OutOfMemory => return error.OutOfMemory,
     };
     if (mem.eql(u8, fmt.out_buffer.written(), source_code))
