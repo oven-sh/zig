@@ -1060,6 +1060,7 @@ pub fn printValue(
             }
         },
         .final => {},
+        else => @compileError("Invalid format mode: " ++ @tagName(root_format_mode)),
     }
 
     switch (fmt.len) {
