@@ -149,7 +149,8 @@ pub fn run(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
             try std.zig.printAstErrorsToStderr(gpa, tree, "<stdin>", color);
             process.exit(2);
         }
-        const formatted = try tree.renderAlloc(gpa, .{ .upstream = upstream_flag });
+        if (upstream_flag) @panic("cannot mix stdin_flag with upstream_flag");
+        const formatted = try tree.renderAlloc(gpa);
         defer gpa.free(formatted);
 
         if (check_flag) {
