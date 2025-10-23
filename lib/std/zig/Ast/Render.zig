@@ -44,7 +44,7 @@ pub const Fixups = struct {
     /// Change all identifier names matching the key to be value instead.
     rename_identifiers: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
     /// Convert .#field to .@"#field"
-    upstream: bool,
+    upstream: bool = false,
 
     /// All `@import` builtin calls which refer to a file path will be prefixed
     /// with this path.
