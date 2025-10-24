@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: zig
-      - run: sed -i 's/ZIG_VERSION="0.15.0-dev.1601+c1483eb05"/ZIG_VERSION="0.15.1"/' build
+      - run: sed -i 's/ZIG_VERSION="0.15.0-dev.1601+c1483eb05"/ZIG_VERSION="0.15.2"/' build
       - run: sed -i 's/Doptimize=ReleaseFast/Doptimize=ReleaseSafe/' build
         if: matrix.safe == 'true'
       - run: sed -i 's/Dstrip/Ddebug-extensions/' build
