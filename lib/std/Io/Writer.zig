@@ -1046,16 +1046,30 @@ pub fn printValue(
     switch (root_format_mode) {
         .always_call_format => {
             // TODO: this is temporary for migration. change to compileError unless fmt == "f"
-            if (std.meta.hasMethod(T, "format")) {
-                return value.format(w);
+            if (comptime std.meta.hasMethod(T, "format")) {
+                const rt = value.format(w);
+                const ti = @typeInfo(@TypeOf(rt));
+                if (ti == .error_union) {
+                    const eset = @typeInfo(ti.error_union.error_set).error_set;
+                    if (eset == null) _ = value.formatTypeHadErrorSetAnyopaque;
+                    if (eset.?.len != 1) _ = value.formatTypeHadTooManyErrors;
+                }
+                return rt;
             }
         },
         .require_f => {
-            if (std.meta.hasMethod(T, "format")) {
-                if (std.mem.eql(u8, fmt, "f")) {
-                    return value.format(w);
+            if (comptime std.meta.hasMethod(T, "format")) {
+                if (comptime (fmt.len == 1 and fmt[0] == 'f')) {
+                    const rt = value.format(w);
+                    const ti = @typeInfo(@TypeOf(rt));
+                    if (ti == .error_union) {
+                        const eset = @typeInfo(ti.error_union.error_set).error_set;
+                        if (eset == null) _ = value.formatTypeHadErrorSetAnyopaque;
+                        if (eset.?.len != 1) _ = value.formatTypeHadTooManyErrors;
+                    }
+                    return rt;
                 } else {
-                    @compileError("Ambiguous format string. Must specify {f} to call format fn.");
+                    @compileError("Ambiguous format string. Must specify {f} to call format fn. Received: {" ++ fmt ++ "} for type " ++ @typeName(@TypeOf(value)));
                 }
             }
         },
