@@ -755,6 +755,7 @@ pub const Object = struct {
     }
 
     pub const EmitOptions = struct {
+        bin_path_list: ?[]const [*:0]const u8 = null,
         pre_ir_path: ?[]const u8,
         pre_bc_path: ?[]const u8,
         bin_path: ?[*:0]const u8,
@@ -1061,6 +1062,17 @@ pub const Object = struct {
         // Unfortunately, LLVM shits the bed when we ask for both binary and assembly.
         // So we call the entire pipeline multiple times if this is requested.
         // var error_message: [*:0]const u8 = undefined;
+
+        // Convert bin_path_list to NULL-terminated C array if provided
+        const bin_filename_list: ?[*:null]const ?[*:0]const u8 = if (options.bin_path_list) |list| blk: {
+            const null_term = try comp.gpa.alloc(?[*:0]const u8, list.len + 1);
+            for (list, 0..) |path, i| {
+                null_term[i] = path;
+            }
+            null_term[list.len] = null;
+            break :blk @ptrCast(null_term.ptr);
+        } else null;
+
         var lowered_options: llvm.TargetMachine.EmitOptions = .{
             .is_debug = options.is_debug,
             .is_small = options.is_small,
@@ -1083,6 +1095,8 @@ pub const Object = struct {
 
             // `.coverage` value is only used when `.sancov` is enabled.
             .sancov = options.fuzz or comp.config.san_cov_trace_pc_guard,
+            .gcov_profiling = comp.config.gcov_profiling,
+            .bin_filename_list = bin_filename_list,
             .coverage = .{
                 .CoverageType = .Edge,
                 // Works in tandem with Inline8bitCounters or InlineBoolFlag.
@@ -9716,15 +9730,16 @@ pub const FuncGen = struct {
             self.maybeMarkAllowZeroAccess(ptr_info);
 
             const len = try o.builder.intValue(try o.lowerType(pt, Type.usize), operand_ty.abiSize(zcu));
+            const should_init = safety and !owner_mod.no_init_undefined;
             _ = try self.wip.callMemSet(
                 dest_ptr,
                 ptr_ty.ptrAlignment(zcu).toLlvm(),
-                if (safety) try o.builder.intValue(.i8, 0xaa) else try o.builder.undefValue(.i8),
+                if (should_init) try o.builder.intValue(.i8, 0xaa) else try o.builder.undefValue(.i8),
                 len,
                 if (ptr_ty.isVolatilePtr(zcu)) .@"volatile" else .normal,
                 self.disable_intrinsics,
             );
-            if (safety and owner_mod.valgrind) {
+            if (should_init and owner_mod.valgrind) {
                 try self.valgrindMarkUndef(dest_ptr, len);
             }
             return .none;
@@ -10033,7 +10048,9 @@ pub const FuncGen = struct {
                 // Even if safety is disabled, we still emit a memset to undefined since it conveys
                 // extra information to LLVM. However, safety makes the difference between using
                 // 0xaa or actual undefined for the fill byte.
-                const fill_byte = if (safety)
+                const owner_mod = self.ng.ownerModule();
+                const should_init = safety and !owner_mod.no_init_undefined;
+                const fill_byte = if (should_init)
                     try o.builder.intValue(.i8, 0xaa)
                 else
                     try o.builder.undefValue(.i8);
@@ -10046,8 +10063,7 @@ pub const FuncGen = struct {
                     access_kind,
                     self.disable_intrinsics,
                 );
-                const owner_mod = self.ng.ownerModule();
-                if (safety and owner_mod.valgrind) {
+                if (should_init and owner_mod.valgrind) {
                     try self.valgrindMarkUndef(dest_ptr, len);
                 }
                 return .none;

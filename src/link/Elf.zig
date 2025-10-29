@@ -264,6 +264,7 @@ pub fn createEmpty(
                 try std.fmt.allocPrint(arena, "{s}_zcu.o", .{fs.path.stem(emit.sub_path)})
             else
                 null,
+            .zcu_object_partition_count = @intCast(options.llvm_codegen_threads),
             .gc_sections = options.gc_sections orelse (optimize_mode != .Debug and output_mode != .Obj),
             .print_gc_sections = options.print_gc_sections,
             .stack_size = options.stack_size orelse 16777216,
@@ -765,13 +766,39 @@ fn flushInner(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id) !void {
     const gpa = comp.gpa;
     const diags = &comp.link_diags;
 
+    // Skip linking entirely if --no-link flag is set
+    if (comp.no_link_obj) {
+        return;
+    }
+
     const zcu_obj_path: ?Path = if (self.base.zcu_object_basename) |raw| p: {
         break :p try comp.resolveEmitPathFlush(arena, .temp, raw);
     } else null;
 
     if (self.zigObjectPtr()) |zig_object| try zig_object.flush(self, tid);
 
-    if (zcu_obj_path) |path| openParseObjectReportingFailure(self, path);
+    // Parse LLVM-generated object file(s)
+    if (zcu_obj_path) |path| {
+        const partition_count = self.base.zcu_object_partition_count;
+        if (partition_count > 1) {
+            // Parallel codegen: parse all partition files
+            const base_path = path.sub_path;
+            const base_name = if (std.mem.endsWith(u8, base_path, ".o"))
+                base_path[0 .. base_path.len - 2]
+            else
+                base_path;
+
+            for (0..partition_count) |i| {
+                const partition_path: Path = .{
+                    .root_dir = path.root_dir,
+                    .sub_path = try std.fmt.allocPrint(arena, "{s}.{d}.o", .{ base_name, i }),
+                };
+                openParseObjectReportingFailure(self, partition_path);
+            }
+        } else {
+            openParseObjectReportingFailure(self, path);
+        }
+    }
 
     switch (comp.config.output_mode) {
         .Obj => return relocatable.flushObject(self, comp),

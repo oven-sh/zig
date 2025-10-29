@@ -389,6 +389,8 @@ pub const File = struct {
     ///
     /// To convert this to an actual path, see `Compilation.resolveEmitPath` (with `kind == .temp`).
     zcu_object_basename: ?[]const u8 = null,
+    /// Number of parallel codegen partitions (0 or 1 = single file)
+    zcu_object_partition_count: u32 = 0,
     gc_sections: bool,
     print_gc_sections: bool,
     build_id: std.zig.BuildId,
@@ -451,6 +453,7 @@ pub const File = struct {
         print_gc_sections: bool,
         print_icf_sections: bool,
         print_map: bool,
+        llvm_codegen_threads: u32,
 
         /// Use a wrapper function for symbol. Any undefined reference to symbol
         /// will be resolved to __wrap_symbol. Any undefined reference to

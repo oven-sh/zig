@@ -264,6 +264,8 @@ link_task_wait_group: WaitGroup = .{},
 link_prog_node: std.Progress.Node = std.Progress.Node.none,
 
 llvm_opt_bisect_limit: c_int,
+llvm_codegen_threads: u32,
+no_link_obj: bool,
 
 time_report: ?TimeReport,
 
@@ -1726,6 +1728,8 @@ pub const CreateOptions = struct {
     linker_print_icf_sections: bool = false,
     linker_print_map: bool = false,
     llvm_opt_bisect_limit: i32 = -1,
+    llvm_codegen_threads: u32 = 0,
+    no_link_obj: bool = false,
     build_id: ?std.zig.BuildId = null,
     disable_c_depfile: bool = false,
     linker_z_nodelete: bool = false,
@@ -2293,6 +2297,8 @@ pub fn create(gpa: Allocator, arena: Allocator, diag: *CreateDiagnostic, options
             .link_inputs = options.link_inputs,
             .framework_dirs = options.framework_dirs,
             .llvm_opt_bisect_limit = options.llvm_opt_bisect_limit,
+            .llvm_codegen_threads = options.llvm_codegen_threads,
+            .no_link_obj = options.no_link_obj,
             .skip_linker_dependencies = options.skip_linker_dependencies,
             .queued_jobs = .{},
             .function_sections = options.function_sections,
@@ -2402,6 +2408,7 @@ pub fn create(gpa: Allocator, arena: Allocator, diag: *CreateDiagnostic, options
             .pdb_out_path = options.pdb_out_path,
             .entry_addr = null, // CLI does not expose this option (yet?)
             .object_host_name = "env",
+            .llvm_codegen_threads = options.llvm_codegen_threads,
         };
 
         switch (options.cache_mode) {
@@ -3346,15 +3353,41 @@ fn flush(
                 comp.time_report.?.stats.real_ns_llvm_emit = ns;
             };
 
+            const base_bin_path: ?[*:0]const u8 = p: {
+                const lf = comp.bin_file orelse break :p null;
+                // With --no-link, write LLVM output directly to final location
+                const basename = if (comp.no_link_obj)
+                    lf.emit.sub_path  // Direct to final output (skip flushObject)
+                else
+                    lf.zcu_object_basename.?;  // To intermediate (flushObject will copy)
+                const p = try comp.resolveEmitPathFlush(arena, if (comp.no_link_obj) .artifact else .temp, basename);
+                break :p (try p.toStringZ(arena)).ptr;
+            };
+
+            // Generate parallel codegen output filenames if enabled
+            const bin_path_list: ?[]const [*:0]const u8 = if (comp.llvm_codegen_threads > 1 and base_bin_path != null) blk: {
+                const num_threads = comp.llvm_codegen_threads;
+                const list = try arena.alloc([*:0]const u8, num_threads);
+                const base_path_slice = std.mem.sliceTo(base_bin_path.?, 0);
+
+                // Strip .o extension if present
+                const base_name: []const u8 = if (std.mem.endsWith(u8, base_path_slice, ".o"))
+                    base_path_slice[0 .. base_path_slice.len - 2]
+                else
+                    base_path_slice;
+
+                for (0..num_threads) |i| {
+                    list[i] = (try std.fmt.allocPrintSentinel(arena, "{s}.{d}.o", .{base_name, i}, 0)).ptr;
+                }
+                break :blk list;
+            } else null;
+
             llvm_object.emit(pt, .{
                 .pre_ir_path = comp.verbose_llvm_ir,
                 .pre_bc_path = comp.verbose_llvm_bc,
 
-                .bin_path = p: {
-                    const lf = comp.bin_file orelse break :p null;
-                    const p = try comp.resolveEmitPathFlush(arena, .temp, lf.zcu_object_basename.?);
-                    break :p try p.toStringZ(arena);
-                },
+                .bin_path = base_bin_path,
+                .bin_path_list = bin_path_list,
                 .asm_path = p: {
                     const raw = comp.emit_asm orelse break :p null;
                     const p = try comp.resolveEmitPathFlush(arena, .artifact, raw);
@@ -7241,6 +7274,11 @@ pub fn addCCArgs(
 
                 if (comp.config.san_cov_trace_pc_guard) {
                     try argv.append("-fsanitize-coverage=trace-pc-guard");
+                }
+
+                if (comp.config.gcov_profiling) {
+                    try argv.append("-fprofile-arcs");
+                    try argv.append("-ftest-coverage");
                 }
             }
 

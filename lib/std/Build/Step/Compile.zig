@@ -157,6 +157,15 @@ headerpad_max_install_names: bool = false,
 /// (Darwin) Remove dylibs that are unreachable by the entry point or exported symbols.
 dead_strip_dylibs: bool = false,
 
+/// Number of threads to use for LLVM backend code generation.
+/// 0 means single-threaded (default). > 1 enables parallel codegen.
+/// When enabled, outputs multiple .o files: filename.0.o, filename.1.o, etc.
+llvm_codegen_threads: u32 = 0,
+
+/// Skip linker step for build-obj - outputs raw LLVM object file(s).
+/// Saves time by avoiding parse/resolve/write cycle.
+no_link_obj: bool = false,
+
 /// (Darwin) Force load all members of static archives that implement an Objective-C class or category
 force_load_objc: bool = false,
 
@@ -1519,6 +1528,12 @@ fn getZigArgs(compile: *Compile, fuzz: bool) ![][]const u8 {
     }
     if (compile.link_data_sections) {
         try zig_args.append("-fdata-sections");
+    }
+    if (compile.llvm_codegen_threads > 0) {
+        try zig_args.append(b.fmt("--llvm-codegen-threads={d}", .{compile.llvm_codegen_threads}));
+    }
+    if (compile.no_link_obj) {
+        try zig_args.append("--no-link");
     }
     if (compile.link_gc_sections) |x| {
         try zig_args.append(if (x) "--gc-sections" else "--no-gc-sections");

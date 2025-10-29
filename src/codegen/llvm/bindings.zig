@@ -100,6 +100,10 @@ pub const TargetMachine = opaque {
         llvm_ir_filename: ?[*:0]const u8,
         bitcode_filename: ?[*:0]const u8,
         coverage: Coverage,
+        gcov_profiling: bool,
+        // For parallel codegen: NULL-terminated array of output filenames
+        // NULL = single-threaded. Array length determines thread count.
+        bin_filename_list: ?[*:null]const ?[*:0]const u8,
 
         pub const LtoPhase = enum(c_int) {
             None,

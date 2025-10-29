@@ -35,6 +35,8 @@ cc_argv: []const []const u8,
 /// (SPIR-V) whether to generate a structured control flow graph or not
 structured_cfg: bool,
 no_builtin: bool,
+/// Disable writing 0xaa to undefined memory even in ReleaseSafe mode
+no_init_undefined: bool,
 
 pub const Deps = std.StringArrayHashMapUnmanaged(*Module);
 
@@ -83,6 +85,7 @@ pub const CreateOptions = struct {
         fuzz: ?bool = null,
         structured_cfg: ?bool = null,
         no_builtin: ?bool = null,
+        no_init_undefined: ?bool = null,
     };
 };
 
@@ -342,6 +345,12 @@ pub fn create(arena: Allocator, options: CreateOptions) !*Package.Module {
         break :b target.cpu.arch.isBpf();
     };
 
+    const no_init_undefined = b: {
+        if (options.inherited.no_init_undefined) |x| break :b x;
+        if (options.parent) |p| break :b p.no_init_undefined;
+        break :b false;
+    };
+
     const llvm_cpu_features: ?[*:0]const u8 = b: {
         if (resolved_target.llvm_cpu_features) |x| break :b x;
         if (!options.global.use_llvm) break :b null;
@@ -412,6 +421,7 @@ pub fn create(arena: Allocator, options: CreateOptions) !*Package.Module {
         .cc_argv = options.cc_argv,
         .structured_cfg = structured_cfg,
         .no_builtin = no_builtin,
+        .no_init_undefined = no_init_undefined,
     };
     return mod;
 }
@@ -452,6 +462,7 @@ pub fn createLimited(gpa: Allocator, options: LimitedOptions) Allocator.Error!*P
         .cc_argv = undefined,
         .structured_cfg = undefined,
         .no_builtin = undefined,
+        .no_init_undefined = undefined,
     };
     return mod;
 }
@@ -492,6 +503,7 @@ pub fn createBuiltin(arena: Allocator, opts: Builtin, dirs: Compilation.Director
         .sanitize_c = .off,
         .structured_cfg = false,
         .no_builtin = false,
+        .no_init_undefined = false,
     };
     return new;
 }

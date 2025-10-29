@@ -181166,7 +181166,10 @@ fn genSetReg(
         .elementwise_args,
         .reserved_frame,
         => unreachable,
-        .undef => if (opts.safety) switch (dst_reg.class()) {
+        .undef => if (opts.safety and !switch (self.owner) {
+            .nav_index => |nav_index| if (self.pt.zcu.navFileScope(nav_index).mod) |mod| mod.no_init_undefined else false,
+            .lazy_sym => false,
+        }) switch (dst_reg.class()) {
             .general_purpose, .gphi => switch (abi_size) {
                 1 => try self.asmRegisterImmediate(.{ ._, .mov }, dst_reg.to8(), .u(0xaa)),
                 2 => try self.asmRegisterImmediate(.{ ._, .mov }, dst_reg.to16(), .u(0xaaaa)),
@@ -182838,7 +182841,11 @@ fn airMemset(self: *CodeGen, inst: Air.Inst.Index, safety: bool) !void {
     const bin_op = self.air.instructions.items(.data)[@intFromEnum(inst)].bin_op;
 
     result: {
-        if (!safety and (try self.resolveInst(bin_op.rhs)) == .undef) break :result;
+        const should_skip = switch (self.owner) {
+            .nav_index => |nav_index| (!safety or if (self.pt.zcu.navFileScope(nav_index).mod) |mod| mod.no_init_undefined else false),
+            .lazy_sym => !safety,
+        };
+        if (should_skip and (try self.resolveInst(bin_op.rhs)) == .undef) break :result;
 
         try self.spillRegisters(&.{ .rax, .rdi, .rsi, .rcx });
         const reg_locks = self.register_manager.lockRegsAssumeUnused(4, .{ .rax, .rdi, .rsi, .rcx });
@@ -186711,7 +186718,10 @@ const Temp = struct {
             const val_mcv = val.tracking(cg).short;
             switch (val_mcv) {
                 else => |mcv| std.debug.panic("{s}: {f}\n", .{ @src().fn_name, mcv }),
-                .undef => if (opts.safe) {
+                .undef => if (opts.safe and !switch (cg.owner) {
+                    .nav_index => |nav_index| if (cg.pt.zcu.navFileScope(nav_index).mod) |mod| mod.no_init_undefined else false,
+                    .lazy_sym => false,
+                }) {
                     var pat = try cg.tempInit(.u8, .{ .immediate = 0xaa });
                     var len = try cg.tempInit(.usize, .{ .immediate = val_ty.abiSize(cg.pt.zcu) });
                     try ptr.memset(&pat, &len, cg);
@@ -186858,7 +186868,10 @@ const Temp = struct {
             switch (val_mcv) {
                 else => |mcv| std.debug.panic("{s}: {f}\n", .{ @src().fn_name, mcv }),
                 .none => {},
-                .undef => if (opts.safe) {
+                .undef => if (opts.safe and !switch (cg.owner) {
+                    .nav_index => |nav_index| if (cg.pt.zcu.navFileScope(nav_index).mod) |mod| mod.no_init_undefined else false,
+                    .lazy_sym => false,
+                }) {
                     var dst_ptr = try cg.tempInit(.usize, dst.tracking(cg).short.address().offset(opts.disp));
                     var pat = try cg.tempInit(.u8, .{ .immediate = 0xaa });
                     var len = try cg.tempInit(.usize, .{ .immediate = val_ty.abiSize(cg.pt.zcu) });

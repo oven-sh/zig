@@ -474,6 +474,8 @@ const usage_build_generic =
     \\  -fno-reference-trace      Disable reference trace
     \\  -ffunction-sections       Places each function in a separate section
     \\  -fno-function-sections    All functions go into same section
+    \\  --llvm-codegen-threads=[threads] Number of threads for LLVM codegen (0=single-threaded)
+    \\  --no-link                 Skip linker step for build-obj (outputs raw LLVM object)
     \\  -fdata-sections           Places each data in a separate section
     \\  -fno-data-sections        All data go into same section
     \\  -fformatted-panics        Enable formatted safety panics
@@ -538,6 +540,8 @@ const usage_build_generic =
     \\  -fno-fuzz                 Disable fuzz testing instrumentation
     \\  -fbuiltin                 Enable implicit builtin knowledge of functions
     \\  -fno-builtin              Disable implicit builtin knowledge of functions
+    \\  -finit-undefined          Write 0xaa to undefined memory in ReleaseSafe mode
+    \\  -fno-init-undefined       Disable writing 0xaa to undefined memory
     \\  -funwind-tables           Always produce unwind table entries for all functions
     \\  -fasync-unwind-tables     Always produce asynchronous unwind table entries for all functions
     \\  -fno-unwind-tables        Never produce unwind table entries
@@ -874,6 +878,8 @@ fn buildOutputType(
     var linker_print_icf_sections: bool = false;
     var linker_print_map: bool = false;
     var llvm_opt_bisect_limit: c_int = -1;
+    var llvm_codegen_threads: u32 = 0;
+    var no_link_obj: bool = false;
     var linker_z_nocopyreloc = false;
     var linker_z_nodelete = false;
     var linker_z_notext = false;
@@ -1499,6 +1505,10 @@ fn buildOutputType(
                         create_module.opts.san_cov_trace_pc_guard = true;
                     } else if (mem.eql(u8, arg, "-fno-sanitize-coverage-trace-pc-guard")) {
                         create_module.opts.san_cov_trace_pc_guard = false;
+                    } else if (mem.eql(u8, arg, "-fprofile-arcs") or mem.eql(u8, arg, "-ftest-coverage")) {
+                        create_module.opts.gcov_profiling = true;
+                    } else if (mem.eql(u8, arg, "-fno-profile-arcs") or mem.eql(u8, arg, "-fno-test-coverage")) {
+                        create_module.opts.gcov_profiling = false;
                     } else if (mem.eql(u8, arg, "-freference-trace")) {
                         reference_trace = 256;
                     } else if (mem.startsWith(u8, arg, "-freference-trace=")) {
@@ -1610,10 +1620,19 @@ fn buildOutputType(
                         mod_opts.no_builtin = false;
                     } else if (mem.eql(u8, arg, "-fno-builtin")) {
                         mod_opts.no_builtin = true;
+                    } else if (mem.eql(u8, arg, "-finit-undefined")) {
+                        mod_opts.no_init_undefined = false;
+                    } else if (mem.eql(u8, arg, "-fno-init-undefined")) {
+                        mod_opts.no_init_undefined = true;
                     } else if (mem.startsWith(u8, arg, "-fopt-bisect-limit=")) {
                         const next_arg = arg["-fopt-bisect-limit=".len..];
                         llvm_opt_bisect_limit = std.fmt.parseInt(c_int, next_arg, 0) catch |err|
                             fatal("unable to parse '{s}': {s}", .{ arg, @errorName(err) });
+                    } else if (mem.startsWith(u8, arg, "--llvm-codegen-threads=")) {
+                        llvm_codegen_threads = std.fmt.parseInt(u32, arg["--llvm-codegen-threads=".len..], 10) catch |err|
+                            fatal("unable to parse '{s}': {s}", .{ arg, @errorName(err) });
+                    } else if (mem.eql(u8, arg, "--no-link")) {
+                        no_link_obj = true;
                     } else if (mem.eql(u8, arg, "--eh-frame-hdr")) {
                         link_eh_frame_hdr = true;
                     } else if (mem.eql(u8, arg, "--no-eh-frame-hdr")) {
@@ -2039,6 +2058,8 @@ fn buildOutputType(
                     .no_data_sections => data_sections = false,
                     .builtin => mod_opts.no_builtin = false,
                     .no_builtin => mod_opts.no_builtin = true,
+                    .init_undefined => mod_opts.no_init_undefined = false,
+                    .no_init_undefined => mod_opts.no_init_undefined = true,
                     .color_diagnostics => color = .on,
                     .no_color_diagnostics => color = .off,
                     .stack_check => mod_opts.stack_check = true,
@@ -3470,6 +3491,8 @@ fn buildOutputType(
         .linker_print_icf_sections = linker_print_icf_sections,
         .linker_print_map = linker_print_map,
         .llvm_opt_bisect_limit = llvm_opt_bisect_limit,
+        .llvm_codegen_threads = llvm_codegen_threads,
+        .no_link_obj = no_link_obj,
         .linker_global_base = linker_global_base,
         .linker_export_symbol_names = linker_export_symbol_names.items,
         .linker_z_nocopyreloc = linker_z_nocopyreloc,
@@ -5933,6 +5956,8 @@ pub const ClangArgIterator = struct {
         no_data_sections,
         builtin,
         no_builtin,
+        init_undefined,
+        no_init_undefined,
         color_diagnostics,
         no_color_diagnostics,
         stack_check,

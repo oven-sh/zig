@@ -39,6 +39,7 @@
 #include <llvm/Passes/StandardInstrumentations.h>
 #include <llvm/Object/Archive.h>
 #include <llvm/Object/ArchiveWriter.h>
+#include <llvm/Object/ObjectFile.h>
 #include <llvm/Object/COFF.h>
 #include <llvm/Object/COFFImportFile.h>
 #include <llvm/Object/COFFModuleDefinition.h>
@@ -57,13 +58,20 @@
 #include <llvm/Transforms/Instrumentation/ThreadSanitizer.h>
 #include <llvm/Transforms/Instrumentation/AddressSanitizer.h>
 #include <llvm/Transforms/Instrumentation/SanitizerCoverage.h>
+#include <llvm/Transforms/Instrumentation/GCOVProfiler.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Utils.h>
 #include <llvm/Transforms/Utils/AddDiscriminators.h>
 #include <llvm/Transforms/Utils/CanonicalizeAliases.h>
 #include <llvm/Transforms/Utils/NameAnonGlobals.h>
+#include <llvm/Transforms/Utils/SplitModule.h>
+#include <llvm/Support/ThreadPool.h>
+#include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/Support/Threading.h>
 
 #include <lld/Common/Driver.h>
+
+#include <thread>
 
 #if __GNUC__ >= 9
 #pragma GCC diagnostic pop
@@ -246,7 +254,13 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machi
             return true;
         }
     }
-    if (options->bin_filename) {
+    // Open single bin file if not using parallel codegen
+    // Check early if parallel will actually be used
+    bool will_use_parallel = options->bin_filename_list != nullptr &&
+                             !options->lto &&
+                             !options->asm_filename;
+
+    if (options->bin_filename && !will_use_parallel) {
         std::error_code EC;
         dest_bin_ptr = new(std::nothrow) raw_fd_ostream(options->bin_filename, EC, sys::fs::OF_None);
         if (EC) {
@@ -335,6 +349,12 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machi
         if (!options->is_debug) {
             module_pm.addPass(createModuleToFunctionPassAdaptor(AddDiscriminatorsPass()));
         }
+
+        // GCOV profiling instrumentation
+        if (options->gcov_profiling) {
+            GCOVOptions gcov_opts = GCOVOptions::getDefault();
+            module_pm.addPass(GCOVProfilerPass(gcov_opts));
+        }
     });
 
     const bool early_san = options->is_debug;
@@ -404,29 +424,145 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machi
       module_pm = pass_builder.buildPerModuleDefaultPipeline(opt_level);
     }
 
-    // Unfortunately we don't have new PM for code generation
-    legacy::PassManager codegen_pm;
-    codegen_pm.add(
-      createTargetTransformInfoWrapperPass(target_machine.getTargetIRAnalysis()));
-
-    if (dest_bin && !options->lto) {
-        if (target_machine.addPassesToEmitFile(codegen_pm, *dest_bin, nullptr, CodeGenFileType::ObjectFile)) {
-            *error_message = strdup("TargetMachine can't emit an object file");
-            return true;
-        }
-    }
-    if (dest_asm) {
-        if (target_machine.addPassesToEmitFile(codegen_pm, *dest_asm, nullptr, CodeGenFileType::AssemblyFile)) {
-            *error_message = strdup("TargetMachine can't emit an assembly file");
-            return true;
-        }
-    }
-
     // Optimization phase
     module_pm.run(llvm_module, module_am);
 
     // Code generation phase
-    codegen_pm.run(llvm_module);
+    // Check if we should use parallel codegen (same condition as will_use_parallel above)
+    bool use_parallel_codegen = options->bin_filename_list != nullptr &&
+                                !options->lto &&
+                                !options->asm_filename;
+
+    if (use_parallel_codegen) {
+        // Count number of output files (NULL-terminated array)
+        unsigned NumThreads = 0;
+        while (options->bin_filename_list[NumThreads] != nullptr) {
+            NumThreads++;
+        }
+
+        if (NumThreads <= 1) {
+            use_parallel_codegen = false;
+        }
+    }
+
+    if (use_parallel_codegen) {
+        // Parallel code generation path
+        unsigned NumThreads = 0;
+        while (options->bin_filename_list[NumThreads] != nullptr) {
+            NumThreads++;
+        }
+
+        std::vector<std::unique_ptr<raw_fd_ostream>> temp_streams;
+        std::vector<raw_pwrite_stream *> stream_ptrs;
+
+        // Create N output streams using the provided filenames
+        for (unsigned i = 0; i < NumThreads; ++i) {
+            std::error_code EC;
+            auto stream = std::make_unique<raw_fd_ostream>(options->bin_filename_list[i], EC, sys::fs::OF_None);
+            if (EC) {
+                *error_message = strdup((const char *)StringRef(EC.message()).bytes_begin());
+                return true;
+            }
+            stream_ptrs.push_back(stream.get());
+            temp_streams.push_back(std::move(stream));
+        }
+
+        // TargetMachine factory - creates a new TM for each thread
+        Target *TheTarget = reinterpret_cast<Target*>(const_cast<void*>(
+            reinterpret_cast<const void*>(&target_machine.getTarget())));
+        std::string Triple = std::string(target_machine.getTargetTriple().str());
+        std::string CPU = std::string(target_machine.getTargetCPU());
+        std::string Features = std::string(target_machine.getTargetFeatureString());
+        CodeGenOptLevel CGOptLevel = target_machine.getOptLevel();
+        auto RM = target_machine.getRelocationModel();
+        auto CM = target_machine.getCodeModel();
+        TargetOptions Opts = target_machine.Options;
+
+        auto TMFactory = [=]() -> std::unique_ptr<TargetMachine> {
+            std::unique_ptr<TargetMachine> TM(TheTarget->createTargetMachine(
+                Triple, CPU, Features, Opts, RM, CM, CGOptLevel, false));
+            if (options->allow_fast_isel) {
+                TM->setO0WantsFastISel(true);
+            } else {
+                TM->setFastISel(false);
+            }
+            return TM;
+        };
+
+        // Manual parallel code generation (same as llvm::splitCodeGen)
+        {
+            llvm::StdThreadPool CodegenThreadPool(llvm::hardware_concurrency(NumThreads));
+            std::atomic<unsigned> ThreadCount(0);
+
+            SplitModule(
+                llvm_module, NumThreads,
+                [&](std::unique_ptr<Module> MPart) {
+                    SmallString<0> BC;
+                    raw_svector_ostream BCOS(BC);
+                    WriteBitcodeToFile(*MPart, BCOS);
+
+                    llvm::raw_pwrite_stream *ThreadOS = stream_ptrs[ThreadCount++];
+
+                    CodegenThreadPool.async(
+                        [TMFactory, ThreadOS](const SmallString<0> &BC) {
+                            LLVMContext Ctx;
+                            auto BufferRef = MemoryBufferRef(StringRef(BC.data(), BC.size()), "<split-module>");
+                            Expected<std::unique_ptr<Module>> MOrErr = parseBitcodeFile(BufferRef, Ctx);
+                            if (!MOrErr) {
+                                std::string Msg;
+                                handleAllErrors(MOrErr.takeError(), [&](ErrorInfoBase &EIB) {
+                                    Msg = EIB.message();
+                                });
+                                report_fatal_error(Twine("Failed to read bitcode: ") + Msg);
+                            }
+                            std::unique_ptr<Module> MPartInCtx = std::move(*MOrErr);
+
+                            std::unique_ptr<TargetMachine> TM = TMFactory();
+                            legacy::PassManager CodeGenPasses;
+                            if (TM->addPassesToEmitFile(CodeGenPasses, *ThreadOS, nullptr, CodeGenFileType::ObjectFile))
+                                report_fatal_error("Failed to setup codegen");
+                            CodeGenPasses.run(*MPartInCtx);
+                        },
+                        std::move(BC));
+                },
+                true);  // avoid symbol globalization overhead
+        }
+
+        // Flush and close streams
+        for (auto &stream : temp_streams) {
+            stream->flush();
+        }
+        temp_streams.clear();
+
+        // Output files are now: bin_filename.0.o, bin_filename.1.o, ..., bin_filename.(N-1).o
+        // The linker will automatically pick up all of them
+    } else {
+        // Single-threaded code generation path (original)
+        legacy::PassManager codegen_pm;
+        codegen_pm.add(
+          createTargetTransformInfoWrapperPass(target_machine.getTargetIRAnalysis()));
+
+        if (dest_bin && !options->lto) {
+            if (target_machine.addPassesToEmitFile(codegen_pm, *dest_bin, nullptr, CodeGenFileType::ObjectFile)) {
+                *error_message = strdup("TargetMachine can't emit an object file");
+                return true;
+            }
+        }
+        if (dest_asm) {
+            if (target_machine.addPassesToEmitFile(codegen_pm, *dest_asm, nullptr, CodeGenFileType::AssemblyFile)) {
+                *error_message = strdup("TargetMachine can't emit an assembly file");
+                return true;
+            }
+        }
+
+        if (options->allow_fast_isel) {
+            target_machine.setO0WantsFastISel(true);
+        } else {
+            target_machine.setFastISel(false);
+        }
+
+        codegen_pm.run(llvm_module);
+    }
 
     if (options->llvm_ir_filename) {
         if (LLVMPrintModuleToFile(module_ref, options->llvm_ir_filename, error_message)) {
