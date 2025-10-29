@@ -1028,11 +1028,6 @@ pub fn printAddress(w: *Writer, value: anytype) Error!void {
     @compileError("cannot format non-pointer type " ++ @typeName(T) ++ " with * specifier");
 }
 
-const root_format_mode = switch (@hasDecl(@import("root"), "format_mode")) {
-    true => @import("root").format_mode,
-    false => .final,
-};
-
 /// Asserts `buffer` capacity of at least 2 if `value` is a union.
 pub fn printValue(
     w: *Writer,
@@ -1042,40 +1037,6 @@ pub fn printValue(
     max_depth: usize,
 ) Error!void {
     const T = @TypeOf(value);
-
-    switch (root_format_mode) {
-        .always_call_format => {
-            // TODO: this is temporary for migration. change to compileError unless fmt == "f"
-            if (comptime std.meta.hasMethod(T, "format")) {
-                const rt = value.format(w);
-                const ti = @typeInfo(@TypeOf(rt));
-                if (ti == .error_union) {
-                    const eset = @typeInfo(ti.error_union.error_set).error_set;
-                    if (eset == null) _ = value.formatTypeHadErrorSetAnyopaque;
-                    if (eset.?.len != 1) _ = value.formatTypeHadTooManyErrors;
-                }
-                return rt;
-            }
-        },
-        .require_f => {
-            if (comptime std.meta.hasMethod(T, "format")) {
-                if (comptime (fmt.len == 1 and fmt[0] == 'f')) {
-                    const rt = value.format(w);
-                    const ti = @typeInfo(@TypeOf(rt));
-                    if (ti == .error_union) {
-                        const eset = @typeInfo(ti.error_union.error_set).error_set;
-                        if (eset == null) _ = value.formatTypeHadErrorSetAnyopaque;
-                        if (eset.?.len != 1) _ = value.formatTypeHadTooManyErrors;
-                    }
-                    return rt;
-                } else {
-                    @compileError("Ambiguous format string. Must specify {f} to call format fn. Received: {" ++ fmt ++ "} for type " ++ @typeName(@TypeOf(value)));
-                }
-            }
-        },
-        .final => {},
-        else => @compileError("Invalid format mode: " ++ @tagName(root_format_mode)),
-    }
 
     switch (fmt.len) {
         1 => switch (fmt[0]) {
