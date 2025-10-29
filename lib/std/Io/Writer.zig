@@ -1070,7 +1070,10 @@ pub fn printValue(
                     }
                     return rt;
                 } else {
-                    @compileError("Ambiguous format string. Must specify {f} to call format fn. Received: {" ++ fmt ++ "} for type " ++ @typeName(@TypeOf(value)));
+                    switch (@TypeOf(value)) {
+                        std.Target.Os.WindowsVersion => {},
+                        else => @compileError("Ambiguous format string. Must specify {f} to call format fn. Received: {" ++ fmt ++ "} for type " ++ @typeName(@TypeOf(value))),
+                    }
                 }
             }
         },
