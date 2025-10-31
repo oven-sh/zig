@@ -3357,7 +3357,7 @@ fn flush(
                 const lf = comp.bin_file orelse break :p null;
                 // With --no-link, write LLVM output directly to final location
                 const basename = if (comp.no_link_obj)
-                    lf.emit.sub_path  // Direct to final output (skip flushObject)
+                    std.fs.path.basename(lf.emit.sub_path)  // Direct to final output (skip flushObject)
                 else
                     lf.zcu_object_basename.?;  // To intermediate (flushObject will copy)
                 const p = try comp.resolveEmitPathFlush(arena, if (comp.no_link_obj) .artifact else .temp, basename);
