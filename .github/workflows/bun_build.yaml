@@ -40,6 +40,15 @@ jobs:
       - run: sed -i 's/max_rss = 7_800_000_000/max_rss = 10_000_000_000/' zig/build.zig
         if: matrix.safe == 'true'
       - run: cat build
+      - name: Cache host toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            out/build-llvm-host
+          key: |
+            host-llvm-${{ runner.os }}-${{ runner.arch }}-zig0152-ninja-${{ hashFiles('build', 'llvm/**', 'clang/**', 'lld/**') }}
+          restore-keys: |
+            host-llvm-${{ runner.os }}-${{ runner.arch }}-zig0152-ninja-
       - run: CMAKE_GENERATOR=Ninja ./build ${{ matrix.target }} baseline
       - uses: actions/upload-artifact@v4
         with:
