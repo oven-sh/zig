@@ -45,6 +45,7 @@ jobs:
         with:
           path: |
             out/build-llvm-host
+            out/host
           key: |
             host-llvm-${{ runner.os }}-${{ runner.arch }}-zig0152-ninja-${{ hashFiles('build', 'llvm/**', 'clang/**', 'lld/**') }}
           restore-keys: |
