@@ -49,7 +49,7 @@ jobs:
             out/build-llvm-${{ matrix.target }}-baseline
             out/build-zlib-${{ matrix.target }}-baseline
           key: |
-            host-llvm-${{ matrix.target }}-zig0152-ninja-${{ hashFiles('build', 'llvm/**', 'clang/**', 'lld/**') }}
+            host-llvm-${{ matrix.target }}-zig0152-ninja-${{ matrix.safe }}-${{ hashFiles('build', 'llvm/**', 'clang/**', 'lld/**') }}
           restore-keys: |
             host-llvm-${{ matrix.target }}-zig0152-ninja-
       - run: CMAKE_GENERATOR=Ninja ./build ${{ matrix.target }} baseline
