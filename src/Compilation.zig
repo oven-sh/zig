@@ -3356,12 +3356,11 @@ fn flush(
             const base_bin_path: ?[*:0]const u8 = p: {
                 const lf = comp.bin_file orelse break :p null;
                 // With --no-link, write LLVM output directly to final location
-                const basename = if (comp.no_link_obj)
-                    std.fs.path.basename(lf.emit.sub_path)  // Direct to final output (skip flushObject)
-                else
-                    lf.zcu_object_basename.?;  // To intermediate (flushObject will copy)
-                const p = try comp.resolveEmitPathFlush(arena, if (comp.no_link_obj) .artifact else .temp, basename);
-                break :p (try p.toStringZ(arena)).ptr;
+                const path: Cache.Path = if (comp.no_link_obj) .{
+                    .root_dir = lf.emit.root_dir,
+                    .sub_path = lf.emit.sub_path,
+                } else try comp.resolveEmitPathFlush(arena, .temp, lf.zcu_object_basename.?);
+                break :p (try path.toStringZ(arena)).ptr;
             };
 
             // Generate parallel codegen output filenames if enabled
@@ -3418,17 +3417,20 @@ fn flush(
         }
     }
     if (comp.bin_file) |lf| {
-        var timer = comp.startTimer();
-        defer if (timer.finish()) |ns| {
-            comp.mutex.lock();
-            defer comp.mutex.unlock();
-            comp.time_report.?.stats.real_ns_link_flush = ns;
-        };
-        // This is needed before reading the error flags.
-        lf.flush(arena, tid, comp.link_prog_node) catch |err| switch (err) {
-            error.LinkFailure => {}, // Already reported.
-            error.OutOfMemory => return error.OutOfMemory,
-        };
+        // Skip linker flush when --no-link is set (we already emitted the object directly)
+        if (!comp.no_link_obj) {
+            var timer = comp.startTimer();
+            defer if (timer.finish()) |ns| {
+                comp.mutex.lock();
+                defer comp.mutex.unlock();
+                comp.time_report.?.stats.real_ns_link_flush = ns;
+            };
+            // This is needed before reading the error flags.
+            lf.flush(arena, tid, comp.link_prog_node) catch |err| switch (err) {
+                error.LinkFailure => {}, // Already reported.
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+        }
     }
     if (comp.zcu) |zcu| {
         try link.File.C.flushEmitH(zcu);
