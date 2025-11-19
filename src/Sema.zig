@@ -17669,36 +17669,15 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ai
                     .struct_type => ip.loadStructType(ty.toIntern()),
                     else => unreachable,
                 };
-
-                // Count non-private fields first
-                var non_private_field_count: u32 = 0;
-                for (0..struct_type.field_types.len) |field_index| {
-                    const field_name = if (struct_type.fieldName(ip, field_index).unwrap()) |field_name|
-                        field_name
-                    else
-                        try ip.getOrPutStringFmt(gpa, pt.tid, "{d}", .{field_index}, .no_embedded_nulls);
-                    const field_name_slice = field_name.toSlice(ip);
-                    if (!fieldNameIsPrivate(field_name_slice)) {
-                        non_private_field_count += 1;
-                    }
-                }
-
-                struct_field_vals = try gpa.alloc(InternPool.Index, non_private_field_count);
+                struct_field_vals = try gpa.alloc(InternPool.Index, struct_type.field_types.len);
 
                 try ty.resolveStructFieldInits(pt);
 
-                var output_field_index: u32 = 0;
-                for (0..struct_type.field_types.len) |field_index| {
+                for (struct_field_vals, 0..) |*field_val, field_index| {
                     const field_name = if (struct_type.fieldName(ip, field_index).unwrap()) |field_name|
                         field_name
                     else
                         try ip.getOrPutStringFmt(gpa, pt.tid, "{d}", .{field_index}, .no_embedded_nulls);
-                    const field_name_slice = field_name.toSlice(ip);
-
-                    // Skip private fields (those starting with '#')
-                    if (fieldNameIsPrivate(field_name_slice)) continue;
-
-                    const field_val = &struct_field_vals[output_field_index];
                     const field_name_len = field_name.length(ip);
                     const field_ty: Type = .fromInterned(struct_type.field_types.get(ip)[field_index]);
                     const field_init = struct_type.fieldInit(ip, field_index);
