@@ -17730,8 +17730,6 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ai
                         (try pt.intValue(.comptime_int, alignment.toByteUnits() orelse 0)).toIntern(),
                     };
                     field_val.* = (try pt.aggregateValue(struct_field_ty, &struct_field_fields)).toIntern();
-
-                    output_field_index += 1;
                 }
             }
 
