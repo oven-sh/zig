@@ -21,6 +21,7 @@ jobs:
           - x86_64-windows-gnu
           - aarch64-macos-none
           - aarch64-linux-musl
+          - aarch64-windows-gnu
         safe: ["false", "true"]
     steps:
       - run: sudo apt-get install -y ninja-build
@@ -80,6 +81,8 @@ jobs:
           chmod +x bootstrap-aarch64-macos-none-ReleaseSafe/zig
           chmod +x bootstrap-aarch64-linux-musl/zig
           chmod +x bootstrap-aarch64-linux-musl-ReleaseSafe/zig
+          chmod +x bootstrap-aarch64-windows-gnu/zig.exe
+          chmod +x bootstrap-aarch64-windows-gnu-ReleaseSafe/zig.exe
       - name: Build ZLS
         run: |
           ./bootstrap-aarch64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos-none --prefix . --prefix-exe-dir ./bootstrap-x86_64-macos-none &
@@ -92,6 +95,8 @@ jobs:
           ./bootstrap-aarch64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos-none --prefix . --prefix-exe-dir ./bootstrap-aarch64-macos-none-ReleaseSafe &
           ./bootstrap-aarch64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl --prefix . --prefix-exe-dir ./bootstrap-aarch64-linux-musl &
           ./bootstrap-aarch64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl --prefix . --prefix-exe-dir ./bootstrap-aarch64-linux-musl-ReleaseSafe &
+          ./bootstrap-aarch64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows-gnu --prefix . --prefix-exe-dir ./bootstrap-aarch64-windows-gnu &
+          ./bootstrap-aarch64-linux-musl/zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows-gnu --prefix . --prefix-exe-dir ./bootstrap-aarch64-windows-gnu-ReleaseSafe &
           wait
       - name: Compress artifacts
         run: |
@@ -105,6 +110,8 @@ jobs:
           zip -r bootstrap-aarch64-macos-none-ReleaseSafe.zip bootstrap-aarch64-macos-none-ReleaseSafe &
           zip -r bootstrap-aarch64-linux-musl.zip bootstrap-aarch64-linux-musl &
           zip -r bootstrap-aarch64-linux-musl-ReleaseSafe.zip bootstrap-aarch64-linux-musl-ReleaseSafe &
+          zip -r bootstrap-aarch64-windows-gnu.zip bootstrap-aarch64-windows-gnu &
+          zip -r bootstrap-aarch64-windows-gnu-ReleaseSafe.zip bootstrap-aarch64-windows-gnu-ReleaseSafe &
           wait
       - name: Release
         uses: softprops/action-gh-release@v1
@@ -123,3 +130,5 @@ jobs:
             bootstrap-aarch64-macos-none-ReleaseSafe.zip
             bootstrap-aarch64-linux-musl.zip
             bootstrap-aarch64-linux-musl-ReleaseSafe.zip
+            bootstrap-aarch64-windows-gnu.zip
+            bootstrap-aarch64-windows-gnu-ReleaseSafe.zip
