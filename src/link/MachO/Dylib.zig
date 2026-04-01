@@ -733,6 +733,15 @@ pub const TargetMatcher = struct {
         const apple_string = try targetToAppleString(allocator, cpu_arch, platform);
         try self.target_strings.append(allocator, apple_string);
 
+        // Xcode 26.4 SDK dropped `arm64-*` from TBD targets, ships `arm64e-*` only.
+        if (cpu_arch == .aarch64) {
+            try self.target_strings.append(allocator, try std.fmt.allocPrint(
+                allocator,
+                "arm64e{s}",
+                .{apple_string["arm64".len..]},
+            ));
+        }
+
         switch (platform) {
             .IOSSIMULATOR, .TVOSSIMULATOR, .WATCHOSSIMULATOR, .VISIONOSSIMULATOR => {
                 // For Apple simulator targets, linking gets tricky as we need to link against the simulator
