@@ -38,6 +38,7 @@ const Alignment = InternPool.Alignment;
 const AnalUnit = InternPool.AnalUnit;
 const BuiltinFn = std.zig.BuiltinFn;
 const LlvmObject = @import("codegen/llvm.zig").Object;
+const LlvmPartitionSet = @import("codegen/llvm.zig").PartitionSet;
 const dev = @import("dev.zig");
 const Zoir = std.zig.Zoir;
 const ZonGen = std.zig.ZonGen;
@@ -57,9 +58,9 @@ comptime {
 /// General-purpose allocator. Used for both temporary and long-term storage.
 gpa: Allocator,
 comp: *Compilation,
-/// If the ZCU is emitting an LLVM object (i.e. we are using the LLVM backend), then this is the
-/// `LlvmObject` we are emitting to.
-llvm_object: ?LlvmObject.Ptr,
+/// If the ZCU is emitting via the LLVM backend, this is the set of partitioned LLVM `Object`
+/// builders we are emitting to. Phase 1: always a single-element set.
+llvm_object: ?LlvmPartitionSet.Ptr,
 
 /// Pointer to externally managed resource.
 root_mod: *Package.Module,
@@ -69,6 +70,24 @@ main_mod: *Package.Module,
 std_mod: *Package.Module,
 sema_prog_node: std.Progress.Node = .none,
 codegen_prog_node: std.Progress.Node = .none,
+/// Protects all non-InternPool Zcu maps that Sema reads/writes (failed_analysis,
+/// analysis_in_progress, exports, outdated, etc.) when analyze_func runs on
+/// worker threads. Recursive so an ensure* call can lock at entry, recurse into
+/// other ensure* calls (no-op re-lock), and unlock at exit; the only carve-out
+/// is the heavy AIR generation in `analyzeFnBody`, around which the owning
+/// worker explicitly fully releases via `semaRelease`/`semaReacquire`.
+sema_lock: std.Thread.Mutex = .{},
+sema_lock_owner: std.atomic.Value(std.Thread.Id) = .init(no_sema_owner),
+sema_lock_depth: u32 = 0,
+/// Signalled whenever a claim in `unit_claims` is released.
+sema_claim_cond: std.Thread.Condition = .{},
+/// AnalUnits currently being analysed by some worker; value is the owning tid.
+/// Guarded by `sema_lock`. A worker that finds an entry here for a unit it
+/// needs waits on `sema_claim_cond` until the entry is removed.
+unit_claims: std.AutoHashMapUnmanaged(AnalUnit, std.Thread.Id) = .empty,
+sema_pending_jobs: std.atomic.Value(u32) = .init(0),
+/// True while parallel Sema is enabled for this update.
+parallel_sema: bool = false,
 /// The number of codegen jobs which are pending or in-progress. Whichever thread drops this value
 /// to 0 is responsible for ending `codegen_prog_node`. While semantic analysis is happening, this
 /// value bottoms out at 1 instead of 0, to ensure that it can only drop to 0 after analysis is
@@ -1111,6 +1130,34 @@ pub const File = struct {
             '/', '\\' => try writer.writeByte('/'),
             else => try writer.writeByte(byte),
         };
+    }
+
+    /// Returns a stable key string used to assign this file to an LLVM codegen
+    /// shard. The key is the owning module's fully-qualified name plus the full
+    /// normalised sub_file_path, so identical source layouts hash identically
+    /// regardless of host path separator.
+    pub fn shardKey(file: File, buf: []u8) []const u8 {
+        const mod = file.mod orelse return buf[0..0];
+        const mod_name = mod.fully_qualified_name;
+        var w: usize = @min(mod_name.len, buf.len);
+        @memcpy(buf[0..w], mod_name[0..w]);
+        if (w < buf.len) {
+            buf[w] = '/';
+            w += 1;
+        }
+        for (file.sub_file_path) |c| {
+            if (w >= buf.len) break;
+            buf[w] = if (c == '\\') '/' else c;
+            w += 1;
+        }
+        return buf[0..w];
+    }
+
+    pub fn computeShard(file: File, n: u32) u8 {
+        if (n <= 1) return 0;
+        var buf: [512]u8 = undefined;
+        const key = file.shardKey(&buf);
+        return @intCast(std.hash.Wyhash.hash(0, key) % n);
     }
 
     pub fn internFullyQualifiedName(file: File, pt: Zcu.PerThread) !InternPool.NullTerminatedString {
@@ -2775,6 +2822,7 @@ pub fn deinit(zcu: *Zcu) void {
         for (zcu.failed_codegen.values()) |value| value.destroy(gpa);
         for (zcu.failed_types.values()) |value| value.destroy(gpa);
         zcu.analysis_in_progress.deinit(gpa);
+        zcu.unit_claims.deinit(gpa);
         zcu.failed_analysis.deinit(gpa);
         zcu.transitive_failed_analysis.deinit(gpa);
         zcu.failed_codegen.deinit(gpa);
@@ -3456,6 +3504,9 @@ pub fn ensureFuncBodyAnalysisQueued(zcu: *Zcu, func_index: InternPool.Index) !vo
 
     assert(func.ty == func.uncoerced_ty); // analyze the body of the original function, not a coerced one
 
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+
     if (zcu.func_body_analysis_queued.contains(func_index)) return;
 
     if (func.analysisUnordered(ip).is_analyzed) {
@@ -3474,6 +3525,9 @@ pub fn ensureFuncBodyAnalysisQueued(zcu: *Zcu, func_index: InternPool.Index) !vo
 
 pub fn ensureNavValAnalysisQueued(zcu: *Zcu, nav_id: InternPool.Nav.Index) !void {
     const ip = &zcu.intern_pool;
+
+    zcu.semaLock();
+    defer zcu.semaUnlock();
 
     if (zcu.nav_val_analysis_queued.contains(nav_id)) return;
 
@@ -3506,6 +3560,106 @@ pub const ImportResult = struct {
     /// could match the module of `cur_file`, since a module can depend on itself.
     module: ?*Package.Module,
 };
+
+pub const no_sema_owner: std.Thread.Id = std.math.maxInt(std.Thread.Id);
+
+/// Recursive acquire of `sema_lock` if parallel Sema is active. No-op otherwise.
+pub fn semaLock(zcu: *Zcu) void {
+    if (!zcu.parallel_sema) return;
+    const me = std.Thread.getCurrentId();
+    if (zcu.sema_lock_owner.load(.acquire) == me) {
+        zcu.sema_lock_depth += 1;
+        return;
+    }
+    zcu.sema_lock.lock();
+    zcu.sema_lock_owner.store(me, .release);
+    zcu.sema_lock_depth = 1;
+}
+pub fn semaUnlock(zcu: *Zcu) void {
+    if (!zcu.parallel_sema) return;
+    zcu.sema_lock_depth -= 1;
+    if (zcu.sema_lock_depth == 0) {
+        zcu.sema_lock_owner.store(no_sema_owner, .release);
+        zcu.sema_lock.unlock();
+    }
+}
+/// Fully release the recursive lock (returning the saved depth) so other
+/// workers can proceed during long unlocked sections. Returns 0 if not held.
+pub fn semaRelease(zcu: *Zcu) u32 {
+    if (!zcu.parallel_sema) return 0;
+    const me = std.Thread.getCurrentId();
+    if (zcu.sema_lock_owner.load(.acquire) != me) return 0;
+    const d = zcu.sema_lock_depth;
+    zcu.sema_lock_depth = 0;
+    zcu.sema_lock_owner.store(no_sema_owner, .release);
+    zcu.sema_lock.unlock();
+    return d;
+}
+pub fn semaReacquire(zcu: *Zcu, depth: u32) void {
+    if (!zcu.parallel_sema or depth == 0) return;
+    const me = std.Thread.getCurrentId();
+    zcu.sema_lock.lock();
+    zcu.sema_lock_owner.store(me, .release);
+    zcu.sema_lock_depth = depth;
+}
+
+/// Try to claim `unit` for analysis on behalf of `tid`. Returns:
+///  - `.claimed` if the caller now owns analysis of this unit and must call
+///    `releaseClaim` when done.
+///  - `.recursed` if this thread already owns it (dependency-loop detection
+///    handled by caller as before via `analysis_in_progress`).
+///  - `.done` if another thread finished analysing it while we waited; caller
+///    should re-read the unit's resolved status and return.
+/// Must be called with `sema_lock` HELD; may temporarily release it while waiting.
+pub fn claimOrWait(zcu: *Zcu, unit: AnalUnit) Allocator.Error!enum { claimed, recursed, done } {
+    if (!zcu.parallel_sema) return .claimed;
+    const me = std.Thread.getCurrentId();
+    while (true) {
+        const gop = try zcu.unit_claims.getOrPut(zcu.gpa, unit);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = me;
+            return .claimed;
+        }
+        if (gop.value_ptr.* == me) return .recursed;
+        // Another thread holds the claim; fully release and wait.
+        const d = zcu.sema_lock_depth;
+        zcu.sema_lock_depth = 0;
+        zcu.sema_lock_owner.store(no_sema_owner, .release);
+        zcu.sema_claim_cond.wait(&zcu.sema_lock);
+        zcu.sema_lock_owner.store(std.Thread.getCurrentId(), .release);
+        zcu.sema_lock_depth = d;
+        // After wake, check whether the unit is now resolved; if the claim is
+        // gone, another thread finished it.
+        if (!zcu.unit_claims.contains(unit)) return .done;
+    }
+}
+
+pub fn releaseClaim(zcu: *Zcu, unit: AnalUnit) void {
+    if (!zcu.parallel_sema) return;
+    _ = zcu.unit_claims.remove(unit);
+    zcu.sema_claim_cond.broadcast();
+}
+
+
+/// Locked check whether `unit` is currently being analysed by THIS thread,
+/// for dependency-loop detection from inside Sema.
+pub fn semaAipContains(zcu: *Zcu, unit: AnalUnit) bool {
+    if (!zcu.parallel_sema) return zcu.analysis_in_progress.contains(unit);
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+    return zcu.analysis_in_progress.contains(unit);
+}
+
+/// `analysis_in_progress` put that is skipped under parallel Sema (cycle
+/// detection is handled by `unit_claims` instead, which is per-tid).
+pub fn aipPut(zcu: *Zcu, gpa: Allocator, unit: AnalUnit) Allocator.Error!void {
+    if (zcu.parallel_sema) return;
+    try zcu.analysis_in_progress.putNoClobber(gpa, unit, {});
+}
+pub fn aipRemove(zcu: *Zcu, unit: AnalUnit) void {
+    if (zcu.parallel_sema) return;
+    assert(zcu.analysis_in_progress.swapRemove(unit));
+}
 
 /// Delete all the Export objects that are caused by this `AnalUnit`. Re-analysis of
 /// this `AnalUnit` will cause them to be re-created (or not).
@@ -4307,6 +4461,13 @@ pub fn navFileScope(zcu: *Zcu, nav: InternPool.Nav.Index) *File {
     return zcu.fileByIndex(zcu.navFileScopeIndex(nav));
 }
 
+pub fn navShard(zcu: *Zcu, nav: InternPool.Nav.Index, n: u32) u32 {
+    if (n <= 1) return 0;
+    const ip = &zcu.intern_pool;
+    const fqn = ip.getNav(nav).fqn.toSlice(ip);
+    return @intCast(std.hash.Wyhash.hash(0, fqn) % n);
+}
+
 pub fn fmtAnalUnit(zcu: *Zcu, unit: AnalUnit) std.fmt.Formatter(FormatAnalUnit, formatAnalUnit) {
     return .{ .data = .{ .unit = unit, .zcu = zcu } };
 }
@@ -4743,7 +4904,9 @@ const TrackedUnitSema = struct {
     old_name: ?[std.Progress.Node.max_name_len]u8,
     old_analysis_timer: ?Compilation.Timer,
     analysis_timer_decl: ?InternPool.TrackedInst.Index,
+    is_noop: bool = false,
     pub fn end(tus: TrackedUnitSema, zcu: *Zcu) void {
+        if (tus.is_noop) return;
         const comp = zcu.comp;
         if (tus.old_name) |old_name| {
             zcu.sema_prog_node.completeOne(); // we're just renaming, but it's effectively completion
@@ -4773,6 +4936,12 @@ const TrackedUnitSema = struct {
     }
 };
 pub fn trackUnitSema(zcu: *Zcu, name: []const u8, zir_inst: ?InternPool.TrackedInst.Index) TrackedUnitSema {
+    if (zcu.parallel_sema) return .{
+        .old_name = null,
+        .old_analysis_timer = null,
+        .analysis_timer_decl = zir_inst,
+        .is_noop = true,
+    };
     if (zcu.cur_analysis_timer) |*t| t.pause();
     const old_analysis_timer = zcu.cur_analysis_timer;
     zcu.cur_analysis_timer = zcu.comp.startTimer();

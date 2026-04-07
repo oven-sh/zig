@@ -1961,24 +1961,43 @@ pub const OptionalNullTerminatedString = enum(u32) {
 /// * comptime-known value (where we store the value)
 /// * `Nav` val (so that we can analyze the value lazily)
 /// * `Nav` ref (so that we can analyze the reference lazily)
+/// Re-encode a tid_shift_32 index (e.g. `Index`, `Nav.Index`) into 30 bits
+/// using `tid_shift_30`, so it fits inside `CaptureValue.idx`. Safe because
+/// per-tid local arrays stay well below 2^(30 - tid_width) entries.
+fn repack32To30(ip: *const InternPool, raw32: u32) u30 {
+    if (single_threaded) return @intCast(raw32);
+    const tid = raw32 >> ip.tid_shift_32 & ip.getTidMask();
+    const idx = raw32 & ip.getIndexMask(u32);
+    return @intCast(@shlExact(tid, ip.tid_shift_30) | idx);
+}
+fn repack30To32(ip: *const InternPool, raw30: u30) u32 {
+    if (single_threaded) return raw30;
+    const tid = raw30 >> ip.tid_shift_30 & ip.getTidMask();
+    const idx = raw30 & ((@as(u32, 1) << ip.tid_shift_30) - 1);
+    return @shlExact(tid, ip.tid_shift_32) | idx;
+}
+
 pub const CaptureValue = packed struct(u32) {
     tag: enum(u2) { @"comptime", runtime, nav_val, nav_ref },
     idx: u30,
 
-    pub fn wrap(val: Unwrapped) CaptureValue {
+    pub fn wrap(ip: *const InternPool, val: Unwrapped) CaptureValue {
         return switch (val) {
+            // `Index` is already encoded with `tid_shift_30`, so it fits u30 directly.
             .@"comptime" => |i| .{ .tag = .@"comptime", .idx = @intCast(@intFromEnum(i)) },
             .runtime => |i| .{ .tag = .runtime, .idx = @intCast(@intFromEnum(i)) },
-            .nav_val => |i| .{ .tag = .nav_val, .idx = @intCast(@intFromEnum(i)) },
-            .nav_ref => |i| .{ .tag = .nav_ref, .idx = @intCast(@intFromEnum(i)) },
+            // `Nav.Index` is encoded with `tid_shift_32`; repack so the tid bits
+            // land inside u30.
+            .nav_val => |i| .{ .tag = .nav_val, .idx = repack32To30(ip, @intFromEnum(i)) },
+            .nav_ref => |i| .{ .tag = .nav_ref, .idx = repack32To30(ip, @intFromEnum(i)) },
         };
     }
-    pub fn unwrap(val: CaptureValue) Unwrapped {
+    pub fn unwrap(val: CaptureValue, ip: *const InternPool) Unwrapped {
         return switch (val.tag) {
             .@"comptime" => .{ .@"comptime" = @enumFromInt(val.idx) },
             .runtime => .{ .runtime = @enumFromInt(val.idx) },
-            .nav_val => .{ .nav_val = @enumFromInt(val.idx) },
-            .nav_ref => .{ .nav_ref = @enumFromInt(val.idx) },
+            .nav_val => .{ .nav_val = @enumFromInt(repack30To32(ip, val.idx)) },
+            .nav_ref => .{ .nav_ref = @enumFromInt(repack30To32(ip, val.idx)) },
         };
     }
 
@@ -2298,8 +2317,14 @@ pub const Key = union(enum) {
         /// Used for mutating that data.
         analysis_extra_index: u32,
         /// Index into extra array of the `zir_body_inst` corresponding to this function.
-        /// Used for mutating that data.
+        /// Used for mutating that data. For generic instances this index refers
+        /// to the generic owner's extra array, so it may live on a different
+        /// thread's local than `tid`.
         zir_body_inst_extra_index: u32,
+        /// Thread whose extra array `zir_body_inst_extra_index` refers to.
+        /// Equals `tid` for `func_decl`; equals the generic owner's tid for
+        /// `func_instance`.
+        zir_body_inst_tid: Zcu.PerThread.Id,
         /// Index into extra array of the resolved inferred error set for this function.
         /// Used for mutating that data.
         /// 0 when the function does not have an inferred error set.
@@ -2370,7 +2395,7 @@ pub const Key = union(enum) {
 
         /// Returns a pointer that becomes invalid after any additions to the `InternPool`.
         fn zirBodyInstPtr(func: Func, ip: *const InternPool) *TrackedInst.Index {
-            const extra = ip.getLocalShared(func.tid).extra.acquire();
+            const extra = ip.getLocalShared(func.zir_body_inst_tid).extra.acquire();
             return @ptrCast(&extra.view().items(.@"0")[func.zir_body_inst_extra_index]);
         }
 
@@ -7534,6 +7559,7 @@ fn extraFuncDecl(tid: Zcu.PerThread.Id, extra: Local.Extra, extra_index: u32) Ke
         .uncoerced_ty = func_decl.data.ty,
         .analysis_extra_index = extra_index + std.meta.fieldIndex(P, "analysis").?,
         .zir_body_inst_extra_index = extra_index + std.meta.fieldIndex(P, "zir_body_inst").?,
+        .zir_body_inst_tid = tid,
         .resolved_error_set_extra_index = if (func_decl.data.analysis.inferred_error_set) func_decl.end else 0,
         .branch_quota_extra_index = 0,
         .owner_nav = func_decl.data.owner_nav,
@@ -7562,6 +7588,7 @@ fn extraFuncInstance(ip: *const InternPool, tid: Zcu.PerThread.Id, extra: Local.
         .uncoerced_ty = ty,
         .analysis_extra_index = analysis_extra_index,
         .zir_body_inst_extra_index = func_decl.zir_body_inst_extra_index,
+        .zir_body_inst_tid = func_decl.tid,
         .resolved_error_set_extra_index = if (analysis.inferred_error_set) end_extra_index else 0,
         .branch_quota_extra_index = extra_index + std.meta.fieldIndex(Tag.FuncInstance, "branch_quota").?,
         .owner_nav = owner_nav,
@@ -7843,6 +7870,7 @@ pub fn get(ip: *InternPool, gpa: Allocator, tid: Zcu.PerThread.Id, key: Key) All
                 new_key.ptr_type.flags.size = .many;
                 const ptr_type_index = try ip.get(gpa, tid, new_key);
                 gop = try ip.getOrPutKey(gpa, tid, key);
+                if (gop == .existing) return gop.existing;
 
                 try items.ensureUnusedCapacity(1);
                 items.appendAssumeCapacity(.{
@@ -8099,6 +8127,7 @@ pub fn get(ip: *InternPool, gpa: Allocator, tid: Zcu.PerThread.Id, key: Key) All
                         .storage = .{ .u64 = base_index.index },
                     } });
                     gop = try ip.getOrPutKey(gpa, tid, key);
+                    if (gop == .existing) return gop.existing;
                     try items.ensureUnusedCapacity(1);
                     items.appendAssumeCapacity(.{
                         .tag = switch (ptr.base_addr) {
@@ -8522,6 +8551,7 @@ pub fn get(ip: *InternPool, gpa: Allocator, tid: Zcu.PerThread.Id, key: Key) All
                             .storage = .{ .u64 = bytes.at(0, ip) },
                         } });
                         gop = try ip.getOrPutKey(gpa, tid, key);
+                        if (gop == .existing) return gop.existing;
                         try items.ensureUnusedCapacity(1);
                         break :elem elem;
                     },
@@ -11489,6 +11519,27 @@ pub fn getNav(ip: *const InternPool, index: Nav.Index) Nav {
     const unwrapped = index.unwrap(ip);
     const navs = ip.getLocalShared(unwrapped.tid).navs.acquire();
     return navs.view().get(unwrapped.index).unpack();
+}
+
+/// Total number of Navs across all per-thread locals. Intended for diagnostics.
+pub fn navCount(ip: *const InternPool) u32 {
+    var total: u32 = 0;
+    for (ip.locals) |*local| total += local.mutate.navs.len;
+    return total;
+}
+
+/// Construct a Nav.Index from a flat ordinal in [0, navCount()). Intended for
+/// diagnostics that need to enumerate every Nav; not stable across updates.
+pub fn navIndexFromOrdinal(ip: *const InternPool, ordinal: u32) Nav.Index {
+    var rem = ordinal;
+    for (ip.locals, 0..) |*local, tid| {
+        const len = local.mutate.navs.len;
+        if (rem < len) {
+            return @enumFromInt(@shlExact(@as(u32, @intCast(tid)), ip.tid_shift_32) | rem);
+        }
+        rem -= len;
+    }
+    unreachable;
 }
 
 pub fn namespacePtr(ip: *InternPool, namespace_index: NamespaceIndex) *Zcu.Namespace {

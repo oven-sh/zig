@@ -491,6 +491,129 @@ fn codeModel(model: std.builtin.CodeModel, target: *const std.Target) CodeModel 
     };
 }
 
+pub const PartitionSet = struct {
+    objects: []Object.Ptr,
+    mutexes: []std.Thread.Mutex,
+    n: u32,
+
+    pub const Ptr = if (dev.env.supports(.llvm_backend)) *PartitionSet else noreturn;
+
+    pub fn create(arena: Allocator, comp: *Compilation, n: u32) !Ptr {
+        dev.check(.llvm_backend);
+        const n_eff = @max(1, n);
+        const ps = try arena.create(PartitionSet);
+        const objects = try arena.alloc(Object.Ptr, n_eff);
+        const mutexes = try arena.alloc(std.Thread.Mutex, n_eff);
+        @memset(mutexes, .{});
+        ps.* = .{
+            .objects = objects,
+            .mutexes = mutexes,
+            .n = n_eff,
+        };
+        for (0..n_eff) |i| {
+            ps.objects[i] = try Object.create(arena, comp, @intCast(i));
+            ps.objects[i].partition_set = ps;
+        }
+        return ps;
+    }
+
+    pub fn deinit(self: *PartitionSet) void {
+        for (self.objects) |o| o.deinit();
+        self.* = undefined;
+    }
+
+    pub fn primary(self: *PartitionSet) Object.Ptr {
+        return self.objects[0];
+    }
+
+    pub fn updateFunc(
+        self: *PartitionSet,
+        pt: Zcu.PerThread,
+        func_index: InternPool.Index,
+        air: *const Air,
+        liveness: *const ?Air.Liveness,
+    ) !void {
+        const zcu = pt.zcu;
+        const owner_nav = zcu.funcInfo(func_index).owner_nav;
+        const shard = zcu.navShard(owner_nav, self.n);
+        self.mutexes[shard].lock();
+        defer self.mutexes[shard].unlock();
+        return self.objects[shard].updateFunc(pt, func_index, air, liveness);
+    }
+
+    pub fn updateNav(self: *PartitionSet, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) !void {
+        const shard = pt.zcu.navShard(nav_index, self.n);
+        self.mutexes[shard].lock();
+        defer self.mutexes[shard].unlock();
+        return self.objects[shard].updateNav(pt, nav_index);
+    }
+
+    pub fn updateExports(
+        self: *PartitionSet,
+        pt: Zcu.PerThread,
+        exported: Zcu.Exported,
+        export_indices: []const Zcu.Export.Index,
+    ) link.File.UpdateExportsError!void {
+        const shard: u32 = switch (exported) {
+            .nav => |nav| pt.zcu.navShard(nav, self.n),
+            .uav => 0,
+        };
+        self.mutexes[shard].lock();
+        defer self.mutexes[shard].unlock();
+        return self.objects[shard].updateExports(pt, exported, export_indices);
+    }
+
+    pub fn emit(self: *PartitionSet, pt: Zcu.PerThread, options: Object.EmitOptions) error{ LinkFailure, OutOfMemory }!void {
+        if (self.n == 1) return self.objects[0].emit(pt, options);
+        const list = options.bin_path_list orelse
+            return self.objects[0].emit(pt, options);
+        assert(list.len == self.n);
+
+        const comp = pt.zcu.comp;
+        // LLVM target registration mutates a global linked list; do it once
+        // here before fanning out so per-shard emit workers only read it.
+        if (build_options.have_llvm and comp.config.use_lib_llvm)
+            initializeLLVMTarget(comp.root_mod.resolved_target.result.cpu.arch);
+        var wg: std.Thread.WaitGroup = .{};
+        var err_flag: std.atomic.Value(u8) = .init(0); // 0=ok, 1=oom, 2=link
+        for (self.objects, 0..) |obj, i| {
+            var shard_opts = options;
+            shard_opts.bin_path = list[i];
+            shard_opts.bin_path_list = null;
+            shard_opts.asm_path = null;
+            if (i != 0) {
+                shard_opts.time_report = null;
+                shard_opts.pre_ir_path = null;
+                shard_opts.pre_bc_path = null;
+                shard_opts.post_ir_path = null;
+                shard_opts.post_bc_path = null;
+            }
+            comp.thread_pool.spawnWgId(&wg, emitShardWorker, .{ pt.zcu, obj, shard_opts, &err_flag });
+        }
+        comp.thread_pool.waitAndWork(&wg);
+        switch (err_flag.load(.monotonic)) {
+            0 => {},
+            1 => return error.OutOfMemory,
+            else => return error.LinkFailure,
+        }
+    }
+
+    fn emitShardWorker(
+        tid: usize,
+        zcu: *Zcu,
+        obj: Object.Ptr,
+        options: Object.EmitOptions,
+        err_flag: *std.atomic.Value(u8),
+    ) void {
+        const pt: Zcu.PerThread = .activate(zcu, @enumFromInt(tid));
+        defer pt.deactivate();
+        obj.emit(pt, options) catch |err| switch (err) {
+            error.OutOfMemory => _ = err_flag.cmpxchgStrong(0, 1, .monotonic, .monotonic),
+            error.LinkFailure => _ = err_flag.cmpxchgStrong(0, 2, .monotonic, .monotonic),
+        };
+    }
+};
+
 pub const Object = struct {
     gpa: Allocator,
     builder: Builder,
@@ -550,6 +673,9 @@ pub const Object = struct {
     /// Values for `@llvm.used`.
     used: std.ArrayListUnmanaged(Builder.Constant),
 
+    partition_id: u32 = 0,
+    partition_set: ?*PartitionSet = null,
+
     const ZigStructField = struct {
         struct_ty: InternPool.Index,
         field_index: u32,
@@ -559,7 +685,7 @@ pub const Object = struct {
 
     pub const TypeMap = std.AutoHashMapUnmanaged(InternPool.Index, Builder.Type);
 
-    pub fn create(arena: Allocator, comp: *Compilation) !Ptr {
+    pub fn create(arena: Allocator, comp: *Compilation, partition_id: u32) !Ptr {
         dev.check(.llvm_backend);
         const gpa = comp.gpa;
         const target = &comp.root_mod.resolved_target.result;
@@ -643,8 +769,41 @@ pub const Object = struct {
             .null_opt_usize = .no_init,
             .struct_field_map = .{},
             .used = .{},
+            .partition_id = partition_id,
+            .partition_set = null,
         };
         return obj;
+    }
+
+    pub fn isSharded(o: *const Object) bool {
+        const ps = o.partition_set orelse return false;
+        return ps.n > 1;
+    }
+
+    pub fn ownsNav(o: *const Object, zcu: *Zcu, nav: InternPool.Nav.Index) bool {
+        if (!o.isSharded()) return true;
+        return zcu.navShard(nav, o.partition_set.?.n) == o.partition_id;
+    }
+
+    /// Symbol name for an internal-linkage Nav. When sharded, the InternPool
+    /// Nav.Index is appended so distinct generic instantiations whose `fqn` is
+    /// identical (e.g. `const T = struct {...}` inside a generic function) get
+    /// distinct cross-shard symbol names that every shard agrees on; Sema is
+    /// single-threaded so the index is deterministic within one compilation.
+    fn shardedNavName(
+        o: *Object,
+        ip: *const InternPool,
+        fqn: InternPool.NullTerminatedString,
+        nav: InternPool.Nav.Index,
+    ) Allocator.Error!Builder.StrtabString {
+        const s = fqn.toSlice(ip);
+        if (!o.isSharded()) return o.builder.strtabString(s);
+        return o.builder.strtabStringFmt("{s}__N{d}", .{ s, @intFromEnum(nav) });
+    }
+
+    fn shardSuffixed(o: *Object, comptime fmt: []const u8, args: anytype) Allocator.Error!Builder.StrtabString {
+        if (!o.isSharded()) return o.builder.strtabStringFmt(fmt, args);
+        return o.builder.strtabStringFmt(fmt ++ "_s{d}", args ++ .{o.partition_id});
     }
 
     pub fn deinit(self: *Object) void {
@@ -665,8 +824,26 @@ pub const Object = struct {
     }
 
     fn genErrorNameTable(o: *Object, pt: Zcu.PerThread) Allocator.Error!void {
-        // If o.error_name_table is null, then it was not referenced by any instructions.
-        if (o.error_name_table == .none) return;
+        if (o.isSharded()) {
+            // Shard 0 owns the definition; other shards reference it as an
+            // external hidden declaration created by getErrorNameTable.
+            if (o.partition_id != 0) return;
+            if (o.error_name_table == .none) {
+                const variable_index =
+                    try o.builder.addVariable(try o.builder.strtabString("__zig_err_name_table"), .ptr, .default);
+                variable_index.setLinkage(.external, &o.builder);
+                variable_index.setVisibility(.hidden, &o.builder);
+                variable_index.setMutability(.constant, &o.builder);
+                variable_index.setAlignment(
+                    Type.slice_const_u8_sentinel_0.abiAlignment(pt.zcu).toLlvm(),
+                    &o.builder,
+                );
+                o.error_name_table = variable_index;
+            }
+        } else {
+            // If o.error_name_table is null, then it was not referenced by any instructions.
+            if (o.error_name_table == .none) return;
+        }
 
         const zcu = pt.zcu;
         const ip = &zcu.intern_pool;
@@ -716,6 +893,12 @@ pub const Object = struct {
     }
 
     fn genCmpLtErrorsLenFunction(o: *Object, pt: Zcu.PerThread) !void {
+        if (o.isSharded() and o.partition_id != 0) return;
+        if (o.isSharded()) {
+            // Shard 0 must define this even if it never referenced it locally,
+            // since other shards may declare it external hidden.
+            _ = try o.getCmpLtErrorsLenFunction(pt);
+        }
         // If there is no such function in the module, it means the source code does not need it.
         const name = o.builder.strtabStringIfExists(lt_errors_fn_name) orelse return;
         const llvm_fn = o.builder.getGlobal(name) orelse return;
@@ -741,6 +924,7 @@ pub const Object = struct {
     }
 
     fn genModuleLevelAssembly(object: *Object, pt: Zcu.PerThread) Allocator.Error!void {
+        if (object.isSharded() and object.partition_id != 0) return;
         const b = &object.builder;
         const gpa = b.gpa;
         b.module_asm.clearRetainingCapacity();
@@ -1482,7 +1666,7 @@ pub const Object = struct {
                     .sp_flags = .{
                         .Optimized = owner_mod.optimize_mode != .Debug,
                         .Definition = true,
-                        .LocalToUnit = is_internal_linkage,
+                        .LocalToUnit = is_internal_linkage and !o.isSharded(),
                     },
                 },
                 o.debug_compile_unit,
@@ -1501,7 +1685,7 @@ pub const Object = struct {
             // array of the appropriate size after the POI count is known.
 
             // Due to error "members of llvm.compiler.used must be named", this global needs a name.
-            const anon_name = try o.builder.strtabStringFmt("__sancov_gen_.{d}", .{o.used.items.len});
+            const anon_name = try o.shardSuffixed("__sancov_gen_.{d}", .{o.used.items.len});
             const counters_variable = try o.builder.addVariable(anon_name, .void, .default);
             try o.used.append(gpa, counters_variable.toConst(&o.builder));
             counters_variable.setLinkage(.private, &o.builder);
@@ -1577,7 +1761,7 @@ pub const Object = struct {
             const array_llvm_ty = try o.builder.arrayType(f.pcs.items.len, .ptr);
             const init_val = try o.builder.arrayConst(array_llvm_ty, f.pcs.items);
             // Due to error "members of llvm.compiler.used must be named", this global needs a name.
-            const anon_name = try o.builder.strtabStringFmt("__sancov_gen_.{d}", .{o.used.items.len});
+            const anon_name = try o.shardSuffixed("__sancov_gen_.{d}", .{o.used.items.len});
             const pcs_variable = try o.builder.addVariable(anon_name, array_llvm_ty, .default);
             try o.used.append(gpa, pcs_variable.toConst(&o.builder));
             pcs_variable.setLinkage(.private, &o.builder);
@@ -1619,8 +1803,12 @@ pub const Object = struct {
         const zcu = pt.zcu;
         const nav_index = switch (exported) {
             .nav => |nav| nav,
-            .uav => |uav| return updateExportedValue(self, pt, uav, export_indices),
+            .uav => |uav| {
+                if (self.isSharded() and self.partition_id != 0) return;
+                return updateExportedValue(self, pt, uav, export_indices);
+            },
         };
+        if (!self.ownsNav(zcu, nav_index)) return;
         const ip = &zcu.intern_pool;
         const global_index = self.nav_map.get(nav_index).?;
         const comp = zcu.comp;
@@ -1649,12 +1837,17 @@ pub const Object = struct {
         if (export_indices.len != 0) {
             return updateExportedGlobal(self, zcu, global_index, export_indices);
         } else {
-            const fqn = try self.builder.strtabString(ip.getNav(nav_index).fqn.toSlice(ip));
+            const fqn = try self.shardedNavName(ip, ip.getNav(nav_index).fqn, nav_index);
             try global_index.rename(fqn, &self.builder);
-            global_index.setLinkage(.internal, &self.builder);
+            if (self.isSharded()) {
+                global_index.setLinkage(.external, &self.builder);
+                global_index.setVisibility(.hidden, &self.builder);
+            } else {
+                global_index.setLinkage(.internal, &self.builder);
+                global_index.setUnnamedAddr(.unnamed_addr, &self.builder);
+            }
             if (comp.config.dll_export_fns)
                 global_index.setDllStorageClass(.default, &self.builder);
-            global_index.setUnnamedAddr(.unnamed_addr, &self.builder);
         }
     }
 
@@ -1691,6 +1884,36 @@ pub const Object = struct {
             try variable_index.setInitializer(init_val, &o.builder);
             break :i global_index;
         };
+        if (o.isSharded()) {
+            // Uavs are duplicated per shard so no other shard references this
+            // global by name; apply export linkage directly without an alias.
+            const first_export = export_indices[0].ptr(zcu);
+            global_index.setUnnamedAddr(.default, &o.builder);
+            global_index.setLinkage(switch (first_export.opts.linkage) {
+                .internal => unreachable,
+                .strong => .external,
+                .weak => .weak_odr,
+                .link_once => .linkonce_odr,
+            }, &o.builder);
+            global_index.setVisibility(.fromSymbolVisibility(first_export.opts.visibility), &o.builder);
+            if (zcu.comp.config.dll_export_fns)
+                global_index.setDllStorageClass(.dllexport, &o.builder);
+            for (export_indices[1..]) |export_idx| {
+                const exp = export_idx.ptr(zcu);
+                const exp_name = try o.builder.strtabString(exp.opts.name.toSlice(ip));
+                const alias_index = try o.builder.addAlias(.empty, global_index.typeOf(&o.builder), .default, global_index.toConst());
+                try alias_index.rename(exp_name, &o.builder);
+                const ag = alias_index.ptrConst(&o.builder).global;
+                ag.setLinkage(switch (exp.opts.linkage) {
+                    .internal => unreachable,
+                    .strong => .external,
+                    .weak => .weak_odr,
+                    .link_once => .linkonce_odr,
+                }, &o.builder);
+                ag.setVisibility(.fromSymbolVisibility(exp.opts.visibility), &o.builder);
+            }
+            return;
+        }
         return updateExportedGlobal(o, zcu, global_index, export_indices);
     }
 
@@ -1703,6 +1926,65 @@ pub const Object = struct {
         const comp = zcu.comp;
         const ip = &zcu.intern_pool;
         const first_export = export_indices[0].ptr(zcu);
+
+        if (o.isSharded()) {
+            // Other shards reference this definition by its fqn, so it must
+            // keep that name. Expose each export name as an alias instead.
+            global_index.setUnnamedAddr(.default, &o.builder);
+            if (first_export.opts.section.toSlice(ip)) |section|
+                switch (global_index.ptrConst(&o.builder).kind) {
+                    .variable => |impl_index| impl_index.setSection(
+                        try o.builder.string(section),
+                        &o.builder,
+                    ),
+                    .function, .alias, .replaced => {},
+                };
+            for (export_indices) |export_idx| {
+                const exp = export_idx.ptr(zcu);
+                const exp_name = try o.builder.strtabString(exp.opts.name.toSlice(ip));
+                if (o.builder.getGlobal(exp_name)) |existing| {
+                    switch (existing.ptrConst(&o.builder).kind) {
+                        .alias => |alias| {
+                            alias.setAliasee(global_index.toConst(), &o.builder);
+                            const ag = alias.ptrConst(&o.builder).global;
+                            ag.setLinkage(switch (exp.opts.linkage) {
+                                .internal => unreachable,
+                                .strong => .external,
+                                .weak => .weak_odr,
+                                .link_once => .linkonce_odr,
+                            }, &o.builder);
+                            ag.setVisibility(.fromSymbolVisibility(exp.opts.visibility), &o.builder);
+                            if (comp.config.dll_export_fns)
+                                ag.setDllStorageClass(.dllexport, &o.builder);
+                            continue;
+                        },
+                        .variable, .function => {
+                            try existing.rename(.empty, &o.builder);
+                            try existing.replace(global_index, &o.builder);
+                        },
+                        .replaced => unreachable,
+                    }
+                }
+                const alias_index = try o.builder.addAlias(
+                    .empty,
+                    global_index.typeOf(&o.builder),
+                    .default,
+                    global_index.toConst(),
+                );
+                try alias_index.rename(exp_name, &o.builder);
+                const ag = alias_index.ptrConst(&o.builder).global;
+                ag.setLinkage(switch (exp.opts.linkage) {
+                    .internal => unreachable,
+                    .strong => .external,
+                    .weak => .weak_odr,
+                    .link_once => .linkonce_odr,
+                }, &o.builder);
+                ag.setVisibility(.fromSymbolVisibility(exp.opts.visibility), &o.builder);
+                if (comp.config.dll_export_fns)
+                    ag.setDllStorageClass(.dllexport, &o.builder);
+            }
+            return;
+        }
 
         // We will rename this global to have a name matching `first_export`.
         // Successive exports become aliases.
@@ -2725,9 +3007,22 @@ pub const Object = struct {
             .{ true, @"extern".lib_name }
         else
             .{ false, .none };
+        const sym_name = if (is_extern)
+            try o.builder.strtabString(nav.name.toSlice(ip))
+        else
+            try o.shardedNavName(ip, nav.fqn, nav_index);
+        // Multiple Navs can map to the same extern symbol name (e.g. two
+        // `extern "c" fn powf` declarations); reuse the existing declaration
+        // so the second one isn't silently renamed to `name.2`.
+        if (is_extern) if (o.builder.getGlobal(sym_name)) |existing| {
+            if (existing.ptrConst(&o.builder).kind == .function) {
+                gop.value_ptr.* = existing;
+                return existing.ptrConst(&o.builder).kind.function;
+            }
+        };
         const function_index = try o.builder.addFunction(
             try o.lowerType(pt, ty),
-            try o.builder.strtabString((if (is_extern) nav.name else nav.fqn).toSlice(ip)),
+            sym_name,
             toLlvmAddressSpace(nav.getAddrspace(), target),
         );
         gop.value_ptr.* = function_index.ptrConst(&o.builder).global;
@@ -2736,7 +3031,12 @@ pub const Object = struct {
         defer attributes.deinit(&o.builder);
 
         if (!is_extern) {
-            function_index.setLinkage(.internal, &o.builder);
+            if (o.isSharded()) {
+                function_index.setLinkage(.external, &o.builder);
+                function_index.ptrConst(&o.builder).global.setVisibility(.hidden, &o.builder);
+            } else {
+                function_index.setLinkage(.internal, &o.builder);
+            }
             function_index.setUnnamedAddr(.unnamed_addr, &o.builder);
         } else {
             if (target.cpu.arch.isWasm()) {
@@ -3002,7 +3302,16 @@ pub const Object = struct {
         gop.value_ptr.* = variable_index.ptrConst(&o.builder).global;
 
         try variable_index.setInitializer(try o.lowerValue(pt, uav), &o.builder);
-        variable_index.setLinkage(.internal, &o.builder);
+        if (o.isSharded()) {
+            // Comptime constant pointer identity is observable across generic
+            // instantiations that may live in different shards; emit one
+            // canonical definition per `__anon_{ip_index}` and let the linker
+            // coalesce duplicates so every shard sees the same address.
+            variable_index.setLinkage(.linkonce_odr, &o.builder);
+            variable_index.setVisibility(.hidden, &o.builder);
+        } else {
+            variable_index.setLinkage(.internal, &o.builder);
+        }
         variable_index.setMutability(.constant, &o.builder);
         variable_index.setUnnamedAddr(.unnamed_addr, &o.builder);
         variable_index.setAlignment(alignment.toLlvm(), &o.builder);
@@ -3032,12 +3341,19 @@ pub const Object = struct {
             .type_resolved => |r| .{ .internal, .default, r.is_threadlocal, false },
         };
 
+        const sym_name = switch (linkage) {
+            .internal => try o.shardedNavName(ip, nav.fqn, nav_index),
+            .strong, .weak => try o.builder.strtabString(nav.name.toSlice(ip)),
+            .link_once => unreachable,
+        };
+        if (linkage != .internal) if (o.builder.getGlobal(sym_name)) |existing| {
+            if (existing.ptrConst(&o.builder).kind == .variable) {
+                gop.value_ptr.* = existing;
+                return existing.ptrConst(&o.builder).kind.variable;
+            }
+        };
         const variable_index = try o.builder.addVariable(
-            try o.builder.strtabString(switch (linkage) {
-                .internal => nav.fqn,
-                .strong, .weak => nav.name,
-                .link_once => unreachable,
-            }.toSlice(ip)),
+            sym_name,
             try o.lowerType(pt, Type.fromInterned(nav.typeOf(ip))),
             toLlvmGlobalAddressSpace(nav.getAddrspace(), zcu.getTarget()),
         );
@@ -3045,7 +3361,25 @@ pub const Object = struct {
 
         // This is needed for declarations created by `@extern`.
         switch (linkage) {
-            .internal => {
+            .internal => if (o.isSharded()) {
+                // Cross-shard internal navs are addressed by fqn, so the
+                // declaration must carry the attributes the owning shard's
+                // definition will have (linkage, visibility, TLS, alignment,
+                // mutability) and must not be unnamed_addr.
+                variable_index.setLinkage(.external, &o.builder);
+                variable_index.setVisibility(.hidden, &o.builder);
+                if (is_threadlocal and !zcu.navFileScope(nav_index).mod.?.single_threaded)
+                    variable_index.setThreadLocal(.generaldynamic, &o.builder);
+                const is_const = switch (nav.status) {
+                    .unresolved => unreachable,
+                    .type_resolved => |r| r.is_const,
+                    .fully_resolved => |r| r.is_const,
+                };
+                if (is_const) variable_index.setMutability(.constant, &o.builder);
+                if (nav.getAlignment() != .none)
+                    variable_index.setAlignment(nav.getAlignment().toLlvm(), &o.builder);
+                return variable_index;
+            } else {
                 variable_index.setLinkage(.internal, &o.builder);
                 variable_index.setUnnamedAddr(.unnamed_addr, &o.builder);
             },
@@ -4474,7 +4808,12 @@ pub const Object = struct {
         defer attributes.deinit(&o.builder);
         try o.addCommonFnAttributes(&attributes, zcu.root_mod, zcu.root_mod.omit_frame_pointer);
 
-        function_index.setLinkage(.internal, &o.builder);
+        if (o.isSharded()) {
+            function_index.setLinkage(.external, &o.builder);
+            function_index.ptrConst(&o.builder).global.setVisibility(.hidden, &o.builder);
+        } else {
+            function_index.setLinkage(.internal, &o.builder);
+        }
         function_index.setCallConv(.fastcc, &o.builder);
         function_index.setAttributes(try attributes.finish(&o.builder), &o.builder);
         return function_index;
@@ -4494,7 +4833,7 @@ pub const Object = struct {
         const target = &zcu.root_mod.resolved_target.result;
         const function_index = try o.builder.addFunction(
             try o.builder.fnType(ret_ty, &.{try o.lowerType(pt, Type.fromInterned(enum_type.tag_ty))}, .normal),
-            try o.builder.strtabStringFmt("__zig_tag_name_{f}", .{enum_type.name.fmt(ip)}),
+            try o.shardSuffixed("__zig_tag_name_{f}", .{enum_type.name.fmt(ip)}),
             toLlvmAddressSpace(.generic, target),
         );
 
@@ -4583,6 +4922,7 @@ pub const NavGen = struct {
         const nav_index = ng.nav_index;
         const nav = ip.getNav(nav_index);
         const resolved = nav.status.fully_resolved;
+        assert(o.ownsNav(zcu, nav_index));
 
         const lib_name, const linkage, const visibility: Builder.Visibility, const is_threadlocal, const is_dll_import, const is_const, const init_val, const owner_nav = switch (ip.indexToKey(resolved.val)) {
             .variable => |variable| .{ .none, .internal, .default, variable.is_threadlocal, false, false, variable.init, variable.owner_nav },
@@ -4603,7 +4943,8 @@ pub const NavGen = struct {
                 .none => .no_init,
                 else => try o.lowerValue(pt, init_val),
             }, &o.builder);
-            variable_index.setVisibility(visibility, &o.builder);
+            if (!(o.isSharded() and linkage == .internal))
+                variable_index.setVisibility(visibility, &o.builder);
 
             const file_scope = zcu.navFileScopeIndex(nav_index);
             const mod = zcu.fileByIndex(file_scope).mod.?;
@@ -4623,7 +4964,7 @@ pub const NavGen = struct {
                     line_number,
                     try o.lowerDebugType(pt, ty),
                     variable_index,
-                    .{ .local = linkage == .internal },
+                    .{ .local = linkage == .internal and !o.isSharded() },
                 );
 
                 const debug_expression = try o.builder.debugExpression(&.{});
@@ -5210,7 +5551,7 @@ pub const FuncGen = struct {
                         .Optimized = mod.optimize_mode != .Debug,
                         .Definition = true,
                         // TODO: we can't know this at this point, since the function could be exported later!
-                        .LocalToUnit = true,
+                        .LocalToUnit = !o.isSharded(),
                     },
                 },
                 o.debug_compile_unit,
@@ -6481,7 +6822,7 @@ pub const FuncGen = struct {
             const table_val = try o.builder.arrayConst(table_llvm_ty, table_elems);
 
             const table_variable = try o.builder.addVariable(
-                try o.builder.strtabStringFmt("__jmptab_{d}", .{@intFromEnum(inst)}),
+                try o.shardSuffixed("__jmptab_{d}", .{@intFromEnum(inst)}),
                 table_llvm_ty,
                 .default,
             );
@@ -10429,7 +10770,7 @@ pub const FuncGen = struct {
         const target = &zcu.root_mod.resolved_target.result;
         const function_index = try o.builder.addFunction(
             try o.builder.fnType(.i1, &.{try o.lowerType(pt, Type.fromInterned(enum_type.tag_ty))}, .normal),
-            try o.builder.strtabStringFmt("__zig_is_named_enum_value_{f}", .{enum_type.name.fmt(ip)}),
+            try o.shardSuffixed("__zig_is_named_enum_value_{f}", .{enum_type.name.fmt(ip)}),
             toLlvmAddressSpace(.generic, target),
         );
 
@@ -11287,9 +11628,14 @@ pub const FuncGen = struct {
         // TODO: Address space
         const variable_index =
             try o.builder.addVariable(try o.builder.strtabString("__zig_err_name_table"), .ptr, .default);
-        variable_index.setLinkage(.private, &o.builder);
+        if (o.isSharded()) {
+            variable_index.setLinkage(.external, &o.builder);
+            variable_index.setVisibility(.hidden, &o.builder);
+        } else {
+            variable_index.setLinkage(.private, &o.builder);
+            variable_index.setUnnamedAddr(.unnamed_addr, &o.builder);
+        }
         variable_index.setMutability(.constant, &o.builder);
-        variable_index.setUnnamedAddr(.unnamed_addr, &o.builder);
         variable_index.setAlignment(
             Type.slice_const_u8_sentinel_0.abiAlignment(pt.zcu).toLlvm(),
             &o.builder,

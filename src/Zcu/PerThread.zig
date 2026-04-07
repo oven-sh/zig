@@ -628,7 +628,19 @@ pub fn ensureMemoizedStateUpToDate(pt: Zcu.PerThread, stage: InternPool.Memoized
 
     log.debug("ensureMemoizedStateUpToDate", .{});
 
-    assert(!zcu.analysis_in_progress.contains(unit));
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+    switch (try zcu.claimOrWait(unit)) {
+        .claimed => {},
+        .recursed => return error.AnalysisFail,
+        .done => {
+            if (zcu.failed_analysis.contains(unit) or zcu.transitive_failed_analysis.contains(unit))
+                return error.AnalysisFail;
+            return;
+        },
+    }
+    defer zcu.releaseClaim(unit);
+    if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(unit));
 
     const was_outdated = zcu.outdated.swapRemove(unit) or zcu.potentially_outdated.swapRemove(unit);
     const prev_failed = zcu.failed_analysis.contains(unit) or zcu.transitive_failed_analysis.contains(unit);
@@ -700,8 +712,8 @@ fn analyzeMemoizedState(pt: Zcu.PerThread, stage: InternPool.MemoizedStateStage)
 
     const unit: AnalUnit = .wrap(.{ .memoized_state = stage });
 
-    try zcu.analysis_in_progress.putNoClobber(gpa, unit, {});
-    defer assert(zcu.analysis_in_progress.swapRemove(unit));
+    try zcu.aipPut(gpa, unit);
+    defer zcu.aipRemove(unit);
 
     // Before we begin, collect:
     // * The type `std`, and its namespace
@@ -776,7 +788,19 @@ pub fn ensureComptimeUnitUpToDate(pt: Zcu.PerThread, cu_id: InternPool.ComptimeU
 
     log.debug("ensureComptimeUnitUpToDate {f}", .{zcu.fmtAnalUnit(anal_unit)});
 
-    assert(!zcu.analysis_in_progress.contains(anal_unit));
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+    switch (try zcu.claimOrWait(anal_unit)) {
+        .claimed => {},
+        .recursed => return error.AnalysisFail,
+        .done => {
+            if (zcu.failed_analysis.contains(anal_unit) or zcu.transitive_failed_analysis.contains(anal_unit))
+                return error.AnalysisFail;
+            return;
+        },
+    }
+    defer zcu.releaseClaim(anal_unit);
+    if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(anal_unit));
 
     // Determine whether or not this `ComptimeUnit` is outdated. For this kind of `AnalUnit`, that's
     // the only indicator as to whether or not analysis is required; when a `ComptimeUnit` is first
@@ -864,8 +888,8 @@ fn analyzeComptimeUnit(pt: Zcu.PerThread, cu_id: InternPool.ComptimeUnit.Id) Zcu
     const file = zcu.fileByIndex(inst_resolved.file);
     const zir = file.zir.?;
 
-    try zcu.analysis_in_progress.putNoClobber(gpa, anal_unit, {});
-    defer assert(zcu.analysis_in_progress.swapRemove(anal_unit));
+    try zcu.aipPut(gpa, anal_unit);
+    defer zcu.aipRemove(anal_unit);
 
     var analysis_arena: std.heap.ArenaAllocator = .init(gpa);
     defer analysis_arena.deinit();
@@ -951,14 +975,28 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
     const gpa = zcu.gpa;
     const ip = &zcu.intern_pool;
 
-    _ = zcu.nav_val_analysis_queued.swapRemove(nav_id);
-
     const anal_unit: AnalUnit = .wrap(.{ .nav_val = nav_id });
     const nav = ip.getNav(nav_id);
 
     log.debug("ensureNavValUpToDate {f}", .{zcu.fmtAnalUnit(anal_unit)});
 
-    assert(!zcu.analysis_in_progress.contains(anal_unit));
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+
+    switch (try zcu.claimOrWait(anal_unit)) {
+        .claimed => {},
+        .recursed => return error.AnalysisFail,
+        .done => {
+            if (zcu.failed_analysis.contains(anal_unit) or zcu.transitive_failed_analysis.contains(anal_unit))
+                return error.AnalysisFail;
+            return;
+        },
+    }
+    defer zcu.releaseClaim(anal_unit);
+
+    _ = zcu.nav_val_analysis_queued.swapRemove(nav_id);
+
+    if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(anal_unit));
 
     // Determine whether or not this `Nav`'s value is outdated. This also includes checking if the
     // status is `.unresolved`, which indicates that the value is outdated because it has *never*
@@ -1094,14 +1132,16 @@ fn analyzeNavVal(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu.CompileErr
     const zir = file.zir.?;
     const zir_decl = zir.getDeclaration(inst_resolved.inst);
 
-    try zcu.analysis_in_progress.putNoClobber(gpa, anal_unit, {});
-    errdefer _ = zcu.analysis_in_progress.swapRemove(anal_unit);
+    try zcu.aipPut(gpa, anal_unit);
+    errdefer if (!zcu.parallel_sema) {
+        _ = zcu.analysis_in_progress.swapRemove(anal_unit);
+    };
 
     // If there's no type body, we are also resolving the type here.
     if (zir_decl.type_body == null) {
-        try zcu.analysis_in_progress.putNoClobber(gpa, .wrap(.{ .nav_ty = nav_id }), {});
+        try zcu.aipPut(gpa, .wrap(.{ .nav_ty = nav_id }));
     }
-    errdefer if (zir_decl.type_body == null) {
+    errdefer if (zir_decl.type_body == null and !zcu.parallel_sema) {
         _ = zcu.analysis_in_progress.swapRemove(.wrap(.{ .nav_ty = nav_id }));
     };
 
@@ -1313,9 +1353,9 @@ fn analyzeNavVal(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu.CompileErr
     });
 
     // Mark the unit as completed before evaluating the export!
-    assert(zcu.analysis_in_progress.swapRemove(anal_unit));
+    zcu.aipRemove(anal_unit);
     if (zir_decl.type_body == null) {
-        assert(zcu.analysis_in_progress.swapRemove(.wrap(.{ .nav_ty = nav_id })));
+        zcu.aipRemove(.wrap(.{ .nav_ty = nav_id }));
     }
 
     if (zir_decl.linkage == .@"export") {
@@ -1359,7 +1399,19 @@ pub fn ensureNavTypeUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zc
 
     log.debug("ensureNavTypeUpToDate {f}", .{zcu.fmtAnalUnit(anal_unit)});
 
-    assert(!zcu.analysis_in_progress.contains(anal_unit));
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+    switch (try zcu.claimOrWait(anal_unit)) {
+        .claimed => {},
+        .recursed => return error.AnalysisFail,
+        .done => {
+            if (zcu.failed_analysis.contains(anal_unit) or zcu.transitive_failed_analysis.contains(anal_unit))
+                return error.AnalysisFail;
+            return;
+        },
+    }
+    defer zcu.releaseClaim(anal_unit);
+    if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(anal_unit));
 
     const type_resolved_by_value: bool = from_val: {
         const analysis = nav.analysis orelse break :from_val false;
@@ -1477,8 +1529,8 @@ fn analyzeNavType(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu.CompileEr
     const file = zcu.fileByIndex(inst_resolved.file);
     const zir = file.zir.?;
 
-    try zcu.analysis_in_progress.putNoClobber(gpa, anal_unit, {});
-    defer assert(zcu.analysis_in_progress.swapRemove(anal_unit));
+    try zcu.aipPut(gpa, anal_unit);
+    defer zcu.aipRemove(anal_unit);
 
     const zir_decl = zir.getDeclaration(inst_resolved.inst);
     const type_body = zir_decl.type_body.?;
@@ -1595,17 +1647,31 @@ pub fn ensureFuncBodyUpToDate(pt: Zcu.PerThread, func_index: InternPool.Index) Z
     const gpa = zcu.gpa;
     const ip = &zcu.intern_pool;
 
-    _ = zcu.func_body_analysis_queued.swapRemove(func_index);
-
     const anal_unit: AnalUnit = .wrap(.{ .func = func_index });
 
     log.debug("ensureFuncBodyUpToDate {f}", .{zcu.fmtAnalUnit(anal_unit)});
 
-    assert(!zcu.analysis_in_progress.contains(anal_unit));
-
     const func = zcu.funcInfo(func_index);
 
     assert(func.ty == func.uncoerced_ty); // analyze the body of the original function, not a coerced one
+
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+
+    switch (try zcu.claimOrWait(anal_unit)) {
+        .claimed => {},
+        .recursed => return error.AnalysisFail,
+        .done => {
+            if (zcu.failed_analysis.contains(anal_unit) or zcu.transitive_failed_analysis.contains(anal_unit))
+                return error.AnalysisFail;
+            return;
+        },
+    }
+    defer zcu.releaseClaim(anal_unit);
+
+    _ = zcu.func_body_analysis_queued.swapRemove(func_index);
+
+    if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(anal_unit));
 
     const was_outdated = zcu.outdated.swapRemove(anal_unit) or
         zcu.potentially_outdated.swapRemove(anal_unit);
@@ -2564,6 +2630,9 @@ pub fn scanNamespace(
     const gpa = zcu.gpa;
     const namespace = zcu.namespacePtr(namespace_index);
 
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+
     const tracked_unit = zcu.trackUnitSema(
         Type.fromInterned(namespace.owner_type).containerTypeName(ip).toSlice(ip),
         null,
@@ -2797,8 +2866,10 @@ fn analyzeFnBodyInner(pt: Zcu.PerThread, func_index: InternPool.Index) Zcu.SemaE
     const file = zcu.fileByIndex(inst_info.file);
     const zir = file.zir.?;
 
-    try zcu.analysis_in_progress.putNoClobber(gpa, anal_unit, {});
-    errdefer _ = zcu.analysis_in_progress.swapRemove(anal_unit);
+    try zcu.aipPut(gpa, anal_unit);
+    errdefer if (!zcu.parallel_sema) {
+        _ = zcu.analysis_in_progress.swapRemove(anal_unit);
+    };
 
     func.setAnalyzed(ip);
     if (func.analysisUnordered(ip).inferred_error_set) {
@@ -2947,10 +3018,19 @@ fn analyzeFnBodyInner(pt: Zcu.PerThread, func_index: InternPool.Index) Zcu.SemaE
     sema.error_return_trace_index_on_fn_entry = error_return_trace_index;
     inner_block.error_return_trace_index = error_return_trace_index;
 
-    sema.analyzeFnBody(&inner_block, fn_info.body) catch |err| switch (err) {
-        error.ComptimeReturn => unreachable,
-        else => |e| return e,
-    };
+    {
+        // Carve-out disabled: releasing sema_lock here exposes the
+        // `WipNamespaceType` publish-before-`finish()` window (and similar
+        // create-then-set patterns in InternPool) to concurrent readers.
+        // Re-enable once those windows are closed (claim per wip type, or
+        // delay shard publish into `finish()`).
+        const saved_depth: u32 = 0;
+        defer zcu.semaReacquire(saved_depth);
+        sema.analyzeFnBody(&inner_block, fn_info.body) catch |err| switch (err) {
+            error.ComptimeReturn => unreachable,
+            else => |e| return e,
+        };
+    }
 
     for (sema.unresolved_inferred_allocs.keys()) |ptr_inst| {
         // The lack of a resolve_inferred_alloc means that this instruction
@@ -2998,7 +3078,7 @@ fn analyzeFnBodyInner(pt: Zcu.PerThread, func_index: InternPool.Index) Zcu.SemaE
         func.setResolvedErrorSet(ip, ies.resolved);
     }
 
-    assert(zcu.analysis_in_progress.swapRemove(anal_unit));
+    zcu.aipRemove(anal_unit);
 
     // Finally we must resolve the return type and parameter types so that backends
     // have full access to type information.
@@ -3878,6 +3958,9 @@ pub fn ensureTypeUpToDate(pt: Zcu.PerThread, ty: InternPool.Index) Zcu.SemaError
     const gpa = zcu.gpa;
     const ip = &zcu.intern_pool;
 
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+
     const anal_unit: AnalUnit = .wrap(.{ .type = ty });
     const outdated = zcu.outdated.swapRemove(anal_unit) or
         zcu.potentially_outdated.swapRemove(anal_unit);
@@ -4495,7 +4578,6 @@ fn runCodegenInner(pt: Zcu.PerThread, func_index: InternPool.Index, air: *Air) e
     // "emit" step because LLVM does not support incremental linking. Our linker (LLD or self-hosted)
     // will just see the ZCU object file which LLVM ultimately emits.
     if (zcu.llvm_object) |llvm_object| {
-        assert(pt.tid == .main); // LLVM has a lot of shared state
         try llvm_object.updateFunc(pt, func_index, air, &liveness);
         return error.BackendDoesNotProduceMir;
     }

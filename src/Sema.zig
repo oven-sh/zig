@@ -2649,6 +2649,8 @@ pub fn failWithOwnedErrorMsg(sema: *Sema, block: ?*Block, err_msg: *Zcu.ErrorMsg
 
     err_msg.reference_trace_root = sema.owner.toOptional();
 
+    zcu.semaLock();
+    defer zcu.semaUnlock();
     const gop = try zcu.failed_analysis.getOrPut(gpa, sema.owner);
     if (gop.found_existing) {
         // If there are multiple errors for the same Decl, prefer the first one added.
@@ -2881,7 +2883,7 @@ fn getCaptures(sema: *Sema, block: *Block, type_src: LazySrcLoc, extra_index: us
         const zir_name_slice = sema.code.nullTerminatedString(zir_name);
         capture.* = switch (zir_capture.unwrap()) {
             .nested => |parent_idx| parent_captures.get(ip)[parent_idx],
-            .instruction_load => |ptr_inst| InternPool.CaptureValue.wrap(capture: {
+            .instruction_load => |ptr_inst| InternPool.CaptureValue.wrap(ip, capture: {
                 const ptr_ref = try sema.resolveInst(ptr_inst.toRef());
                 const ptr_val = try sema.resolveValue(ptr_ref) orelse {
                     break :capture .{ .runtime = sema.typeOf(ptr_ref).childType(zcu).toIntern() };
@@ -2897,7 +2899,7 @@ fn getCaptures(sema: *Sema, block: *Block, type_src: LazySrcLoc, extra_index: us
                 }
                 break :capture .{ .@"comptime" = loaded_val.toIntern() };
             }),
-            .instruction => |inst| InternPool.CaptureValue.wrap(capture: {
+            .instruction => |inst| InternPool.CaptureValue.wrap(ip, capture: {
                 const air_ref = try sema.resolveInst(inst.toRef());
                 if (try sema.resolveValueResolveLazy(air_ref)) |val| {
                     if (val.canMutateComptimeVarState(zcu)) {
@@ -2916,7 +2918,7 @@ fn getCaptures(sema: *Sema, block: *Block, type_src: LazySrcLoc, extra_index: us
                     .no_embedded_nulls,
                 );
                 const nav = try sema.lookupIdentifier(block, decl_name);
-                break :capture InternPool.CaptureValue.wrap(.{ .nav_val = nav });
+                break :capture InternPool.CaptureValue.wrap(ip, .{ .nav_val = nav });
             },
             .decl_ref => |str| capture: {
                 const decl_name = try ip.getOrPutString(
@@ -2926,7 +2928,7 @@ fn getCaptures(sema: *Sema, block: *Block, type_src: LazySrcLoc, extra_index: us
                     .no_embedded_nulls,
                 );
                 const nav = try sema.lookupIdentifier(block, decl_name);
-                break :capture InternPool.CaptureValue.wrap(.{ .nav_ref = nav });
+                break :capture InternPool.CaptureValue.wrap(ip, .{ .nav_ref = nav });
             },
         };
     }
@@ -5532,6 +5534,8 @@ fn zirCompileLog(
 
     const line_data = try zcu.intern_pool.getOrPutString(gpa, pt.tid, aw.written(), .no_embedded_nulls);
 
+    zcu.semaLock();
+    defer zcu.semaUnlock();
     const line_idx: Zcu.CompileLogLine.Index = if (zcu.free_compile_log_lines.pop()) |idx| idx: {
         zcu.compile_log_lines.items[@intFromEnum(idx)] = .{
             .next = .none,
@@ -5752,6 +5756,8 @@ fn zirCImport(sema: *Sema, parent_block: *Block, inst: Zir.Inst.Index) CompileEr
             if (!comp.config.link_libc)
                 try sema.errNote(src, msg, "libc headers not available; compilation does not link against libc", .{});
 
+            zcu.semaLock();
+            defer zcu.semaUnlock();
             const gop = try zcu.cimport_errors.getOrPut(gpa, sema.owner);
             if (!gop.found_existing) {
                 gop.value_ptr.* = c_import_res.errors;
@@ -16842,7 +16848,7 @@ fn zirClosureGet(sema: *Sema, block: *Block, extended: Zir.Inst.Extended.InstDat
     const src_node: std.zig.Ast.Node.Offset = @enumFromInt(@as(i32, @bitCast(extended.operand)));
     const src = block.nodeOffset(src_node);
 
-    const capture_ty = switch (captures.get(ip)[extended.small].unwrap()) {
+    const capture_ty = switch (captures.get(ip)[extended.small].unwrap(ip)) {
         .@"comptime" => |index| return Air.internedToRef(index),
         .runtime => |index| index,
         .nav_val => |nav| return sema.analyzeNavVal(block, src, nav),
@@ -31219,6 +31225,8 @@ fn addReferenceEntry(
     if (!zcu.comp.incremental and zcu.comp.reference_trace == 0) return;
     const gop = try sema.references.getOrPut(sema.gpa, referenced_unit);
     if (gop.found_existing) return;
+    zcu.semaLock();
+    defer zcu.semaUnlock();
     try zcu.addUnitReference(sema.owner, referenced_unit, src, inline_frame: {
         const block = opt_block orelse break :inline_frame .none;
         const inlining = block.inlining orelse break :inline_frame .none;
@@ -31236,6 +31244,8 @@ pub fn addTypeReferenceEntry(
     if (!zcu.comp.incremental and zcu.comp.reference_trace == 0) return;
     const gop = try sema.type_references.getOrPut(sema.gpa, referenced_type);
     if (gop.found_existing) return;
+    zcu.semaLock();
+    defer zcu.semaUnlock();
     try zcu.addTypeReference(sema.owner, referenced_type, src);
 }
 
@@ -31246,7 +31256,7 @@ fn ensureMemoizedStateResolved(sema: *Sema, src: LazySrcLoc, stage: InternPool.M
     try sema.addReferenceEntry(null, src, unit);
     try sema.declareDependency(.{ .memoized_state = stage });
 
-    if (pt.zcu.analysis_in_progress.contains(unit)) {
+    if (pt.zcu.semaAipContains(unit)) {
         return sema.failWithOwnedErrorMsg(null, try sema.errMsg(src, "dependency loop detected", .{}));
     }
     try pt.ensureMemoizedStateUpToDate(stage);
@@ -31277,7 +31287,7 @@ pub fn ensureNavResolved(sema: *Sema, block: *Block, src: LazySrcLoc, nav_index:
     });
     try sema.addReferenceEntry(block, src, anal_unit);
 
-    if (zcu.analysis_in_progress.contains(anal_unit)) {
+    if (zcu.semaAipContains(anal_unit)) {
         return sema.failWithOwnedErrorMsg(null, try sema.errMsg(.{
             .base_node_inst = nav.analysis.?.zir_index,
             .offset = LazySrcLoc.Offset.nodeOffset(.zero),
@@ -35011,7 +35021,7 @@ fn resolveInferredErrorSet(
     const resolved_ty = func.resolvedErrorSetUnordered(ip);
     if (resolved_ty != .none) return resolved_ty;
 
-    if (zcu.analysis_in_progress.contains(.wrap(.{ .func = func_index }))) {
+    if (zcu.semaAipContains(.wrap(.{ .func = func_index }))) {
         return sema.fail(block, src, "unable to resolve inferred error set", .{});
     }
 
@@ -37209,6 +37219,9 @@ pub fn flushExports(sema: *Sema) !void {
     const zcu = sema.pt.zcu;
     const gpa = zcu.gpa;
 
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+
     // There may be existing exports. For instance, a struct may export
     // things during both field type resolution and field default resolution.
     //
@@ -37324,6 +37337,8 @@ pub fn resolveDeclaredEnum(
         error.ComptimeReturn => unreachable,
         error.OutOfMemory => |e| return e,
         error.AnalysisFail => {
+            zcu.semaLock();
+            defer zcu.semaUnlock();
             if (!zcu.failed_analysis.contains(sema.owner)) {
                 try zcu.transitive_failed_analysis.put(gpa, sema.owner, {});
             }

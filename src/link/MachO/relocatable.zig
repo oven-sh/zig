@@ -1,4 +1,4 @@
-pub fn flushObject(macho_file: *MachO, comp: *Compilation, module_obj_path: ?Path) link.File.FlushError!void {
+pub fn flushObject(macho_file: *MachO, arena: Allocator, comp: *Compilation, module_obj_path: ?Path) link.File.FlushError!void {
     const gpa = macho_file.base.comp.gpa;
     const diags = &macho_file.base.comp.link_diags;
 
@@ -12,7 +12,7 @@ pub fn flushObject(macho_file: *MachO, comp: *Compilation, module_obj_path: ?Pat
         try positionals.append(try link.openObjectInput(diags, key.status.success.object_path));
     }
 
-    if (module_obj_path) |path| try positionals.append(try link.openObjectInput(diags, path));
+    try macho_file.appendZcuObjectInputs(arena, &positionals, module_obj_path);
 
     if (macho_file.getZigObject() == null and positionals.items.len == 1) {
         // Instead of invoking a full-blown `-r` mode on the input which sadly will strip all
@@ -77,7 +77,7 @@ pub fn flushObject(macho_file: *MachO, comp: *Compilation, module_obj_path: ?Pat
     try writeHeader(macho_file, ncmds, sizeofcmds);
 }
 
-pub fn flushStaticLib(macho_file: *MachO, comp: *Compilation, module_obj_path: ?Path) link.File.FlushError!void {
+pub fn flushStaticLib(macho_file: *MachO, arena: Allocator, comp: *Compilation, module_obj_path: ?Path) link.File.FlushError!void {
     const gpa = comp.gpa;
     const diags = &macho_file.base.comp.link_diags;
 
@@ -91,7 +91,7 @@ pub fn flushStaticLib(macho_file: *MachO, comp: *Compilation, module_obj_path: ?
         try positionals.append(try link.openObjectInput(diags, key.status.success.object_path));
     }
 
-    if (module_obj_path) |path| try positionals.append(try link.openObjectInput(diags, path));
+    try macho_file.appendZcuObjectInputs(arena, &positionals, module_obj_path);
 
     if (comp.compiler_rt_strat == .obj) {
         try positionals.append(try link.openObjectInput(diags, comp.compiler_rt_obj.?.full_object_path));
@@ -776,6 +776,7 @@ fn writeHeader(macho_file: *MachO, ncmds: usize, sizeofcmds: usize) !void {
 }
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const Path = std.Build.Cache.Path;
 const WaitGroup = std.Thread.WaitGroup;
 const assert = std.debug.assert;

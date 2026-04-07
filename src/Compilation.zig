@@ -43,6 +43,7 @@ const Zir = std.zig.Zir;
 const Air = @import("Air.zig");
 const Builtin = @import("Builtin.zig");
 const LlvmObject = @import("codegen/llvm.zig").Object;
+const LlvmPartitionSet = @import("codegen/llvm.zig").PartitionSet;
 const dev = @import("dev.zig");
 
 const DeprecatedLinearFifo = @import("deprecated.zig").LinearFifo;
@@ -125,6 +126,8 @@ work_queues: [
         break :len len;
     }
 ]DeprecatedLinearFifo(Job),
+/// Protects `work_queues` when Sema runs on worker threads and calls `queueJob`.
+work_queue_mutex: std.Thread.Mutex = .{},
 
 /// These jobs are to invoke the Clang compiler to create an object file, which
 /// gets linked with the Compilation.
@@ -265,6 +268,7 @@ link_prog_node: std.Progress.Node = std.Progress.Node.none,
 
 llvm_opt_bisect_limit: c_int,
 llvm_codegen_threads: u32,
+llvm_shard_stats: bool,
 no_link_obj: bool,
 
 time_report: ?TimeReport,
@@ -1729,6 +1733,7 @@ pub const CreateOptions = struct {
     linker_print_map: bool = false,
     llvm_opt_bisect_limit: i32 = -1,
     llvm_codegen_threads: u32 = 0,
+    llvm_shard_stats: bool = false,
     no_link_obj: bool = false,
     build_id: ?std.zig.BuildId = null,
     disable_c_depfile: bool = false,
@@ -2298,7 +2303,10 @@ pub fn create(gpa: Allocator, arena: Allocator, diag: *CreateDiagnostic, options
             .framework_dirs = options.framework_dirs,
             .llvm_opt_bisect_limit = options.llvm_opt_bisect_limit,
             .llvm_codegen_threads = options.llvm_codegen_threads,
-            .no_link_obj = options.no_link_obj,
+            .llvm_shard_stats = options.llvm_shard_stats,
+            // Partitioned LLVM output produces N objects which must be merged by
+            // the linker, so the no-link shortcut cannot apply in that case.
+            .no_link_obj = options.no_link_obj and options.llvm_codegen_threads <= 1,
             .skip_linker_dependencies = options.skip_linker_dependencies,
             .queued_jobs = .{},
             .function_sections = options.function_sections,
@@ -2506,7 +2514,8 @@ pub fn create(gpa: Allocator, arena: Allocator, diag: *CreateDiagnostic, options
 
         if (use_llvm) {
             if (opt_zcu) |zcu| {
-                zcu.llvm_object = try LlvmObject.create(arena, comp);
+                const n_shards: u32 = if (options.llvm_codegen_threads <= 1) 1 else options.llvm_codegen_threads;
+                zcu.llvm_object = try LlvmPartitionSet.create(arena, comp, n_shards);
             }
         }
 
@@ -3132,6 +3141,10 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
             try pt.processExports();
         }
 
+        if (comp.llvm_shard_stats or std.process.hasNonEmptyEnvVarConstant("ZIG_JOB_STATS")) {
+            comp.dumpLlvmShardStats(zcu);
+        }
+
         if (build_options.enable_debug_extensions and comp.verbose_intern_pool) {
             std.debug.print("intern pool stats for '{s}':\n", .{
                 comp.root_name,
@@ -3267,6 +3280,65 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
     }
 }
 
+fn dumpLlvmShardStats(comp: *Compilation, zcu: *Zcu) void {
+    const ip = &zcu.intern_pool;
+    const n: u32 = if (comp.llvm_codegen_threads > 1) comp.llvm_codegen_threads else 16;
+    var counts = [_]u32{0} ** 256;
+    var top_file = [_]?*Zcu.File{null} ** 256;
+    var top_file_count = [_]u32{0} ** 256;
+
+    var per_file = std.AutoHashMap(*Zcu.File, u32).init(comp.gpa);
+    defer per_file.deinit();
+
+    const total_navs = ip.navCount();
+    var skipped: u32 = 0;
+    var i: u32 = 0;
+    while (i < total_navs) : (i += 1) {
+        const nav_index = ip.navIndexFromOrdinal(i);
+        const nav = ip.getNav(nav_index);
+        if (nav.status == .unresolved) {
+            skipped += 1;
+            continue;
+        }
+        const fqn = nav.fqn.toSlice(ip);
+        const shard: u8 = @intCast(std.hash.Wyhash.hash(0, fqn) % n);
+        counts[shard] += 1;
+        const file = zcu.fileByIndex(nav.srcInst(ip).resolveFile(ip));
+        const gop = per_file.getOrPut(file) catch continue;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+        if (gop.value_ptr.* > top_file_count[shard]) {
+            top_file_count[shard] = gop.value_ptr.*;
+            top_file[shard] = file;
+        }
+    }
+
+    var min: u32 = std.math.maxInt(u32);
+    var max: u32 = 0;
+    var nonempty: u32 = 0;
+    for (counts[0..n]) |c| {
+        if (c == 0) continue;
+        nonempty += 1;
+        min = @min(min, c);
+        max = @max(max, c);
+    }
+    std.debug.print("llvm-shard-stats for '{s}': n={d} navs={d} skipped={d} nonempty_shards={d}\n", .{
+        comp.root_name, n, total_navs - skipped, skipped, nonempty,
+    });
+    for (counts[0..n], 0..) |c, s| {
+        if (c == 0) continue;
+        var buf: [512]u8 = undefined;
+        const key = if (top_file[s]) |f| f.shardKey(&buf) else "";
+        std.debug.print("  shard {d:>3}: {d:>6} navs  (top file '{s}' = {d})\n", .{
+            s, c, key, top_file_count[s],
+        });
+    }
+    if (min != std.math.maxInt(u32)) {
+        const ratio = @as(f64, @floatFromInt(max)) / @as(f64, @floatFromInt(min));
+        std.debug.print("  max/min ratio: {d:.2} (max={d}, min={d})\n", .{ ratio, max, min });
+    }
+}
+
 pub fn appendFileSystemInput(comp: *Compilation, path: Compilation.Path) Allocator.Error!void {
     const gpa = comp.gpa;
     const fsi = comp.file_system_inputs orelse return;
@@ -3364,8 +3436,8 @@ fn flush(
             };
 
             // Generate parallel codegen output filenames if enabled
-            const bin_path_list: ?[]const [*:0]const u8 = if (comp.llvm_codegen_threads > 1 and base_bin_path != null) blk: {
-                const num_threads = comp.llvm_codegen_threads;
+            const bin_path_list: ?[]const [*:0]const u8 = if (llvm_object.n > 1 and base_bin_path != null) blk: {
+                const num_threads = llvm_object.n;
                 const list = try arena.alloc([*:0]const u8, num_threads);
                 const base_path_slice = std.mem.sliceTo(base_bin_path.?, 0);
 
@@ -5060,12 +5132,38 @@ fn performAllTheWork(
         decl_work_timer = comp.startTimer();
     }
 
+    if (comp.zcu) |zcu| {
+        zcu.parallel_sema = std.process.hasNonEmptyEnvVarConstant("ZIG_PARALLEL_SEMA");
+    }
+
+    var job_ns: [@typeInfo(Job.Tag).@"enum".fields.len]u64 = @splat(0);
+    var job_ct: [@typeInfo(Job.Tag).@"enum".fields.len]u64 = @splat(0);
     work: while (true) {
-        for (&comp.work_queues) |*work_queue| if (work_queue.readItem()) |job| {
-            try processOneJob(@intFromEnum(Zcu.PerThread.Id.main), comp, job);
-            continue :work;
+        const maybe_job: ?Job = job: {
+            comp.work_queue_mutex.lock();
+            defer comp.work_queue_mutex.unlock();
+            for (&comp.work_queues) |*work_queue| if (work_queue.readItem()) |job| break :job job;
+            break :job null;
         };
+        if (maybe_job) |job| {
+            if (comp.zcu) |zcu| if (zcu.parallel_sema and job == .analyze_func) {
+                _ = zcu.sema_pending_jobs.rmw(.Add, 1, .acquire);
+                comp.thread_pool.spawnWgId(&comp.link_task_wait_group, workerAnalyzeFunc, .{ comp, job.analyze_func });
+                continue :work;
+            };
+            const t0 = if (comp.llvm_shard_stats or std.process.hasNonEmptyEnvVarConstant("ZIG_JOB_STATS")) std.time.nanoTimestamp() else 0;
+            try processOneJob(@intFromEnum(Zcu.PerThread.Id.main), comp, job);
+            if (comp.llvm_shard_stats or std.process.hasNonEmptyEnvVarConstant("ZIG_JOB_STATS")) {
+                job_ns[@intFromEnum(@as(Job.Tag, job))] += @intCast(std.time.nanoTimestamp() - t0);
+                job_ct[@intFromEnum(@as(Job.Tag, job))] += 1;
+            }
+            continue :work;
+        }
         if (comp.zcu) |zcu| {
+            if (zcu.sema_pending_jobs.load(.acquire) > 0) {
+                std.Thread.yield() catch {};
+                continue :work;
+            }
             // If there's no work queued, check if there's anything outdated
             // which we need to work on, and queue it if so.
             if (try zcu.findOutdatedToAnalyze()) |outdated| {
@@ -5085,11 +5183,21 @@ fn performAllTheWork(
         }
         break;
     }
+    if (comp.zcu) |zcu| zcu.parallel_sema = false;
+    if (comp.llvm_shard_stats or std.process.hasNonEmptyEnvVarConstant("ZIG_JOB_STATS")) {
+        std.debug.print("=== work loop job timings (main thread) ===\n", .{});
+        inline for (@typeInfo(Job.Tag).@"enum".fields, 0..) |f, i| {
+            if (job_ct[i] != 0)
+                std.debug.print("  {s:>24}: {d:>6}ms ({d} jobs)\n", .{ f.name, job_ns[i] / 1_000_000, job_ct[i] });
+        }
+    }
 }
 
 const JobError = Allocator.Error;
 
 pub fn queueJob(comp: *Compilation, job: Job) !void {
+    comp.work_queue_mutex.lock();
+    defer comp.work_queue_mutex.unlock();
     try comp.work_queues[Job.stage(job)].writeItem(job);
 }
 
@@ -5885,6 +5993,17 @@ pub const RtOptions = struct {
     checks_valgrind: bool = false,
     allow_lto: bool = true,
 };
+
+fn workerAnalyzeFunc(tid: usize, comp: *Compilation, func: InternPool.Index) void {
+    const zcu = comp.zcu.?;
+    const pt: Zcu.PerThread = .activate(zcu, @enumFromInt(tid));
+    defer pt.deactivate();
+    pt.ensureFuncBodyUpToDate(func) catch |err| switch (err) {
+        error.OutOfMemory => comp.setAllocFailure(),
+        error.AnalysisFail => {},
+    };
+    _ = zcu.sema_pending_jobs.rmw(.Sub, 1, .release);
+}
 
 fn workerZcuCodegen(
     tid: usize,

@@ -3788,6 +3788,9 @@ fn resolveStructInner(
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+
     const struct_obj = zcu.typeToStruct(ty).?;
     const owner: InternPool.AnalUnit = .wrap(.{ .type = ty.toIntern() });
 
@@ -3846,6 +3849,9 @@ fn resolveUnionInner(
 ) SemaError!void {
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
+
+    zcu.semaLock();
+    defer zcu.semaUnlock();
 
     const union_obj = zcu.typeToUnion(ty).?;
     const owner: InternPool.AnalUnit = .wrap(.{ .type = ty.toIntern() });
