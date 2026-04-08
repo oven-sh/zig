@@ -11642,7 +11642,16 @@ pub fn dumpGenericInstancesFallible(ip: *const InternPool, allocator: Allocator)
 pub fn getNav(ip: *const InternPool, index: Nav.Index) Nav {
     const unwrapped = index.unwrap(ip);
     const navs = ip.getLocalShared(unwrapped.tid).navs.acquire();
-    return navs.view().get(unwrapped.index).unpack();
+    const view = navs.view();
+    var repr = view.get(unwrapped.index);
+    // `resolveNavType`/`resolveNavValue` release-store `bits` last, after
+    // `type_or_val` etc. Re-load `bits` with acquire then re-load the
+    // status-dependent fields so a concurrent reader cannot observe a new
+    // status with a stale `type_or_val`.
+    repr.bits = @atomicLoad(Nav.Repr.Bits, &view.items(.bits)[unwrapped.index], .acquire);
+    repr.type_or_val = @atomicLoad(InternPool.Index, &view.items(.type_or_val)[unwrapped.index], .unordered);
+    repr.@"linksection" = @atomicLoad(OptionalNullTerminatedString, &view.items(.@"linksection")[unwrapped.index], .unordered);
+    return repr.unpack();
 }
 
 /// Total number of Navs across all per-thread locals. Intended for diagnostics.
