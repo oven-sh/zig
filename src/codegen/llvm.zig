@@ -1816,7 +1816,7 @@ pub const Object = struct {
             // export aliases have a definition to point at.
             self.updateNav(pt, nav_index) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.CodegenFail => return error.AnalysisFail,
+                else => return error.AnalysisFail,
             };
             break :gi self.nav_map.get(nav_index).?;
         };
