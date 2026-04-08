@@ -3152,6 +3152,7 @@ pub fn enumFieldIndex(ty: Type, field_name: InternPool.NullTerminatedString, zcu
 /// declaration order, or `null` if `enum_tag` does not match any field.
 pub fn enumTagFieldIndex(ty: Type, enum_tag: Value, zcu: *const Zcu) ?u32 {
     const ip = &zcu.intern_pool;
+    Zcu.awaitNamespaceTypeFinishedConst(zcu, ty.toIntern());
     const enum_type = ip.loadEnumType(ty.toIntern());
     const int_tag = switch (ip.indexToKey(enum_tag.toIntern())) {
         .int => enum_tag.toIntern(),
