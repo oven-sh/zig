@@ -35463,6 +35463,13 @@ fn structFields(
     // Next we do only types and alignments, saving the inits for a second pass,
     // so that init values may depend on type layout.
 
+    // Collect into arena temps and batch-publish under one `extra.mutex` hold
+    // at the end so each field doesn't take the per-tid mutex separately.
+    const tmp_types = try sema.arena.alloc(InternPool.Index, fields.len);
+    @memset(tmp_types, .none);
+    const tmp_aligns = try sema.arena.alloc(InternPool.Alignment, fields.len);
+    @memset(tmp_aligns, .none);
+
     for (fields, 0..) |zir_field, field_i| {
         const ty_src: LazySrcLoc = .{
             .base_node_inst = struct_type.zir_index,
@@ -35479,7 +35486,7 @@ fn structFields(
             break :ty try sema.analyzeAsType(&block_scope, ty_src, ty_ref);
         };
 
-        struct_type.setFieldType(ip, field_i, field_ty.toIntern());
+        tmp_types[field_i] = field_ty.toIntern();
 
         if (field_ty.zigTypeTag(zcu) == .@"opaque") {
             const msg = msg: {
@@ -35538,11 +35545,13 @@ fn structFields(
                 .offset = .{ .container_field_align = @intCast(field_i) },
             };
             const field_align = try sema.analyzeAsAlign(&block_scope, align_src, align_ref);
-            struct_type.setFieldAlign(ip, field_i, field_align);
+            tmp_aligns[field_i] = field_align;
         }
 
         extra_index += zir_field.init_body_len;
     }
+
+    struct_type.setFieldTypesAlignsAll(ip, tmp_types, if (any_aligned) tmp_aligns else null);
 
     // Re-store the last field type with release so the unlocked
     // `haveFieldTypes` fast-path acquire sees all preceding name/type
@@ -35635,6 +35644,8 @@ fn structFieldInits(
     }
 
     if (any_inits) {
+        const tmp_inits = try sema.arena.alloc(InternPool.Index, fields.len);
+        @memset(tmp_inits, .none);
         for (fields, 0..) |zir_field, field_i| {
             extra_index += zir_field.type_body_len;
             extra_index += zir_field.align_body_len;
@@ -35669,8 +35680,9 @@ fn structFieldInits(
                 const field_name = struct_type.fieldName(ip, field_i).unwrap().?;
                 return sema.failWithContainsReferenceToComptimeVar(&block_scope, init_src, field_name, "field default value", default_val);
             }
-            struct_type.setFieldInit(ip, field_i, default_val.toIntern());
+            tmp_inits[field_i] = default_val.toIntern();
         }
+        struct_type.setFieldInitsAll(ip, tmp_inits);
     }
 
     try sema.flushExports();

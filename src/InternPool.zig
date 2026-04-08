@@ -3851,6 +3851,29 @@ pub const LoadedStructType = struct {
         @memcpy(s.field_inits.get(ip), inits);
     }
 
+    pub fn setFieldAlignsAll(s: LoadedStructType, ip: *InternPool, aligns: []const Alignment) void {
+        if (s.field_aligns.len == 0) return;
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        @memcpy(s.field_aligns.get(ip), aligns);
+    }
+
+    /// Publish field types and (optionally) aligns under one `extra.mutex`
+    /// hold so the per-field setters' lock churn is avoided.
+    pub fn setFieldTypesAlignsAll(
+        s: LoadedStructType,
+        ip: *InternPool,
+        types: []const Index,
+        aligns: ?[]const Alignment,
+    ) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        @memcpy(s.field_types.get(ip), types);
+        if (aligns) |a| if (s.field_aligns.len != 0) @memcpy(s.field_aligns.get(ip), a);
+    }
+
     pub fn setOffset(s: LoadedStructType, ip: *InternPool, i: usize, off: u32) void {
         const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
         extra_mutex.lock();
