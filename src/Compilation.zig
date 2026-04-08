@@ -6068,9 +6068,14 @@ fn ensureExportFuncQueued(zcu: *Zcu, export_idx: Zcu.Export.Index) bool {
     };
     if (!ip.isFuncBody(v)) return false;
     const func = ip.unwrapCoercedFunc(v);
-    if (ip.funcAnalysisUnordered(func).is_analyzed) return false;
-    // Bypass `ensureFuncBodyAnalysisQueued`'s already-queued early-return so a
-    // dropped job is actually re-enqueued.
+    // Check the LLVM nav_map: if the body landed there, codegen ran.
+    if (zcu.llvm_object) |llvm| {
+        const shard = zcu.navShard(nav, llvm.n);
+        if (llvm.objects[shard].nav_map.contains(nav)) return false;
+    } else if (ip.funcAnalysisUnordered(func).is_analyzed) return false;
+    // Clear is_analyzed so the fast-path doesn't no-op and re-analysis
+    // re-queues codegen_func.
+    zcu.funcInfo(func).clearAnalyzed(ip);
     zcu.comp.queueJob(.{ .analyze_func = func }) catch return false;
     return true;
 }
