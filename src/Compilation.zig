@@ -5142,8 +5142,9 @@ fn performAllTheWork(
 
     if (comp.zcu) |zcu| {
         // Sub-compilations (compiler_rt, ubsan_rt, etc.) and the build runner
-        // are small and gain nothing from parallel Sema.
-        const is_build_runner = std.mem.endsWith(u8, zcu.main_mod.root_src_path, "build_runner.zig");
+        // are small and gain nothing from parallel Sema. For `zig build`, the
+        // runner is `root_mod` (main_mod is the user's build.zig).
+        const is_build_runner = std.mem.endsWith(u8, zcu.root_mod.root_src_path, "build_runner.zig");
         zcu.parallel_sema = comp.parent_whole_cache == null and
             !is_build_runner and
             std.process.hasNonEmptyEnvVarConstant("ZIG_PARALLEL_SEMA");
