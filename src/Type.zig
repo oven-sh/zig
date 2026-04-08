@@ -2731,6 +2731,13 @@ pub fn comptimeOnlyInner(
 ) SemaError!bool {
     const ip = &zcu.intern_pool;
     return switch (ty.toIntern()) {
+        // Under parallel Sema an unpublished struct/union field-type slot can
+        // surface here (often via tail-recursion through .opt_type/.ptr_type
+        // child); the documented contract above allows a false negative.
+        .none => {
+            assert(zcu.parallel_sema);
+            return false;
+        },
         .empty_tuple_type => false,
 
         else => switch (ip.indexToKey(ty.toIntern())) {
@@ -3873,28 +3880,30 @@ fn resolveStructInner(
     // (not retry-requeue), and the wip-flags inside `Sema.resolveStruct*`
     // revert to their original role of detecting same-thread recursion.
     var owns_claim = false;
-    claim: while (true) switch (try zcu.claimOrWait(owner)) {
-        .claimed => {
-            owns_claim = true;
-            break :claim;
-        },
-        .recursed => break :claim,
-        .done => {
-            if (zcu.anyAnalysisFailed(owner)) return error.AnalysisFail;
-            const reached = switch (resolution) {
-                .fields => struct_obj.haveFieldTypes(ip),
-                .inits => struct_obj.haveFieldInits(ip),
-                .alignment => struct_obj.layout != .@"packed" and struct_obj.flagsUnordered(ip).alignment != .none,
-                .layout => struct_obj.haveLayout(ip),
-                .full => switch (struct_obj.layout) {
-                    .@"packed" => struct_obj.haveLayout(ip),
-                    .auto, .@"extern" => struct_obj.flagsUnordered(ip).fully_resolved,
-                },
-            };
-            if (reached) return;
-            continue :claim;
-        },
-    };
+    claim: while (true) {
+        // Fast-path before locking: most calls hit an already-resolved stage.
+        if (switch (resolution) {
+            .fields => struct_obj.haveFieldTypes(ip),
+            .inits => struct_obj.haveFieldInits(ip),
+            .alignment => struct_obj.layout != .@"packed" and struct_obj.flagsUnordered(ip).alignment != .none,
+            .layout => struct_obj.haveLayout(ip),
+            .full => switch (struct_obj.layout) {
+                .@"packed" => struct_obj.haveLayout(ip),
+                .auto, .@"extern" => struct_obj.flagsUnordered(ip).fully_resolved,
+            },
+        }) return;
+        switch (try zcu.claimOrWait(owner)) {
+            .claimed => {
+                owns_claim = true;
+                break :claim;
+            },
+            .recursed => break :claim,
+            .done => {
+                if (zcu.anyAnalysisFailed(owner)) return error.AnalysisFail;
+                continue :claim;
+            },
+        }
+    }
     defer if (owns_claim) zcu.releaseClaim(owner);
 
     zcu.semaLock();
@@ -3962,25 +3971,26 @@ fn resolveUnionInner(
     const owner: InternPool.AnalUnit = .wrap(.{ .type = ty.toIntern() });
 
     var owns_claim = false;
-    claim: while (true) switch (try zcu.claimOrWait(owner)) {
-        .claimed => {
-            owns_claim = true;
-            break :claim;
-        },
-        .recursed => break :claim,
-        .done => {
-            if (zcu.anyAnalysisFailed(owner)) return error.AnalysisFail;
-            const flags = union_obj.flagsUnordered(ip);
-            const reached = switch (resolution) {
-                .fields => flags.status.haveFieldTypes(),
-                .alignment => flags.alignment != .none,
-                .layout => flags.status.haveLayout(),
-                .full => flags.status == .fully_resolved,
-            };
-            if (reached) return;
-            continue :claim;
-        },
-    };
+    claim: while (true) {
+        const flags = union_obj.flagsUnordered(ip);
+        if (switch (resolution) {
+            .fields => flags.status.haveFieldTypes(),
+            .alignment => flags.alignment != .none,
+            .layout => flags.status.haveLayout(),
+            .full => flags.status == .fully_resolved,
+        }) return;
+        switch (try zcu.claimOrWait(owner)) {
+            .claimed => {
+                owns_claim = true;
+                break :claim;
+            },
+            .recursed => break :claim,
+            .done => {
+                if (zcu.anyAnalysisFailed(owner)) return error.AnalysisFail;
+                continue :claim;
+            },
+        }
+    }
     defer if (owns_claim) zcu.releaseClaim(owner);
 
     zcu.semaLock();
