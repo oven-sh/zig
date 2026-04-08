@@ -1385,7 +1385,28 @@ fn analyzeNavVal(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu.CompileErr
         const export_src = block.src(.{ .token_offset = @enumFromInt(@intFromBool(zir_decl.is_pub)) });
         const name_slice = zir.nullTerminatedString(zir_decl.name);
         const name_ip = try ip.getOrPutString(gpa, pt.tid, name_slice, .no_embedded_nulls);
-        try sema.analyzeExport(&block, export_src, .{ .name = name_ip }, nav_id);
+        // `analyzeExport` may trigger a retry-loop (validateExternType /
+        // ensureNavResolved on aliased nav), but we have already committed
+        // (status .fully_resolved). Swallow and append the export directly
+        // so it is not silently lost; validation will be retried on the
+        // exported nav's own analysis.
+        sema.analyzeExport(&block, export_src, .{ .name = name_ip }, nav_id) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ComptimeReturn, error.ComptimeBreak => unreachable,
+            error.AnalysisFail => {
+                if (Zcu.tls_retry_loop != null) {
+                    Zcu.tls_retry_loop = null;
+                    try sema.exports.append(gpa, .{
+                        .opts = .{ .name = name_ip },
+                        .src = export_src,
+                        .exported = .{ .nav = nav_id },
+                        .status = .in_progress,
+                    });
+                    if (ip.isFuncBody(nav_val.toIntern()))
+                        try zcu.ensureFuncBodyAnalysisQueued(nav_val.toIntern());
+                } else return error.AnalysisFail;
+            },
+        };
     }
 
     try sema.flushExports();

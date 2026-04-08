@@ -34631,7 +34631,15 @@ pub fn resolveStructLayout(sema: *Sema, ty: Type) SemaError!void {
         return sema.failWithOwnedErrorMsg(null, msg);
     };
     struct_type.setLayoutResolved(ip, size, big_align);
-    _ = try ty.comptimeOnlySema(pt);
+    _ = ty.comptimeOnlySema(pt) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AnalysisFail => {
+            if (Zcu.tls_retry_loop != null) {
+                // layout already committed; re-queue would early-return.
+                Zcu.tls_retry_loop = null;
+            } else return error.AnalysisFail;
+        },
+    };
 }
 
 fn backingIntType(
@@ -34930,7 +34938,17 @@ pub fn resolveUnionLayout(sema: *Sema, ty: Type) SemaError!void {
     };
     union_type.setHaveLayout(ip, casted_size, padding, alignment);
 
-    if (union_type.flagsUnordered(ip).assumed_runtime_bits and !(try ty.hasRuntimeBitsSema(pt))) {
+    const has_rt_bits = ty.hasRuntimeBitsSema(pt) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AnalysisFail => blk: {
+            if (Zcu.tls_retry_loop != null) {
+                Zcu.tls_retry_loop = null;
+                break :blk true;
+            }
+            return error.AnalysisFail;
+        },
+    };
+    if (union_type.flagsUnordered(ip).assumed_runtime_bits and !has_rt_bits) {
         const msg = try sema.errMsg(
             ty.srcLoc(pt.zcu),
             "union layout depends on it having runtime bits",
@@ -34949,7 +34967,14 @@ pub fn resolveUnionLayout(sema: *Sema, ty: Type) SemaError!void {
         );
         return sema.failWithOwnedErrorMsg(null, msg);
     }
-    _ = try ty.comptimeOnlySema(pt);
+    _ = ty.comptimeOnlySema(pt) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AnalysisFail => {
+            if (Zcu.tls_retry_loop != null) {
+                Zcu.tls_retry_loop = null;
+            } else return error.AnalysisFail;
+        },
+    };
 }
 
 /// Returns `error.AnalysisFail` if any of the types (recursively) failed to
