@@ -270,6 +270,10 @@ llvm_opt_bisect_limit: c_int,
 llvm_codegen_threads: u32,
 llvm_shard_stats: bool,
 no_link_obj: bool,
+/// When true, the N shard `.o` files emitted by partitioned LLVM codegen are
+/// left as-is (no relocatable -r merge). They land at `{emit}.{i}.o` next to
+/// the would-be merged output. The downstream linker consumes them directly.
+no_merge_shards: bool,
 
 time_report: ?TimeReport,
 
@@ -1735,6 +1739,7 @@ pub const CreateOptions = struct {
     llvm_codegen_threads: u32 = 0,
     llvm_shard_stats: bool = false,
     no_link_obj: bool = false,
+    llvm_no_merge_shards: bool = false,
     build_id: ?std.zig.BuildId = null,
     disable_c_depfile: bool = false,
     linker_z_nodelete: bool = false,
@@ -2304,9 +2309,14 @@ pub fn create(gpa: Allocator, arena: Allocator, diag: *CreateDiagnostic, options
             .llvm_opt_bisect_limit = options.llvm_opt_bisect_limit,
             .llvm_codegen_threads = options.llvm_codegen_threads,
             .llvm_shard_stats = options.llvm_shard_stats,
-            // Partitioned LLVM output produces N objects which must be merged by
-            // the linker, so the no-link shortcut cannot apply in that case.
-            .no_link_obj = options.no_link_obj and options.llvm_codegen_threads <= 1,
+            // Partitioned LLVM output produces N objects which must be merged
+            // by the linker for a single-.o result, so the no-link shortcut
+            // does not apply unless `--llvm-no-merge-shards` is also set, in
+            // which case the N shard `.o` files are emitted directly to the
+            // final location and the relocatable merge is skipped entirely.
+            .no_link_obj = options.no_link_obj and
+                (options.llvm_codegen_threads <= 1 or options.llvm_no_merge_shards),
+            .no_merge_shards = options.llvm_no_merge_shards and options.llvm_codegen_threads > 1,
             .skip_linker_dependencies = options.skip_linker_dependencies,
             .queued_jobs = .{},
             .function_sections = options.function_sections,

@@ -690,7 +690,12 @@ pub fn ensureMemoizedStateUpToDate(pt: Zcu.PerThread, stage: InternPool.Memoized
         info.deps.clearRetainingCapacity();
     }
 
-    const any_changed: bool, const new_failed: bool = if (pt.analyzeMemoizedState(stage)) |any_changed|
+    const memoized_result = blk: {
+        const d = zcu.semaRelease();
+        defer zcu.semaReacquire(d);
+        break :blk pt.analyzeMemoizedState(stage);
+    };
+    const any_changed: bool, const new_failed: bool = if (memoized_result) |any_changed|
         .{ any_changed or prev_failed, false }
     else |err| switch (err) {
         error.AnalysisFail => res: {
@@ -864,7 +869,12 @@ pub fn ensureComptimeUnitUpToDate(pt: Zcu.PerThread, cu_id: InternPool.ComptimeU
     );
     defer unit_tracking.end(zcu);
 
-    return pt.analyzeComptimeUnit(cu_id) catch |err| switch (err) {
+    const cu_result = blk: {
+        const d = zcu.semaRelease();
+        defer zcu.semaReacquire(d);
+        break :blk pt.analyzeComptimeUnit(cu_id);
+    };
+    return cu_result catch |err| switch (err) {
         error.AnalysisFail => {
             if (Zcu.tls_retry_loop != null) {
                 // Re-mark outdated so the re-queued attempt actually re-runs
@@ -1068,7 +1078,15 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
     const unit_tracking = zcu.trackUnitSema(nav.fqn.toSlice(ip), nav.srcInst(ip));
     defer unit_tracking.end(zcu);
 
-    const invalidate_value: bool, const new_failed: bool = if (pt.analyzeNavVal(nav_id)) |result| res: {
+    // Carve-out: per-nav `claimOrWait` already serialises this nav; release the
+    // global lock so other threads can analyse other navs/types concurrently.
+    const nav_result = blk: {
+        const d = zcu.semaRelease();
+        defer zcu.semaReacquire(d);
+        break :blk pt.analyzeNavVal(nav_id);
+    };
+
+    const invalidate_value: bool, const new_failed: bool = if (nav_result) |result| res: {
         break :res .{
             // If the unit has gone from failed to success, we still need to invalidate the dependencies.
             result.val_changed or prev_failed,
@@ -1544,7 +1562,12 @@ pub fn ensureNavTypeUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zc
     const unit_tracking = zcu.trackUnitSema(nav.fqn.toSlice(ip), nav.srcInst(ip));
     defer unit_tracking.end(zcu);
 
-    const invalidate_type: bool, const new_failed: bool = if (pt.analyzeNavType(nav_id)) |result| res: {
+    const nav_ty_result = blk: {
+        const d = zcu.semaRelease();
+        defer zcu.semaReacquire(d);
+        break :blk pt.analyzeNavType(nav_id);
+    };
+    const invalidate_type: bool, const new_failed: bool = if (nav_ty_result) |result| res: {
         break :res .{
             // If the unit has gone from failed to success, we still need to invalidate the dependencies.
             result.type_changed or prev_failed,
