@@ -3140,6 +3140,9 @@ pub fn enumFieldName(ty: Type, field_index: usize, zcu: *const Zcu) InternPool.N
 
 pub fn enumFieldIndex(ty: Type, field_name: InternPool.NullTerminatedString, zcu: *const Zcu) ?u32 {
     const ip = &zcu.intern_pool;
+    // The `.existing` dedup may return an enum whose `WipEnumType` owner is
+    // still populating names; spin until `finish()` so the lookup sees them.
+    ip.awaitNamespaceTypeFinished(ty.toIntern());
     const enum_type = ip.loadEnumType(ty.toIntern());
     return enum_type.nameIndex(ip, field_name);
 }
