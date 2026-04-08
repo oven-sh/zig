@@ -2730,11 +2730,12 @@ pub fn comptimeOnlyInner(
     tid: strat.Tid(),
 ) SemaError!bool {
     const ip = &zcu.intern_pool;
+    // Under parallel Sema an unpublished struct/union field-type slot can
+    // surface here (often via tail-recursion through .opt_type/.ptr_type
+    // child); the documented contract above allows a false negative.
+    // Checked on `ip_index` directly because `toIntern()` asserts != .none.
+    if (ty.ip_index == .none) return false;
     return switch (ty.toIntern()) {
-        // Under parallel Sema an unpublished struct/union field-type slot can
-        // surface here (often via tail-recursion through .opt_type/.ptr_type
-        // child); the documented contract above allows a false negative.
-        .none => false,
         .empty_tuple_type => false,
 
         else => switch (ip.indexToKey(ty.toIntern())) {
