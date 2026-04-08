@@ -11878,18 +11878,10 @@ pub fn resolveNavValue(
     assert(nav_analysis_namespace[unwrapped.index] != .none);
     assert(nav_analysis_zir_index[unwrapped.index] != .none);
 
-    var bits = nav_bits[unwrapped.index];
-    // Seqlock-style write: a concurrent `getNav` does bits-acquire,
-    // type_or_val, bits-acquire and retries until stable. Because
-    // .type_resolved → .fully_resolved REWRITES type_or_val from a type to
-    // a value, mark .unresolved first so a reader cannot pair the old
-    // .type_resolved status with the new value.
-    bits.status = .unresolved;
-    @atomicStore(Nav.Repr.Bits, &nav_bits[unwrapped.index], bits, .release);
-
     @atomicStore(InternPool.Index, &nav_vals[unwrapped.index], resolved.val, .release);
     @atomicStore(OptionalNullTerminatedString, &nav_linksections[unwrapped.index], resolved.@"linksection", .release);
 
+    var bits = nav_bits[unwrapped.index];
     bits.status = .fully_resolved;
     bits.is_const = resolved.is_const;
     bits.alignment = resolved.alignment;

@@ -31392,7 +31392,12 @@ fn analyzeNavRefInner(sema: *Sema, block: *Block, src: LazySrcLoc, orig_nav_inde
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
 
-    try sema.ensureNavResolved(block, src, orig_nav_index, if (is_ref) .type else .fully);
+    // Under parallel Sema another thread may transition the nav from
+    // .type_resolved → .fully_resolved between our ensureNavResolved and
+    // the getNav below, leaving a torn read in `isExternOrFn`. Fully
+    // resolving here serialises via claimOrWait so the subsequent getNav
+    // observes a stable status.
+    try sema.ensureNavResolved(block, src, orig_nav_index, if (is_ref and !zcu.parallel_sema) .type else .fully);
 
     const nav_index = nav: {
         if (ip.getNav(orig_nav_index).isExternOrFn(ip)) {
