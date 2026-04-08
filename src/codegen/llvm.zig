@@ -1861,16 +1861,23 @@ pub const Object = struct {
         const gpa = zcu.gpa;
         const ip = &zcu.intern_pool;
         const main_exp_name = try o.builder.strtabString(export_indices[0].ptr(zcu).opts.name.toSlice(ip));
+        // When sharded, other shards reference this uav as `__anon_{ip_index}`
+        // (linkonce_odr) so the linker coalesces to one address. Keep that
+        // name on the definition and expose every export as an alias to it.
+        const def_name = if (o.isSharded())
+            try o.builder.strtabStringFmt("__anon_{d}", .{@intFromEnum(exported_value)})
+        else
+            main_exp_name;
         const global_index = i: {
             const gop = try o.uav_map.getOrPut(gpa, exported_value);
             if (gop.found_existing) {
                 const global_index = gop.value_ptr.*;
-                try global_index.rename(main_exp_name, &o.builder);
+                if (!o.isSharded()) try global_index.rename(def_name, &o.builder);
                 break :i global_index;
             }
             const llvm_addr_space = toLlvmAddressSpace(.generic, o.target);
             const variable_index = try o.builder.addVariable(
-                main_exp_name,
+                def_name,
                 try o.lowerType(pt, Type.fromInterned(ip.typeOf(exported_value))),
                 llvm_addr_space,
             );
@@ -1882,23 +1889,16 @@ pub const Object = struct {
                 error.CodegenFail => return error.AnalysisFail,
             };
             try variable_index.setInitializer(init_val, &o.builder);
+            if (o.isSharded()) {
+                variable_index.setLinkage(.linkonce_odr, &o.builder);
+                variable_index.setVisibility(.hidden, &o.builder);
+                variable_index.setMutability(.constant, &o.builder);
+            }
             break :i global_index;
         };
         if (o.isSharded()) {
-            // Uavs are duplicated per shard so no other shard references this
-            // global by name; apply export linkage directly without an alias.
-            const first_export = export_indices[0].ptr(zcu);
-            global_index.setUnnamedAddr(.default, &o.builder);
-            global_index.setLinkage(switch (first_export.opts.linkage) {
-                .internal => unreachable,
-                .strong => .external,
-                .weak => .weak_odr,
-                .link_once => .linkonce_odr,
-            }, &o.builder);
-            global_index.setVisibility(.fromSymbolVisibility(first_export.opts.visibility), &o.builder);
-            if (zcu.comp.config.dll_export_fns)
-                global_index.setDllStorageClass(.dllexport, &o.builder);
-            for (export_indices[1..]) |export_idx| {
+            // Definition keeps __anon_{idx} linkonce_odr; export names are aliases.
+            for (export_indices) |export_idx| {
                 const exp = export_idx.ptr(zcu);
                 const exp_name = try o.builder.strtabString(exp.opts.name.toSlice(ip));
                 const alias_index = try o.builder.addAlias(.empty, global_index.typeOf(&o.builder), .default, global_index.toConst());
@@ -1911,6 +1911,8 @@ pub const Object = struct {
                     .link_once => .linkonce_odr,
                 }, &o.builder);
                 ag.setVisibility(.fromSymbolVisibility(exp.opts.visibility), &o.builder);
+                if (zcu.comp.config.dll_export_fns)
+                    ag.setDllStorageClass(.dllexport, &o.builder);
             }
             return;
         }

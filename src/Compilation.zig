@@ -2514,7 +2514,15 @@ pub fn create(gpa: Allocator, arena: Allocator, diag: *CreateDiagnostic, options
 
         if (use_llvm) {
             if (opt_zcu) |zcu| {
-                const n_shards: u32 = if (options.llvm_codegen_threads <= 1) 1 else options.llvm_codegen_threads;
+                // Multi-shard emission only supports producing N object files
+                // for the linker; IR/BC/asm requests for a single output would
+                // silently drop shards 1..N. Clamp to 1 in that case.
+                const single_artifact_only = options.emit_bin == .no and
+                    (options.emit_llvm_ir != .no or options.emit_llvm_bc != .no or options.emit_asm != .no);
+                const n_shards: u32 = if (options.llvm_codegen_threads <= 1 or single_artifact_only)
+                    1
+                else
+                    options.llvm_codegen_threads;
                 zcu.llvm_object = try LlvmPartitionSet.create(arena, comp, n_shards);
             }
         }

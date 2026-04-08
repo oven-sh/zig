@@ -367,9 +367,10 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
     const directory = base.emit.root_dir; // Just an alias to make it shorter to type.
     const full_out_path = try directory.join(arena, &[_][]const u8{base.emit.sub_path});
 
-    const zcu_obj_path: ?Cache.Path = if (comp.zcu != null) p: {
-        break :p try comp.resolveEmitPathFlush(arena, .temp, base.zcu_object_basename.?);
-    } else null;
+    const zcu_obj_paths: []const Cache.Path = if (comp.zcu != null)
+        try base.resolveZcuObjectPaths(arena)
+    else
+        &.{};
 
     const is_lib = comp.config.output_mode == .Lib;
     const is_dyn_lib = comp.config.link_mode == .dynamic and is_lib;
@@ -395,8 +396,8 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
             if (comp.c_object_table.count() != 0)
                 break :blk comp.c_object_table.keys()[0].status.success.object_path;
 
-            if (zcu_obj_path) |p|
-                break :blk p;
+            if (zcu_obj_paths.len > 0)
+                break :blk zcu_obj_paths[0];
 
             // TODO I think this is unreachable. Audit this situation when solving the above TODO
             // regarding eliding redundant object -> object transformations.
@@ -549,7 +550,7 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
             try argv.append(key.status.success.res_path);
         }
 
-        if (zcu_obj_path) |p| {
+        for (zcu_obj_paths) |p| {
             try argv.append(try p.toString(arena));
         }
 
@@ -1373,9 +1374,10 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
     const directory = base.emit.root_dir; // Just an alias to make it shorter to type.
     const full_out_path = try directory.join(arena, &[_][]const u8{base.emit.sub_path});
 
-    const zcu_obj_path: ?Cache.Path = if (comp.zcu != null) p: {
-        break :p try comp.resolveEmitPathFlush(arena, .temp, base.zcu_object_basename.?);
-    } else null;
+    const zcu_obj_paths: []const Cache.Path = if (comp.zcu != null)
+        try base.resolveZcuObjectPaths(arena)
+    else
+        &.{};
 
     const is_obj = comp.config.output_mode == .Obj;
     const compiler_rt_path: ?Cache.Path = blk: {
@@ -1399,8 +1401,8 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
             if (comp.c_object_table.count() != 0)
                 break :blk comp.c_object_table.keys()[0].status.success.object_path;
 
-            if (zcu_obj_path) |p|
-                break :blk p;
+            if (zcu_obj_paths.len > 0)
+                break :blk zcu_obj_paths[0];
 
             // TODO I think this is unreachable. Audit this situation when solving the above TODO
             // regarding eliding redundant object -> object transformations.
@@ -1581,7 +1583,7 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
         for (comp.c_object_table.keys()) |key| {
             try argv.append(try key.status.success.object_path.toString(arena));
         }
-        if (zcu_obj_path) |p| {
+        for (zcu_obj_paths) |p| {
             try argv.append(try p.toString(arena));
         }
 
