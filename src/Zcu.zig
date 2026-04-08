@@ -3721,7 +3721,10 @@ pub fn aipRemove(zcu: *Zcu, unit: AnalUnit) void {
         _ = tls_aip.swapRemove(unit);
         return;
     }
-    assert(zcu.analysis_in_progress.swapRemove(unit));
+    // Idempotent: success-path removes happen earlier than the matching
+    // `errdefer` in some callers (e.g. `analyzeNavVal`), so a second call here
+    // is benign. Asserting on it regressed serial-mode behaviour.
+    _ = zcu.analysis_in_progress.swapRemove(unit);
 }
 
 /// Delete all the Export objects that are caused by this `AnalUnit`. Re-analysis of
