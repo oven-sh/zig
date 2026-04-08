@@ -11673,7 +11673,7 @@ pub fn getNav(ip: *const InternPool, index: Nav.Index) Nav {
         repr.type_or_val = @atomicLoad(InternPool.Index, tov_ptr, .unordered);
         repr.@"linksection" = @atomicLoad(OptionalNullTerminatedString, ls_ptr, .unordered);
         const b2 = @atomicLoad(Nav.Repr.Bits, bits_ptr, .acquire);
-        if (@as(u32, @bitCast(b1)) == @as(u32, @bitCast(b2))) {
+        if (@as(u16, @bitCast(b1)) == @as(u16, @bitCast(b2))) {
             repr.bits = b2;
             return repr.unpack();
         }
