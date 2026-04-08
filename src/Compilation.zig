@@ -5151,6 +5151,7 @@ fn performAllTheWork(
 
     var job_ns: [@typeInfo(Job.Tag).@"enum".fields.len]u64 = @splat(0);
     var job_ct: [@typeInfo(Job.Tag).@"enum".fields.len]u64 = @splat(0);
+    var export_func_pass: u8 = 0;
     work: while (true) {
         const maybe_job: ?Job = job: {
             comp.work_queue_mutex.lock();
@@ -5199,6 +5200,21 @@ fn performAllTheWork(
                     => .{ .analyze_comptime_unit = outdated },
                 });
                 continue;
+            }
+            // Final pass under parallel Sema: any exported function whose body
+            // analysis was dropped by a post-commit retry will not be in
+            // `nav_map` at processExports time. Re-queue here so the work loop
+            // drains it before we exit.
+            if (zcu.parallel_sema and export_func_pass < 3) {
+                export_func_pass += 1;
+                var any_queued = false;
+                var it = zcu.single_exports.valueIterator();
+                while (it.next()) |idx| any_queued = ensureExportFuncQueued(zcu, idx.*) or any_queued;
+                var it2 = zcu.multi_exports.valueIterator();
+                while (it2.next()) |info| for (zcu.all_exports.items[info.index..][0..info.len], info.index..) |_, i| {
+                    any_queued = ensureExportFuncQueued(zcu, @enumFromInt(i)) or any_queued;
+                };
+                if (any_queued) continue;
             }
             zcu.sema_prog_node.end();
             zcu.sema_prog_node = .none;
@@ -6036,6 +6052,26 @@ pub const RtOptions = struct {
     checks_valgrind: bool = false,
     allow_lto: bool = true,
 };
+
+fn ensureExportFuncQueued(zcu: *Zcu, export_idx: Zcu.Export.Index) bool {
+    const ip = &zcu.intern_pool;
+    const exp = export_idx.ptr(zcu);
+    const nav = switch (exp.exported) {
+        .nav => |n| n,
+        .uav => return false,
+    };
+    const v = switch (ip.getNav(nav).status) {
+        .fully_resolved => |r| r.val,
+        else => return false,
+    };
+    if (!ip.isFuncBody(v)) return false;
+    const func = ip.unwrapCoercedFunc(v);
+    if (ip.funcAnalysisUnordered(func).is_analyzed) return false;
+    // Bypass `ensureFuncBodyAnalysisQueued`'s already-queued early-return so a
+    // dropped job is actually re-enqueued.
+    zcu.comp.queueJob(.{ .analyze_func = func }) catch return false;
+    return true;
+}
 
 fn workerAnalyzeFunc(tid: usize, comp: *Compilation, func: InternPool.Index) void {
     const zcu = comp.zcu.?;
