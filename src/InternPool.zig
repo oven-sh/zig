@@ -7015,12 +7015,7 @@ pub fn init(ip: *InternPool, gpa: Allocator, available_threads: usize) !void {
     ip.tid_shift_30 = if (single_threaded) 0 else 30 - ip.tid_width;
     ip.tid_shift_31 = if (single_threaded) 0 else 31 - ip.tid_width;
     ip.tid_shift_32 = if (single_threaded) 0 else ip.tid_shift_31 +| 1;
-    // Shard count for the hash-map sharding is decoupled from `tid_width`
-    // (which sizes the per-tid `locals`). With ~16 Sema workers all
-    // interning concurrently, 32 shards gives only 2× oversubscription and
-    // hot keys cluster; use a generous fixed count instead.
-    const shard_count: usize = @max(@as(usize, 1) << ip.tid_width, 256);
-    ip.shards = try gpa.alloc(Shard, shard_count);
+    ip.shards = try gpa.alloc(Shard, @as(usize, 1) << ip.tid_width);
     @memset(ip.shards, .{
         .shared = .{
             .map = Shard.Map(Index).empty,
