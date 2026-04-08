@@ -3890,6 +3890,7 @@ fn resolveStructInner(
         .full => sema.resolveStructFully(ty),
     }) catch |err| switch (err) {
         error.AnalysisFail => {
+            if (Zcu.tls_retry_loop != null) return error.AnalysisFail;
             if (!zcu.failed_analysis.contains(owner)) {
                 try zcu.transitive_failed_analysis.put(gpa, owner, {});
             }
@@ -3951,6 +3952,7 @@ fn resolveUnionInner(
         .full => sema.resolveUnionFully(ty),
     }) catch |err| switch (err) {
         error.AnalysisFail => {
+            if (Zcu.tls_retry_loop != null) return error.AnalysisFail;
             if (!zcu.failed_analysis.contains(owner)) {
                 try zcu.transitive_failed_analysis.put(gpa, owner, {});
             }

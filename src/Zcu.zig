@@ -88,6 +88,9 @@ unit_claims: std.AutoHashMapUnmanaged(AnalUnit, std.Thread.Id) = .empty,
 /// Tracks which unit each thread is currently waiting on, for deadlock
 /// detection in `claimOrWait`. Guarded by `sema_lock`.
 claim_waits: std.AutoHashMapUnmanaged(std.Thread.Id, AnalUnit) = .empty,
+/// Per-unit retry count for order-dependent dependency loops, to avoid
+/// livelock on a true source-level cycle. Guarded by `sema_lock`.
+sema_retry_counts: std.AutoHashMapUnmanaged(AnalUnit, u8) = .empty,
 sema_pending_jobs: std.atomic.Value(u32) = .init(0),
 /// True while parallel Sema is enabled for this update.
 parallel_sema: bool = false,
@@ -2827,6 +2830,7 @@ pub fn deinit(zcu: *Zcu) void {
         zcu.analysis_in_progress.deinit(gpa);
         zcu.unit_claims.deinit(gpa);
         zcu.claim_waits.deinit(gpa);
+        zcu.sema_retry_counts.deinit(gpa);
         zcu.failed_analysis.deinit(gpa);
         zcu.transitive_failed_analysis.deinit(gpa);
         zcu.failed_codegen.deinit(gpa);
@@ -3665,10 +3669,20 @@ pub fn releaseClaim(zcu: *Zcu, unit: AnalUnit) void {
 
 /// Under parallel Sema, `analysis_in_progress` is per-OS-thread (lock-free).
 threadlocal var tls_aip: std.AutoArrayHashMapUnmanaged(AnalUnit, void) = .empty;
+/// Set by `ensureNavResolved` when a dependency loop is detected under
+/// parallel Sema that may be order-dependent (the looped-on unit might be
+/// resolvable by another thread). Consumed by the outer `ensure*UpToDate`
+/// to release-and-requeue instead of marking the unit failed.
+pub threadlocal var tls_retry_loop: ?AnalUnit = null;
 
 pub fn semaAipContains(zcu: *Zcu, unit: AnalUnit) bool {
     if (!zcu.parallel_sema) return zcu.analysis_in_progress.contains(unit);
     return tls_aip.contains(unit);
+}
+
+pub fn dumpTlsAip(zcu: *Zcu) void {
+    std.debug.print("tls_aip ({d} entries):\n", .{tls_aip.count()});
+    for (tls_aip.keys()) |k| std.debug.print("  {f}\n", .{zcu.fmtAnalUnit(k)});
 }
 
 pub fn aipPut(zcu: *Zcu, gpa: Allocator, unit: AnalUnit) Allocator.Error!void {
@@ -3708,9 +3722,9 @@ pub fn deleteUnitExports(zcu: *Zcu, anal_unit: AnalUnit) void {
     if (dev.env.supports(.incremental)) {
         for (exports, exports_base..) |exp, export_index_usize| {
             const export_idx: Export.Index = @enumFromInt(export_index_usize);
-            if (zcu.comp.bin_file) |lf| {
+            if (zcu.llvm_object == null) if (zcu.comp.bin_file) |lf| {
                 lf.deleteExport(exp.exported, exp.opts.name);
-            }
+            };
             if (zcu.failed_exports.fetchSwapRemove(export_idx)) |failed_kv| {
                 failed_kv.value.destroy(gpa);
             }

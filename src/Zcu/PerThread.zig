@@ -694,6 +694,7 @@ pub fn ensureMemoizedStateUpToDate(pt: Zcu.PerThread, stage: InternPool.Memoized
         .{ any_changed or prev_failed, false }
     else |err| switch (err) {
         error.AnalysisFail => res: {
+            if (Zcu.tls_retry_loop != null) return error.AnalysisFail;
             if (!zcu.failed_analysis.contains(unit)) {
                 // If this unit caused the error, it would have an entry in `failed_analysis`.
                 // Since it does not, this must be a transitive failure.
@@ -865,6 +866,7 @@ pub fn ensureComptimeUnitUpToDate(pt: Zcu.PerThread, cu_id: InternPool.ComptimeU
 
     return pt.analyzeComptimeUnit(cu_id) catch |err| switch (err) {
         error.AnalysisFail => {
+            if (Zcu.tls_retry_loop != null) return error.AnalysisFail;
             if (!zcu.failed_analysis.contains(anal_unit)) {
                 // If this unit caused the error, it would have an entry in `failed_analysis`.
                 // Since it does not, this must be a transitive failure.
@@ -1069,6 +1071,7 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
         };
     } else |err| switch (err) {
         error.AnalysisFail => res: {
+            if (Zcu.tls_retry_loop != null) return error.AnalysisFail;
             if (!zcu.failed_analysis.contains(anal_unit)) {
                 // If this unit caused the error, it would have an entry in `failed_analysis`.
                 // Since it does not, this must be a transitive failure.
@@ -1497,6 +1500,7 @@ pub fn ensureNavTypeUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zc
         };
     } else |err| switch (err) {
         error.AnalysisFail => res: {
+            if (Zcu.tls_retry_loop != null) return error.AnalysisFail;
             if (!zcu.failed_analysis.contains(anal_unit)) {
                 // If this unit caused the error, it would have an entry in `failed_analysis`.
                 // Since it does not, this must be a transitive failure.
@@ -1742,6 +1746,7 @@ pub fn ensureFuncBodyUpToDate(pt: Zcu.PerThread, func_index: InternPool.Index) Z
         .{ prev_failed or result.ies_outdated, false }
     else |err| switch (err) {
         error.AnalysisFail => res: {
+            if (Zcu.tls_retry_loop != null) return error.AnalysisFail;
             if (!zcu.failed_analysis.contains(anal_unit)) {
                 // If this function caused the error, it would have an entry in `failed_analysis`.
                 // Since it does not, this must be a transitive failure.

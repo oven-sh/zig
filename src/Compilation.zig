@@ -5317,9 +5317,16 @@ fn processOneJob(tid: usize, comp: *Compilation, job: Job) JobError!void {
             const pt: Zcu.PerThread = .activate(comp.zcu.?, @enumFromInt(tid));
             defer pt.deactivate();
 
+            Zcu.tls_retry_loop = null;
             pt.ensureFuncBodyUpToDate(func) catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
-                error.AnalysisFail => return,
+                error.AnalysisFail => {
+                    if (Zcu.tls_retry_loop != null) {
+                        Zcu.tls_retry_loop = null;
+                        try comp.queueJob(.{ .analyze_func = func });
+                    }
+                    return;
+                },
             };
         },
         .analyze_comptime_unit => |unit| {
@@ -5329,6 +5336,7 @@ fn processOneJob(tid: usize, comp: *Compilation, job: Job) JobError!void {
             const pt: Zcu.PerThread = .activate(comp.zcu.?, @enumFromInt(tid));
             defer pt.deactivate();
 
+            Zcu.tls_retry_loop = null;
             const maybe_err: Zcu.SemaError!void = switch (unit.unwrap()) {
                 .@"comptime" => |cu| pt.ensureComptimeUnitUpToDate(cu),
                 .nav_ty => |nav| pt.ensureNavTypeUpToDate(nav),
@@ -5339,7 +5347,13 @@ fn processOneJob(tid: usize, comp: *Compilation, job: Job) JobError!void {
             };
             maybe_err catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
-                error.AnalysisFail => return,
+                error.AnalysisFail => {
+                    if (Zcu.tls_retry_loop != null) {
+                        Zcu.tls_retry_loop = null;
+                        try comp.queueJob(.{ .analyze_comptime_unit = unit });
+                    }
+                    return;
+                },
             };
 
             queue_test_analysis: {
@@ -5367,9 +5381,16 @@ fn processOneJob(tid: usize, comp: *Compilation, job: Job) JobError!void {
 
             const pt: Zcu.PerThread = .activate(comp.zcu.?, @enumFromInt(tid));
             defer pt.deactivate();
+            Zcu.tls_retry_loop = null;
             Type.fromInterned(ty).resolveFully(pt) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.AnalysisFail => return,
+                error.AnalysisFail => {
+                    if (Zcu.tls_retry_loop != null) {
+                        Zcu.tls_retry_loop = null;
+                        try comp.queueJob(.{ .resolve_type_fully = ty });
+                    }
+                    return;
+                },
             };
         },
         .analyze_mod => |mod| {
@@ -6015,9 +6036,18 @@ fn workerAnalyzeFunc(tid: usize, comp: *Compilation, func: InternPool.Index) voi
     const zcu = comp.zcu.?;
     const pt: Zcu.PerThread = .activate(zcu, @enumFromInt(tid));
     defer pt.deactivate();
+    Zcu.tls_retry_loop = null;
     pt.ensureFuncBodyUpToDate(func) catch |err| switch (err) {
         error.OutOfMemory => comp.setAllocFailure(),
-        error.AnalysisFail => {},
+        error.AnalysisFail => {
+            if (Zcu.tls_retry_loop != null) {
+                // Order-dependent dependency loop: re-queue this func so
+                // another thread (or a later attempt) can try after
+                // intermediates have been resolved independently.
+                Zcu.tls_retry_loop = null;
+                comp.queueJob(.{ .analyze_func = func }) catch comp.setAllocFailure();
+            }
+        },
     };
     _ = zcu.sema_pending_jobs.rmw(.Sub, 1, .release);
 }

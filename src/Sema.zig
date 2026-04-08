@@ -31283,6 +31283,25 @@ fn ensureMemoizedStateResolved(sema: *Sema, src: LazySrcLoc, stage: InternPool.M
     try pt.ensureMemoizedStateUpToDate(stage);
 }
 
+/// Under parallel Sema, a wip-flag self-dependency may be order-dependent
+/// (an intermediate nav would have short-circuited the chain in serial).
+/// Returns true if the caller should set `tls_retry_loop` and propagate
+/// AnalysisFail so the outermost job can release-and-requeue.
+fn maybeRetryTypeLoop(sema: *Sema, ty: Type) Allocator.Error!bool {
+    const zcu = sema.pt.zcu;
+    const unit: AnalUnit = .wrap(.{ .type = ty.toIntern() });
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+    const gop = try zcu.sema_retry_counts.getOrPut(zcu.gpa, unit);
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    gop.value_ptr.* +|= 1;
+    if (gop.value_ptr.* < 8) {
+        Zcu.tls_retry_loop = unit;
+        return true;
+    }
+    return false;
+}
+
 pub fn ensureNavResolved(sema: *Sema, block: *Block, src: LazySrcLoc, nav_index: InternPool.Nav.Index, kind: enum { type, fully }) CompileError!void {
     const pt = sema.pt;
     const zcu = pt.zcu;
@@ -31309,6 +31328,23 @@ pub fn ensureNavResolved(sema: *Sema, block: *Block, src: LazySrcLoc, nav_index:
     try sema.addReferenceEntry(block, src, anal_unit);
 
     if (zcu.semaAipContains(anal_unit)) {
+        if (zcu.parallel_sema) {
+            // The loop may be order-dependent: another thread could resolve
+            // an intermediate nav and break the chain. Signal the outermost
+            // analyze_func to release-and-requeue instead of marking failed.
+            zcu.semaLock();
+            const tries: u8 = blk: {
+                const gop = zcu.sema_retry_counts.getOrPut(zcu.gpa, anal_unit) catch break :blk 255;
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* +|= 1;
+                break :blk gop.value_ptr.*;
+            };
+            zcu.semaUnlock();
+            if (tries < 8) {
+                Zcu.tls_retry_loop = anal_unit;
+                return error.AnalysisFail;
+            }
+        }
         return sema.failWithOwnedErrorMsg(null, try sema.errMsg(.{
             .base_node_inst = nav.analysis.?.zir_index,
             .offset = LazySrcLoc.Offset.nodeOffset(.zero),
@@ -34410,6 +34446,7 @@ pub fn resolveStructLayout(sema: *Sema, ty: Type) SemaError!void {
     }
 
     if (struct_type.setLayoutWip(ip)) {
+        if (zcu.parallel_sema) if (try sema.maybeRetryTypeLoop(ty)) return error.AnalysisFail;
         const msg = try sema.errMsg(
             ty.srcLoc(zcu),
             "struct '{f}' depends on itself",
@@ -34740,6 +34777,7 @@ pub fn resolveUnionLayout(sema: *Sema, ty: Type) SemaError!void {
     switch (old_flags.status) {
         .none, .have_field_types => {},
         .field_types_wip, .layout_wip => {
+            if (pt.zcu.parallel_sema) if (try sema.maybeRetryTypeLoop(ty)) return error.AnalysisFail;
             const msg = try sema.errMsg(
                 ty.srcLoc(pt.zcu),
                 "union '{f}' depends on itself",
@@ -34937,6 +34975,7 @@ pub fn resolveStructFieldTypes(
     if (struct_type.haveFieldTypes(ip)) return;
 
     if (struct_type.setFieldTypesWip(ip)) {
+        if (zcu.parallel_sema) if (try sema.maybeRetryTypeLoop(Type.fromInterned(ty))) return error.AnalysisFail;
         const msg = try sema.errMsg(
             Type.fromInterned(ty).srcLoc(zcu),
             "struct '{f}' depends on itself",
@@ -34970,6 +35009,7 @@ pub fn resolveStructFieldInits(sema: *Sema, ty: Type) SemaError!void {
     try sema.resolveStructLayout(ty);
 
     if (struct_type.setInitsWip(ip)) {
+        if (zcu.parallel_sema) if (try sema.maybeRetryTypeLoop(ty)) return error.AnalysisFail;
         const msg = try sema.errMsg(
             ty.srcLoc(zcu),
             "struct '{f}' depends on itself",
@@ -35000,6 +35040,7 @@ pub fn resolveUnionFieldTypes(sema: *Sema, ty: Type, union_type: InternPool.Load
     switch (union_type.flagsUnordered(ip).status) {
         .none => {},
         .field_types_wip => {
+            if (zcu.parallel_sema) if (try sema.maybeRetryTypeLoop(ty)) return error.AnalysisFail;
             const msg = try sema.errMsg(ty.srcLoc(zcu), "union '{f}' depends on itself", .{ty.fmt(pt)});
             return sema.failWithOwnedErrorMsg(null, msg);
         },
@@ -37292,6 +37333,7 @@ pub fn flushExports(sema: *Sema) !void {
             .len = @intCast(sema.exports.items.len),
         });
     }
+    sema.exports.clearRetainingCapacity();
 }
 
 /// Called as soon as a `declared` enum type is created.
