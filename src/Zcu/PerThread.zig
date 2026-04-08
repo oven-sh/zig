@@ -3017,7 +3017,8 @@ fn analyzeFnBodyInner(pt: Zcu.PerThread, func_index: InternPool.Index) Zcu.SemaE
 
     const func_nav = ip.getNav(func.owner_nav);
 
-    zcu.intern_pool.removeDependenciesForDepender(gpa, anal_unit);
+    if (zcu.comp.incremental)
+        zcu.intern_pool.removeDependenciesForDepender(gpa, anal_unit);
 
     var analysis_arena = std.heap.ArenaAllocator.init(gpa);
     defer analysis_arena.deinit();
