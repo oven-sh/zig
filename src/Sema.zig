@@ -3001,6 +3001,7 @@ fn zirStructDecl(
     };
     const wip_ty = switch (try ip.getStructType(gpa, pt.tid, struct_init, false)) {
         .existing => |ty| {
+            zcu.awaitNamespaceTypeFinished(ty);
             const new_ty = try pt.ensureTypeUpToDate(ty);
 
             // Make sure we update the namespace if the declaration is re-analyzed, to pick
@@ -3245,6 +3246,7 @@ fn zirEnumDecl(
     };
     const wip_ty = switch (try ip.getEnumType(gpa, pt.tid, enum_init, false)) {
         .existing => |ty| {
+            zcu.awaitNamespaceTypeFinished(ty);
             const new_ty = try pt.ensureTypeUpToDate(ty);
 
             // Make sure we update the namespace if the declaration is re-analyzed, to pick
@@ -3402,6 +3404,7 @@ fn zirUnionDecl(
     };
     const wip_ty = switch (try ip.getUnionType(gpa, pt.tid, union_init, false)) {
         .existing => |ty| {
+            zcu.awaitNamespaceTypeFinished(ty);
             const new_ty = try pt.ensureTypeUpToDate(ty);
 
             // Make sure we update the namespace if the declaration is re-analyzed, to pick
@@ -3501,6 +3504,7 @@ fn zirOpaqueDecl(
     };
     const wip_ty = switch (try ip.getOpaqueType(gpa, pt.tid, opaque_init)) {
         .existing => |ty| {
+            zcu.awaitNamespaceTypeFinished(ty);
             // Make sure we update the namespace if the declaration is re-analyzed, to pick
             // up on e.g. changed comptime decls.
             try pt.ensureNamespaceUpToDate(Type.fromInterned(ty).getNamespaceIndex(zcu));
