@@ -5141,7 +5141,10 @@ fn performAllTheWork(
     }
 
     if (comp.zcu) |zcu| {
-        zcu.parallel_sema = std.process.hasNonEmptyEnvVarConstant("ZIG_PARALLEL_SEMA");
+        // Sub-compilations (compiler_rt, ubsan_rt, etc.) are small and gain
+        // nothing from parallel Sema; only enable for the top-level build.
+        zcu.parallel_sema = comp.parent_whole_cache == null and
+            std.process.hasNonEmptyEnvVarConstant("ZIG_PARALLEL_SEMA");
     }
 
     var job_ns: [@typeInfo(Job.Tag).@"enum".fields.len]u64 = @splat(0);
