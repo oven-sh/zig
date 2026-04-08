@@ -17699,6 +17699,36 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ai
 
                 try ty.resolveStructFieldInits(pt);
 
+                if (zcu.parallel_sema and std.process.hasNonEmptyEnvVarConstant("ZIG_TRACE_TYPEINFO")) diag: {
+                    var any_none_name: bool = false;
+                    var any_none_ty: bool = false;
+                    const n = struct_type.field_types.len;
+                    var idx: u32 = 0;
+                    while (idx < n) : (idx += 1) {
+                        if (struct_type.fieldName(ip, idx) == .none) any_none_name = true;
+                        if (struct_type.field_types.get(ip)[idx] == .none) any_none_ty = true;
+                    }
+                    if (!any_none_name and !any_none_ty) break :diag;
+                    std.debug.print(
+                        "TYPEINFO-RACE struct={f} fields_len={d} haveFieldTypes={} haveFieldInits={} names_map_count={d}\n",
+                        .{
+                            struct_type.name.fmt(ip),
+                            n,
+                            struct_type.haveFieldTypes(ip),
+                            struct_type.haveFieldInits(ip),
+                            if (struct_type.names_map.unwrap()) |m| m.get(ip).count() else 0,
+                        },
+                    );
+                    idx = 0;
+                    while (idx < n) : (idx += 1) {
+                        const nm = struct_type.fieldName(ip, idx);
+                        const ft = struct_type.field_types.get(ip)[idx];
+                        if (nm == .none or ft == .none)
+                            std.debug.print("  field[{d}] name={} type={}\n", .{ idx, nm, ft });
+                    }
+                    std.debug.dumpCurrentStackTrace(null);
+                }
+
                 for (struct_field_vals, 0..) |*field_val, field_index| {
                     const field_name = if (struct_type.fieldName(ip, field_index).unwrap()) |field_name|
                         field_name
@@ -35468,6 +35498,13 @@ fn structFields(
         extra_index += zir_field.init_body_len;
     }
 
+    // Re-store the last field type with release so the unlocked
+    // `haveFieldTypes` fast-path acquire sees all preceding name/type
+    // slot writes from this loop.
+    if (struct_type.field_types.len > 0) {
+        const types = struct_type.field_types.get(ip);
+        @atomicStore(InternPool.Index, &types[types.len - 1], types[types.len - 1], .release);
+    }
     struct_type.clearFieldTypesWip(ip);
     if (!any_inits) struct_type.setHaveFieldInits(ip);
 

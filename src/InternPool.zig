@@ -4180,7 +4180,10 @@ pub const LoadedStructType = struct {
 
     pub fn haveFieldTypes(s: LoadedStructType, ip: *const InternPool) bool {
         const types = s.field_types.get(ip);
-        return types.len == 0 or types[types.len - 1] != .none;
+        if (types.len == 0) return true;
+        // Paired with release-store at the end of `structFields` so a true
+        // result here makes the preceding name/type slot writes visible.
+        return @atomicLoad(Index, &types[types.len - 1], .acquire) != .none;
     }
 
     pub fn haveFieldInits(s: LoadedStructType, ip: *const InternPool) bool {
