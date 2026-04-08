@@ -7564,11 +7564,9 @@ fn analyzeCall(
             } else resolved_ret_ty;
 
             // We now need to actually create the function instance.
-            // `getFuncInstanceIes` holds up to four shard mutexes at once; under
-            // parallel Sema concurrent calls can ABBA-deadlock on those shards.
-            // Serialize via sema_lock.
-            zcu.semaLock();
-            const func_instance = ip.getFuncInstance(gpa, pt.tid, .{
+            // `getFuncInstanceIes` takes its 4 shard mutexes in sorted order
+            // via `lockShardsSorted`, so concurrent calls cannot ABBA-deadlock.
+            const func_instance = try ip.getFuncInstance(gpa, pt.tid, .{
                 .param_types = runtime_param_tys.items,
                 .noalias_bits = noalias_bits,
                 .bare_return_type = bare_ret_ty.toIntern(),
@@ -7576,11 +7574,7 @@ fn analyzeCall(
                 .inferred_error_set = fn_zir_info.inferred_error_set,
                 .generic_owner = func_val.?.toIntern(),
                 .comptime_args = comptime_args,
-            }) catch |err| {
-                zcu.semaUnlock();
-                return err;
-            };
-            zcu.semaUnlock();
+            });
             if (zcu.comp.debugIncremental()) {
                 const nav = ip.indexToKey(func_instance).func.owner_nav;
                 const gop = try zcu.incremental_debug_state.navs.getOrPut(gpa, nav);
@@ -7915,12 +7909,25 @@ fn analyzeCall(
     if (block.isComptime()) {
         const result_val = (try sema.resolveValue(maybe_opv)).?;
         if (want_memoize and sema.allow_memoize and !result_val.canMutateComptimeVarState(zcu)) {
-            _ = try pt.intern(.{ .memoized_call = .{
+            const memo_idx = try pt.intern(.{ .memoized_call = .{
                 .func = func_val.?.toIntern(),
                 .arg_values = memoized_arg_values,
                 .result = result_val.toIntern(),
                 .branch_count = sema.branch_count - old_branch_count,
             } });
+            // Under parallel Sema two threads can compute the same comptime
+            // call and observe different intermediate state (e.g. partial
+            // `@typeInfo` fields). The intern key ignores `result`, so the
+            // first thread to publish wins and the loser would otherwise
+            // silently adopt a wrong cached result. Detect the divergence and
+            // retry instead of returning the cached value.
+            if (zcu.parallel_sema) {
+                const cached = ip.indexToKey(memo_idx).memoized_call.result;
+                if (cached != result_val.toIntern()) {
+                    Zcu.tls_retry_loop = sema.owner;
+                    return error.AnalysisFail;
+                }
+            }
         }
     }
 
@@ -17700,6 +17707,20 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ai
                 struct_field_vals = try gpa.alloc(InternPool.Index, struct_type.field_types.len);
 
                 try ty.resolveStructFieldInits(pt);
+
+                // Under parallel Sema another thread may have left names/types
+                // partially populated when our `haveFieldInits`/`haveFieldTypes`
+                // fast-path observed a stale "done" flag. A wrong `@typeInfo`
+                // result here is permanently memoized via the comptime-call
+                // cache, so guard: if any slot is `.none`, retry the outer job.
+                if (zcu.parallel_sema) for (0..struct_type.field_types.len) |gi| {
+                    if (struct_type.fieldName(ip, gi) == .none or
+                        struct_type.field_types.get(ip)[gi] == .none)
+                    {
+                        Zcu.tls_retry_loop = .wrap(.{ .type = ty.toIntern() });
+                        return error.AnalysisFail;
+                    }
+                };
 
                 if (zcu.parallel_sema and std.process.hasNonEmptyEnvVarConstant("ZIG_TRACE_TYPEINFO")) diag: {
                     var any_none_name: bool = false;

@@ -3844,6 +3844,27 @@ pub const LoadedStructType = struct {
         @memcpy(s.field_types.get(ip), types);
     }
 
+    pub fn setOffset(s: LoadedStructType, ip: *InternPool, i: usize, off: u32) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        s.offsets.get(ip)[i] = off;
+    }
+
+    pub fn setOffsetsAll(s: LoadedStructType, ip: *InternPool, offs: []const u32) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        @memcpy(s.offsets.get(ip), offs);
+    }
+
+    pub fn setRuntimeOrderAll(s: LoadedStructType, ip: *InternPool, ro: []const RuntimeOrder) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        @memcpy(s.runtime_order.get(ip), ro);
+    }
+
     pub fn setFieldInitsAll(s: LoadedStructType, ip: *InternPool, inits: []const Index) void {
         const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
         extra_mutex.lock();
@@ -3872,27 +3893,6 @@ pub const LoadedStructType = struct {
         defer extra_mutex.unlock();
         @memcpy(s.field_types.get(ip), types);
         if (aligns) |a| if (s.field_aligns.len != 0) @memcpy(s.field_aligns.get(ip), a);
-    }
-
-    pub fn setOffset(s: LoadedStructType, ip: *InternPool, i: usize, off: u32) void {
-        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
-        extra_mutex.lock();
-        defer extra_mutex.unlock();
-        s.offsets.get(ip)[i] = off;
-    }
-
-    pub fn setOffsetsAll(s: LoadedStructType, ip: *InternPool, offs: []const u32) void {
-        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
-        extra_mutex.lock();
-        defer extra_mutex.unlock();
-        @memcpy(s.offsets.get(ip), offs);
-    }
-
-    pub fn setRuntimeOrderAll(s: LoadedStructType, ip: *InternPool, ro: []const RuntimeOrder) void {
-        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
-        extra_mutex.lock();
-        defer extra_mutex.unlock();
-        @memcpy(s.runtime_order.get(ip), ro);
     }
 
     pub fn fieldAlign(s: LoadedStructType, ip: *const InternPool, i: usize) Alignment {
@@ -7796,6 +7796,9 @@ const GetOrPutKey = union(enum) {
         tid: Zcu.PerThread.Id,
         shard: *Shard,
         map_index: u32,
+        /// When true, the caller already holds `shard.mutate.map.mutex`
+        /// (via `lockShardsSorted`) and `putFinal`/`cancel` must not unlock.
+        prelocked: bool = false,
     },
 
     fn put(gop: *GetOrPutKey) Index {
@@ -7828,7 +7831,7 @@ const GetOrPutKey = union(enum) {
             .new => |info| {
                 assert(info.shard.shared.map.entries[info.map_index].value == index);
                 info.shard.mutate.map.len += 1;
-                info.shard.mutate.map.mutex.unlock();
+                if (!info.prelocked) info.shard.mutate.map.mutex.unlock();
                 gop.* = .{ .existing = index };
             },
         }
@@ -7837,7 +7840,7 @@ const GetOrPutKey = union(enum) {
     fn cancel(gop: *GetOrPutKey) void {
         switch (gop.*) {
             .existing => {},
-            .new => |info| info.shard.mutate.map.mutex.unlock(),
+            .new => |info| if (!info.prelocked) info.shard.mutate.map.mutex.unlock(),
         }
         gop.* = .{ .existing = undefined };
     }
@@ -7897,7 +7900,7 @@ fn getOrPutKey(
     tid: Zcu.PerThread.Id,
     key: Key,
 ) Allocator.Error!GetOrPutKey {
-    return ip.getOrPutKeyEnsuringAdditionalCapacity(gpa, tid, key, 0);
+    return ip.getOrPutKeyInner(gpa, tid, key, 0, false);
 }
 fn getOrPutKeyEnsuringAdditionalCapacity(
     ip: *InternPool,
@@ -7906,6 +7909,28 @@ fn getOrPutKeyEnsuringAdditionalCapacity(
     key: Key,
     additional_capacity: u32,
 ) Allocator.Error!GetOrPutKey {
+    return ip.getOrPutKeyInner(gpa, tid, key, additional_capacity, false);
+}
+/// Like `getOrPutKeyEnsuringAdditionalCapacity` but assumes the caller already
+/// holds `shard.mutate.map.mutex` for this key's shard (via `lockShardsSorted`).
+/// The returned `.new` will not unlock on `putFinal`/`cancel`/`deinit`.
+fn getOrPutKeyPrelocked(
+    ip: *InternPool,
+    gpa: Allocator,
+    tid: Zcu.PerThread.Id,
+    key: Key,
+    additional_capacity: u32,
+) Allocator.Error!GetOrPutKey {
+    return ip.getOrPutKeyInner(gpa, tid, key, additional_capacity, true);
+}
+fn getOrPutKeyInner(
+    ip: *InternPool,
+    gpa: Allocator,
+    tid: Zcu.PerThread.Id,
+    key: Key,
+    additional_capacity: u32,
+    prelocked: bool,
+) Allocator.Error!GetOrPutKey {
     const full_hash = key.hash64(ip);
     const hash: u32 = @truncate(full_hash >> 32);
     const shard = &ip.shards[@intCast(full_hash & (ip.shards.len - 1))];
@@ -7913,17 +7938,19 @@ fn getOrPutKeyEnsuringAdditionalCapacity(
     const Map = @TypeOf(map);
     var map_mask = map.header().mask();
     var map_index = hash;
-    while (true) : (map_index += 1) {
-        map_index &= map_mask;
-        const entry = &map.entries[map_index];
-        const index = entry.acquire();
-        if (index == .none) break;
-        if (entry.hash != hash) continue;
-        if (index.unwrap(ip).getTag(ip) == .removed) continue;
-        if (ip.indexToKey(index).eql(key, ip)) return .{ .existing = index };
+    if (!prelocked) {
+        while (true) : (map_index += 1) {
+            map_index &= map_mask;
+            const entry = &map.entries[map_index];
+            const index = entry.acquire();
+            if (index == .none) break;
+            if (entry.hash != hash) continue;
+            if (index.unwrap(ip).getTag(ip) == .removed) continue;
+            if (ip.indexToKey(index).eql(key, ip)) return .{ .existing = index };
+        }
+        shard.mutate.map.mutex.lock();
     }
-    shard.mutate.map.mutex.lock();
-    errdefer shard.mutate.map.mutex.unlock();
+    errdefer if (!prelocked) shard.mutate.map.mutex.unlock();
     if (map.entries != shard.shared.map.entries) {
         map = shard.shared.map;
         map_mask = map.header().mask();
@@ -7936,7 +7963,7 @@ fn getOrPutKeyEnsuringAdditionalCapacity(
         if (index == .none) break;
         if (entry.hash != hash) continue;
         if (ip.indexToKey(index).eql(key, ip)) {
-            defer shard.mutate.map.mutex.unlock();
+            if (!prelocked) shard.mutate.map.mutex.unlock();
             return .{ .existing = index };
         }
     }
@@ -7992,7 +8019,39 @@ fn getOrPutKeyEnsuringAdditionalCapacity(
         .tid = tid,
         .shard = shard,
         .map_index = map_index,
+        .prelocked = prelocked,
     } };
+}
+
+/// Compute the shard index for `key` (matches `getOrPutKeyInner`).
+fn keyShardIndex(ip: *const InternPool, key: Key) u32 {
+    return @intCast(key.hash64(ip) & (ip.shards.len - 1));
+}
+
+/// Lock the shard mutexes for the given keys in ascending shard-index order
+/// so concurrent multi-key inserters cannot ABBA-deadlock. Returns the count
+/// of distinct shards locked, written to `out`. Caller must unlock each via
+/// `ip.shards[out[i]].mutate.map.mutex.unlock()` in any order.
+fn lockShardsSorted(
+    ip: *InternPool,
+    keys: []const Key,
+    out: []u32,
+) usize {
+    assert(out.len >= keys.len);
+    var n: usize = 0;
+    for (keys) |k| {
+        const s = ip.keyShardIndex(k);
+        // dedupe: skip if already present
+        for (out[0..n]) |existing| {
+            if (existing == s) break;
+        } else {
+            out[n] = s;
+            n += 1;
+        }
+    }
+    std.mem.sort(u32, out[0..n], {}, std.sort.asc(u32));
+    for (out[0..n]) |s| ip.shards[s].mutate.map.mutex.lock();
+    return n;
 }
 /// Like `getOrPutKey`, but asserts that the key already exists, and prepares to replace
 /// its shard entry with a new `Index` anyway. After finalizing this, the old index remains
@@ -9694,9 +9753,19 @@ pub fn getFuncDeclIes(
         extra.mutate.len = prev_extra_len;
     }
 
-    var func_gop = try ip.getOrPutKeyEnsuringAdditionalCapacity(gpa, tid, .{
-        .func = extraFuncDecl(tid, extra.list.*, func_decl_extra_index),
-    }, 3);
+    const func_key: Key = .{ .func = extraFuncDecl(tid, extra.list.*, func_decl_extra_index) };
+    const eu_key: Key = .{ .error_union_type = .{
+        .error_set_type = error_set_type,
+        .payload_type = key.bare_return_type,
+    } };
+    const es_key: Key = .{ .inferred_error_set_type = func_index };
+    const fty_key: Key = .{ .func_type = extraFuncType(tid, extra.list.*, func_type_extra_index) };
+
+    var locked_shards: [4]u32 = undefined;
+    const n_locked = ip.lockShardsSorted(&.{ func_key, eu_key, es_key, fty_key }, &locked_shards);
+    defer for (locked_shards[0..n_locked]) |s| ip.shards[s].mutate.map.mutex.unlock();
+
+    var func_gop = try ip.getOrPutKeyPrelocked(gpa, tid, func_key, 3);
     defer func_gop.deinit();
     if (func_gop == .existing) {
         // An existing function type was found; undo the additions to our two arrays.
@@ -9715,20 +9784,13 @@ pub fn getFuncDeclIes(
         return func_gop.existing;
     }
     func_gop.putTentative(func_index);
-    var error_union_type_gop = try ip.getOrPutKeyEnsuringAdditionalCapacity(gpa, tid, .{ .error_union_type = .{
-        .error_set_type = error_set_type,
-        .payload_type = key.bare_return_type,
-    } }, 2);
+    var error_union_type_gop = try ip.getOrPutKeyPrelocked(gpa, tid, eu_key, 2);
     defer error_union_type_gop.deinit();
     error_union_type_gop.putTentative(error_union_type);
-    var error_set_type_gop = try ip.getOrPutKeyEnsuringAdditionalCapacity(gpa, tid, .{
-        .inferred_error_set_type = func_index,
-    }, 1);
+    var error_set_type_gop = try ip.getOrPutKeyPrelocked(gpa, tid, es_key, 1);
     defer error_set_type_gop.deinit();
     error_set_type_gop.putTentative(error_set_type);
-    var func_ty_gop = try ip.getOrPutKey(gpa, tid, .{
-        .func_type = extraFuncType(tid, extra.list.*, func_type_extra_index),
-    });
+    var func_ty_gop = try ip.getOrPutKeyPrelocked(gpa, tid, fty_key, 0);
     defer func_ty_gop.deinit();
     func_ty_gop.putTentative(func_ty);
 
@@ -9990,9 +10052,21 @@ pub fn getFuncInstanceIes(
         extra.mutate.len = prev_extra_len;
     }
 
-    var func_gop = try ip.getOrPutKeyEnsuringAdditionalCapacity(gpa, tid, .{
-        .func = ip.extraFuncInstance(tid, extra.list.*, func_extra_index),
-    }, 3);
+    const func_key: Key = .{ .func = ip.extraFuncInstance(tid, extra.list.*, func_extra_index) };
+    const eu_key: Key = .{ .error_union_type = .{
+        .error_set_type = error_set_type,
+        .payload_type = arg.bare_return_type,
+    } };
+    const es_key: Key = .{ .inferred_error_set_type = func_index };
+    const fty_key: Key = .{ .func_type = extraFuncType(tid, extra.list.*, func_type_extra_index) };
+
+    // Four shard mutexes are held simultaneously below; lock in sorted order
+    // so concurrent callers cannot ABBA-deadlock.
+    var locked_shards: [4]u32 = undefined;
+    const n_locked = ip.lockShardsSorted(&.{ func_key, eu_key, es_key, fty_key }, &locked_shards);
+    defer for (locked_shards[0..n_locked]) |s| ip.shards[s].mutate.map.mutex.unlock();
+
+    var func_gop = try ip.getOrPutKeyPrelocked(gpa, tid, func_key, 3);
     defer func_gop.deinit();
     if (func_gop == .existing) {
         // Hot path: undo the additions to our two arrays.
@@ -10001,20 +10075,13 @@ pub fn getFuncInstanceIes(
         return func_gop.existing;
     }
     func_gop.putTentative(func_index);
-    var error_union_type_gop = try ip.getOrPutKeyEnsuringAdditionalCapacity(gpa, tid, .{ .error_union_type = .{
-        .error_set_type = error_set_type,
-        .payload_type = arg.bare_return_type,
-    } }, 2);
+    var error_union_type_gop = try ip.getOrPutKeyPrelocked(gpa, tid, eu_key, 2);
     defer error_union_type_gop.deinit();
     error_union_type_gop.putTentative(error_union_type);
-    var error_set_type_gop = try ip.getOrPutKeyEnsuringAdditionalCapacity(gpa, tid, .{
-        .inferred_error_set_type = func_index,
-    }, 1);
+    var error_set_type_gop = try ip.getOrPutKeyPrelocked(gpa, tid, es_key, 1);
     defer error_set_type_gop.deinit();
     error_set_type_gop.putTentative(error_set_type);
-    var func_ty_gop = try ip.getOrPutKey(gpa, tid, .{
-        .func_type = extraFuncType(tid, extra.list.*, func_type_extra_index),
-    });
+    var func_ty_gop = try ip.getOrPutKeyPrelocked(gpa, tid, fty_key, 0);
     defer func_ty_gop.deinit();
     func_ty_gop.putTentative(func_ty);
     try finishFuncInstance(
