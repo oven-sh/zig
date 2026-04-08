@@ -1811,11 +1811,16 @@ pub const Object = struct {
         if (!self.ownsNav(zcu, nav_index)) return;
         const ip = &zcu.intern_pool;
         const global_index = self.nav_map.get(nav_index) orelse gi: {
-            // The nav was exported but its `link_nav` job never ran (likely a
-            // post-commit retry under parallel Sema). Emit it now so the
-            // export aliases have a definition to point at.
-            try self.updateNav(pt, nav_index);
-            break :gi self.nav_map.get(nav_index).?;
+            // The nav was exported but its `link_nav` / `codegen_func` job
+            // never ran (likely a post-commit retry under parallel Sema). Emit
+            // it now so the export aliases have a definition to point at.
+            switch (ip.indexToKey(ip.getNav(nav_index).status.fully_resolved.val)) {
+                .func => break :gi (try self.resolveLlvmFunction(pt, nav_index)).ptrConst(&self.builder).global,
+                else => {
+                    try self.updateNav(pt, nav_index);
+                    break :gi self.nav_map.get(nav_index).?;
+                },
+            }
         };
         const comp = zcu.comp;
 
