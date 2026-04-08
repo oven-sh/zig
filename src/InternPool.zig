@@ -7782,9 +7782,13 @@ pub const wip_namespace_sentinel: u32 = std.math.maxInt(u32);
 pub fn awaitNamespaceTypeFinished(ip: *const InternPool, ty: Index) void {
     const ns_idx = ip.namespaceTypeNamespaceExtraIndex(ty) orelse return;
     const unwrapped = ty.unwrap(ip);
-    const extra = ip.getLocalShared(unwrapped.tid).extra.acquire();
-    const slot: *const u32 = &extra.view().items(.@"0")[ns_idx];
-    while (@atomicLoad(u32, slot, .acquire) == wip_namespace_sentinel) {
+    while (true) {
+        // Re-acquire the shared view each iteration: the owning tid may
+        // realloc its extra array between `getStructType` and `finish`, which
+        // would leave a cached slot pointer dangling at the old buffer.
+        const extra = ip.getLocalShared(unwrapped.tid).extra.acquire();
+        const slot: *const u32 = &extra.view().items(.@"0")[ns_idx];
+        if (@atomicLoad(u32, slot, .acquire) != wip_namespace_sentinel) return;
         std.atomic.spinLoopHint();
     }
 }
@@ -8972,6 +8976,12 @@ pub const WipNamespaceType = struct {
     }
 
     pub fn cancel(wip: WipNamespaceType, ip: *InternPool, tid: Zcu.PerThread.Id) void {
+        // Clear the wip sentinel so any thread spinning in
+        // `awaitNamespaceTypeFinished` exits instead of livelocking; the
+        // index is then removed so subsequent lookups won't see this entry.
+        const extra = ip.getLocalShared(wip.tid).extra.acquire();
+        const extra_items = extra.view().items(.@"0");
+        @atomicStore(u32, &extra_items[wip.namespace_extra_index], 0, .release);
         ip.remove(tid, wip.index);
     }
 
@@ -10061,6 +10071,11 @@ pub const WipEnumType = struct {
     }
 
     pub fn cancel(wip: WipEnumType, ip: *InternPool, tid: Zcu.PerThread.Id) void {
+        // Clear the wip sentinel so any thread spinning in
+        // `awaitNamespaceTypeFinished` exits instead of livelocking.
+        const extra = ip.getLocalShared(wip.tid).extra.acquire();
+        const extra_items = extra.view().items(.@"0");
+        @atomicStore(u32, &extra_items[wip.namespace_extra_index], 0, .release);
         ip.remove(tid, wip.index);
     }
 

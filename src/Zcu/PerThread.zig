@@ -2902,9 +2902,7 @@ fn analyzeFnBodyInner(pt: Zcu.PerThread, func_index: InternPool.Index) Zcu.SemaE
     const zir = file.zir.?;
 
     try zcu.aipPut(gpa, anal_unit);
-    errdefer if (!zcu.parallel_sema) {
-        _ = zcu.analysis_in_progress.swapRemove(anal_unit);
-    };
+    errdefer zcu.aipRemove(anal_unit);
 
     func.setAnalyzed(ip);
     if (func.analysisUnordered(ip).inferred_error_set) {
