@@ -2662,6 +2662,9 @@ pub fn scanNamespace(
 
     zcu.semaLock();
     defer zcu.semaUnlock();
+    // Another thread may have already scanned this namespace (e.g. via
+    // ensureNamespaceUpToDate before the creator reached its own scan).
+    if (zcu.parallel_sema and namespace.generation == zcu.generation) return;
 
     const tracked_unit = zcu.trackUnitSema(
         Type.fromInterned(namespace.owner_type).containerTypeName(ip).toSlice(ip),
@@ -2702,6 +2705,10 @@ pub fn scanNamespace(
 
     var seen_decls: std.AutoHashMapUnmanaged(InternPool.NullTerminatedString, void) = .empty;
     defer seen_decls.deinit(gpa);
+
+    // Mark stale before clearing so a concurrent fast-path reader cannot
+    // observe gen==current with an emptied map during a re-scan.
+    @atomicStore(u32, &namespace.generation, zcu.generation -% 1, .release);
 
     namespace.pub_decls.clearRetainingCapacity();
     namespace.priv_decls.clearRetainingCapacity();
