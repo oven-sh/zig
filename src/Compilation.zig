@@ -5208,12 +5208,11 @@ fn performAllTheWork(
             if (zcu.parallel_sema and export_func_pass < 3) {
                 export_func_pass += 1;
                 var any_queued = false;
-                var it = zcu.single_exports.valueIterator();
-                while (it.next()) |idx| any_queued = ensureExportFuncQueued(zcu, idx.*) or any_queued;
-                var it2 = zcu.multi_exports.valueIterator();
-                while (it2.next()) |info| for (zcu.all_exports.items[info.index..][0..info.len], info.index..) |_, i| {
-                    any_queued = ensureExportFuncQueued(zcu, @enumFromInt(i)) or any_queued;
-                };
+                for (zcu.single_exports.values()) |idx|
+                    any_queued = ensureExportFuncQueued(zcu, idx) or any_queued;
+                for (zcu.multi_exports.values()) |info|
+                    for (info.index..info.index + info.len) |i|
+                        any_queued = ensureExportFuncQueued(zcu, @enumFromInt(i)) or any_queued;
                 if (any_queued) continue;
             }
             zcu.sema_prog_node.end();

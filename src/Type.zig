@@ -443,7 +443,10 @@ pub fn hasRuntimeBits(ty: Type, zcu: *const Zcu) bool {
 
 pub fn hasRuntimeBitsSema(ty: Type, pt: Zcu.PerThread) SemaError!bool {
     return hasRuntimeBitsInner(ty, false, .sema, pt.zcu, pt.tid) catch |err| switch (err) {
-        error.NeedLazy => unreachable, // this would require a resolve strat of lazy
+        // .sema strat cannot return NeedLazy, but under parallel-Sema races a
+        // partially-populated field type can confuse the inner switches. Treat
+        // it as AnalysisFail so the retry mechanism handles it instead of UB.
+        error.NeedLazy => if (pt.zcu.parallel_sema) error.AnalysisFail else unreachable,
         else => |e| return e,
     };
 }
