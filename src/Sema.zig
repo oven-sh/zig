@@ -3291,7 +3291,6 @@ fn zirEnumDecl(
         .generation = zcu.generation -% 1,
     });
     errdefer if (!done) pt.destroyNamespace(new_namespace_index);
-    wip_ty.prepare(ip, new_namespace_index);
 
     try pt.scanNamespace(new_namespace_index, decls);
 
@@ -3303,7 +3302,16 @@ fn zirEnumDecl(
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
     done = true;
 
+    // Defer clearing the namespace sentinel until after field names are
+    // populated so a parallel `enumFieldIndex` reader that awaits on it sees
+    // the full names_map. Same-thread recursion (a field value referencing an
+    // earlier field) is unblocked via `tls_wip_types`. On error past
+    // `done=true`, prepare() still publishes the namespace so readers don't
+    // spin forever; the partial enum is reported via `failed_analysis`.
+    zcu.wipTypeEnter(wip_ty.index) catch {};
     {
+        defer zcu.wipTypeExit(wip_ty.index);
+        defer wip_ty.prepare(ip, new_namespace_index);
         const tracked_unit = zcu.trackUnitSema(type_name.name.toSlice(ip), null);
         defer tracked_unit.end(zcu);
         try Sema.resolveDeclaredEnum(
@@ -21125,13 +21133,16 @@ fn reifyEnum(
         .file_scope = block.getFileScopeIndex(zcu),
         .generation = zcu.generation,
     });
-    wip_ty.prepare(ip, new_namespace_index);
 
     try sema.declareDependency(.{ .interned = wip_ty.index });
     try sema.addTypeReferenceEntry(src, wip_ty.index);
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
     wip_ty.setTagTy(ip, tag_ty.toIntern());
     done = true;
+
+    zcu.wipTypeEnter(wip_ty.index) catch {};
+    defer zcu.wipTypeExit(wip_ty.index);
+    defer wip_ty.prepare(ip, new_namespace_index);
 
     for (0..fields_len) |field_idx| {
         const field_info = try fields_val.elemValue(pt, field_idx);

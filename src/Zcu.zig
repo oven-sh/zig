@@ -3663,8 +3663,27 @@ pub fn semaReacquire(zcu: *Zcu, depth: u32) void {
     zcu.sema_lock_depth = depth;
 }
 
-pub fn awaitNamespaceTypeFinished(zcu: *Zcu, ty: InternPool.Index) void {
+/// Types this thread is currently in the wip-populate phase for. The
+/// namespace sentinel for these is intentionally still set; same-thread
+/// recursion (e.g. an enum field value referencing an earlier field) must
+/// not spin on it.
+threadlocal var tls_wip_types: std.AutoArrayHashMapUnmanaged(InternPool.Index, void) = .empty;
+
+pub fn wipTypeEnter(zcu: *Zcu, ty: InternPool.Index) Allocator.Error!void {
     if (!zcu.parallel_sema) return;
+    try tls_wip_types.put(zcu.gpa, ty, {});
+}
+pub fn wipTypeExit(zcu: *Zcu, ty: InternPool.Index) void {
+    if (!zcu.parallel_sema) return;
+    _ = tls_wip_types.swapRemove(ty);
+}
+
+pub fn awaitNamespaceTypeFinished(zcu: *Zcu, ty: InternPool.Index) void {
+    awaitNamespaceTypeFinishedConst(zcu, ty);
+}
+pub fn awaitNamespaceTypeFinishedConst(zcu: *const Zcu, ty: InternPool.Index) void {
+    if (!zcu.parallel_sema) return;
+    if (tls_wip_types.contains(ty)) return;
     zcu.intern_pool.awaitNamespaceTypeFinished(ty);
 }
 
