@@ -654,11 +654,13 @@ pub fn ensureMemoizedStateUpToDate(pt: Zcu.PerThread, stage: InternPool.Memoized
     }
     defer zcu.releaseClaim(unit);
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    const need_sema_lock = !zcu.parallel_sema or zcu.comp.incremental;
+    if (need_sema_lock) zcu.semaLock();
+    defer if (need_sema_lock) zcu.semaUnlock();
     if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(unit));
 
-    const was_outdated = zcu.outdated.swapRemove(unit) or zcu.potentially_outdated.swapRemove(unit);
+    const was_outdated = zcu.comp.incremental and
+        (zcu.outdated.swapRemove(unit) or zcu.potentially_outdated.swapRemove(unit));
     const prev_failed = zcu.anyAnalysisFailed(unit);
 
     if (was_outdated) {
@@ -813,8 +815,9 @@ pub fn ensureComptimeUnitUpToDate(pt: Zcu.PerThread, cu_id: InternPool.ComptimeU
     }
     defer zcu.releaseClaim(anal_unit);
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    const need_sema_lock = !zcu.parallel_sema or zcu.comp.incremental;
+    if (need_sema_lock) zcu.semaLock();
+    defer if (need_sema_lock) zcu.semaUnlock();
     if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(anal_unit));
 
     // Determine whether or not this `ComptimeUnit` is outdated. For this kind of `AnalUnit`, that's
@@ -825,12 +828,20 @@ pub fn ensureComptimeUnitUpToDate(pt: Zcu.PerThread, cu_id: InternPool.ComptimeU
     // ensure that the unit is definitely up-to-date when this function returns. This mechanism could
     // result in over-analysis if analysis occurs in a poor order; we do our best to avoid this by
     // carefully choosing which units to re-analyze. See `Zcu.findOutdatedToAnalyze`.
+    //
+    // comptime units are put in `outdated` by scanDecl even non-incrementally,
+    // so this check is unconditional but uses `outdated_mutex` when sema_lock
+    // is not held.
 
-    const was_outdated = zcu.outdated.swapRemove(anal_unit) or
-        zcu.potentially_outdated.swapRemove(anal_unit);
+    const was_outdated = blk: {
+        if (!need_sema_lock) zcu.outdated_mutex.lock();
+        defer if (!need_sema_lock) zcu.outdated_mutex.unlock();
+        const o = zcu.outdated.swapRemove(anal_unit) or zcu.potentially_outdated.swapRemove(anal_unit);
+        if (o) _ = zcu.outdated_ready.swapRemove(anal_unit);
+        break :blk o;
+    };
 
     if (was_outdated) {
-        _ = zcu.outdated_ready.swapRemove(anal_unit);
         // `was_outdated` can be true in the initial update for comptime units, so this isn't a `dev.check`.
         if (dev.env.supports(.incremental)) {
             zcu.deleteUnitExports(anal_unit);
@@ -1009,8 +1020,15 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
     };
     defer zcu.releaseClaim(anal_unit);
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    // Under parallel + non-incremental, `outdated`/`potentially_outdated` are
+    // always empty so `was_outdated` is always false; nav_queued and
+    // failed_analysis have their own mutexes; the body's Sema writes go
+    // through per-map mutexes. The whole-function sema_lock is the largest
+    // serializer in the profile and is only needed for incremental
+    // bookkeeping.
+    const need_sema_lock = !zcu.parallel_sema or zcu.comp.incremental;
+    if (need_sema_lock) zcu.semaLock();
+    defer if (need_sema_lock) zcu.semaUnlock();
 
     {
         zcu.nav_queued_mutex.lock();
@@ -1029,8 +1047,8 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
     // result in over-analysis if analysis occurs in a poor order; we do our best to avoid this by
     // carefully choosing which units to re-analyze. See `Zcu.findOutdatedToAnalyze`.
 
-    const was_outdated = zcu.outdated.swapRemove(anal_unit) or
-        zcu.potentially_outdated.swapRemove(anal_unit);
+    const was_outdated = zcu.comp.incremental and
+        (zcu.outdated.swapRemove(anal_unit) or zcu.potentially_outdated.swapRemove(anal_unit));
 
     const prev_failed = zcu.anyAnalysisFailed(anal_unit);
 
@@ -1469,8 +1487,9 @@ pub fn ensureNavTypeUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zc
     }
     defer zcu.releaseClaim(anal_unit);
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    const need_sema_lock = !zcu.parallel_sema or zcu.comp.incremental;
+    if (need_sema_lock) zcu.semaLock();
+    defer if (need_sema_lock) zcu.semaUnlock();
     if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(anal_unit));
 
     const type_resolved_by_value: bool = from_val: {
@@ -1494,8 +1513,8 @@ pub fn ensureNavTypeUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zc
     // result in over-analysis if analysis occurs in a poor order; we do our best to avoid this by
     // carefully choosing which units to re-analyze. See `Zcu.findOutdatedToAnalyze`.
 
-    const was_outdated = zcu.outdated.swapRemove(anal_unit) or
-        zcu.potentially_outdated.swapRemove(anal_unit);
+    const was_outdated = zcu.comp.incremental and
+        (zcu.outdated.swapRemove(anal_unit) or zcu.potentially_outdated.swapRemove(anal_unit));
 
     const prev_failed = zcu.anyAnalysisFailed(anal_unit);
 
@@ -1740,15 +1759,16 @@ pub fn ensureFuncBodyUpToDate(pt: Zcu.PerThread, func_index: InternPool.Index) Z
     };
     defer zcu.releaseClaim(anal_unit);
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    const need_sema_lock = !zcu.parallel_sema or zcu.comp.incremental;
+    if (need_sema_lock) zcu.semaLock();
+    defer if (need_sema_lock) zcu.semaUnlock();
 
-    _ = zcu.func_body_analysis_queued.swapRemove(func_index);
+    if (!zcu.parallel_sema) _ = zcu.func_body_analysis_queued.swapRemove(func_index);
 
     if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(anal_unit));
 
-    const was_outdated = zcu.outdated.swapRemove(anal_unit) or
-        zcu.potentially_outdated.swapRemove(anal_unit);
+    const was_outdated = zcu.comp.incremental and
+        (zcu.outdated.swapRemove(anal_unit) or zcu.potentially_outdated.swapRemove(anal_unit));
 
     const prev_failed = zcu.anyAnalysisFailed(anal_unit);
 
@@ -2878,6 +2898,8 @@ const ScanDeclIter = struct {
                 if (existing_unit == null) {
                     // For a `comptime` declaration, whether to analyze is based solely on whether the unit
                     // is outdated. So, add this fresh one to `outdated` and `outdated_ready`.
+                    zcu.outdated_mutex.lock();
+                    defer zcu.outdated_mutex.unlock();
                     try zcu.outdated.ensureUnusedCapacity(gpa, 1);
                     try zcu.outdated_ready.ensureUnusedCapacity(gpa, 1);
                     zcu.outdated.putAssumeCapacityNoClobber(unit, 0);
@@ -3465,12 +3487,7 @@ pub fn populateTestFunctions(pt: Zcu.PerThread) Allocator.Error!void {
             {
                 // The test declaration might have failed; if that's the case, just return, as we'll
                 // be emitting a compile error anyway.
-                const anal_unit: AnalUnit = .wrap(.{ .nav_val = test_nav_index });
-                if (zcu.failed_analysis.contains(anal_unit) or
-                    zcu.transitive_failed_analysis.contains(anal_unit))
-                {
-                    return;
-                }
+                if (zcu.anyAnalysisFailed(.wrap(.{ .nav_val = test_nav_index }))) return;
             }
 
             const test_nav_name = test_nav.fqn;

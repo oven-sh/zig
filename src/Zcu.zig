@@ -110,6 +110,11 @@ exports_mutex: std.Thread.Mutex = .{},
 /// Guards `nav_val_analysis_queued` so `ensureNavValAnalysisQueued` does not
 /// contend on `sema_lock`.
 nav_queued_mutex: std.Thread.Mutex = .{},
+/// Guards `outdated` / `potentially_outdated` / `outdated_ready`. Under
+/// non-incremental these are only touched for comptime units (scanDecl marks
+/// fresh ones, ensureComptimeUnitUpToDate consumes), so this mutex is rarely
+/// contended.
+outdated_mutex: std.Thread.Mutex = .{},
 /// True while parallel Sema is enabled for this update.
 parallel_sema: bool = false,
 /// The number of codegen jobs which are pending or in-progress. Whichever thread drops this value

@@ -5327,8 +5327,7 @@ fn processOneJob(tid: usize, comp: *Compilation, job: Job) JobError!void {
             const zcu = comp.zcu.?;
             const nav = zcu.intern_pool.getNav(nav_index);
             if (nav.analysis != null) {
-                const unit: InternPool.AnalUnit = .wrap(.{ .nav_val = nav_index });
-                if (zcu.failed_analysis.contains(unit) or zcu.transitive_failed_analysis.contains(unit)) {
+                if (zcu.anyAnalysisFailed(.wrap(.{ .nav_val = nav_index }))) {
                     comp.link_prog_node.completeOne();
                     return;
                 }

@@ -3854,11 +3854,14 @@ fn resolveStructInner(
     const struct_obj = zcu.typeToStruct(ty).?;
     const owner: InternPool.AnalUnit = .wrap(.{ .type = ty.toIntern() });
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
-    if (zcu.failed_analysis.contains(owner) or zcu.transitive_failed_analysis.contains(owner)) {
-        return error.AnalysisFail;
-    }
+    // Under parallel + non-incremental, the wip-flag (setFieldTypesWip etc.)
+    // plus the retry-loop serialise concurrent attempts on this type, and
+    // every Zcu write inside the body uses a per-map mutex; the global
+    // sema_lock here is the largest single serializer in the profile.
+    const need_sema_lock = !zcu.parallel_sema or zcu.comp.incremental;
+    if (need_sema_lock) zcu.semaLock();
+    defer if (need_sema_lock) zcu.semaUnlock();
+    if (zcu.anyAnalysisFailed(owner)) return error.AnalysisFail;
     if (zcu.comp.debugIncremental()) {
         const info = try zcu.incremental_debug_state.getUnitInfo(gpa, owner);
         info.last_update_gen = zcu.generation;
@@ -3919,11 +3922,10 @@ fn resolveUnionInner(
     const union_obj = zcu.typeToUnion(ty).?;
     const owner: InternPool.AnalUnit = .wrap(.{ .type = ty.toIntern() });
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
-    if (zcu.failed_analysis.contains(owner) or zcu.transitive_failed_analysis.contains(owner)) {
-        return error.AnalysisFail;
-    }
+    const need_sema_lock = !zcu.parallel_sema or zcu.comp.incremental;
+    if (need_sema_lock) zcu.semaLock();
+    defer if (need_sema_lock) zcu.semaUnlock();
+    if (zcu.anyAnalysisFailed(owner)) return error.AnalysisFail;
     if (zcu.comp.debugIncremental()) {
         const info = try zcu.incremental_debug_state.getUnitInfo(gpa, owner);
         info.last_update_gen = zcu.generation;
