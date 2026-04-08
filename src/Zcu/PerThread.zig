@@ -644,18 +644,18 @@ pub fn ensureMemoizedStateUpToDate(pt: Zcu.PerThread, stage: InternPool.Memoized
         if (@atomicLoad(InternPool.Index, zcu.builtin_decl_values.getPtrConst(to_check), .acquire) != .none) return;
     }
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
     switch (try zcu.claimOrWait(unit)) {
         .claimed => {},
         .recursed => return error.AnalysisFail,
         .done => {
-            if (zcu.failed_analysis.contains(unit) or zcu.transitive_failed_analysis.contains(unit))
-                return error.AnalysisFail;
+            if (zcu.anyAnalysisFailed(unit)) return error.AnalysisFail;
             return;
         },
     }
     defer zcu.releaseClaim(unit);
+
+    zcu.semaLock();
+    defer zcu.semaUnlock();
     if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(unit));
 
     const was_outdated = zcu.outdated.swapRemove(unit) or zcu.potentially_outdated.swapRemove(unit);
@@ -806,18 +806,18 @@ pub fn ensureComptimeUnitUpToDate(pt: Zcu.PerThread, cu_id: InternPool.ComptimeU
 
     log.debug("ensureComptimeUnitUpToDate {f}", .{zcu.fmtAnalUnit(anal_unit)});
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
     switch (try zcu.claimOrWait(anal_unit)) {
         .claimed => {},
         .recursed => return error.AnalysisFail,
         .done => {
-            if (zcu.failed_analysis.contains(anal_unit) or zcu.transitive_failed_analysis.contains(anal_unit))
-                return error.AnalysisFail;
+            if (zcu.anyAnalysisFailed(anal_unit)) return error.AnalysisFail;
             return;
         },
     }
     defer zcu.releaseClaim(anal_unit);
+
+    zcu.semaLock();
+    defer zcu.semaUnlock();
     if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(anal_unit));
 
     // Determine whether or not this `ComptimeUnit` is outdated. For this kind of `AnalUnit`, that's
@@ -1006,19 +1006,22 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
 
     if (zcu.parallel_sema and !zcu.comp.incremental and nav.status == .fully_resolved) return;
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
-
-    switch (try zcu.claimOrWait(anal_unit)) {
-        .claimed => {},
+    claim: while (true) switch (try zcu.claimOrWait(anal_unit)) {
+        .claimed => break :claim,
         .recursed => return error.AnalysisFail,
         .done => {
-            if (zcu.failed_analysis.contains(anal_unit) or zcu.transitive_failed_analysis.contains(anal_unit))
-                return error.AnalysisFail;
-            return;
+            if (zcu.anyAnalysisFailed(anal_unit)) return error.AnalysisFail;
+            // The previous holder may have released its claim via a retry-abort
+            // (yield-and-requeue) without actually resolving the nav. Re-check
+            // the resolved status and loop back to claim if not.
+            if (ip.getNav(nav_id).status == .fully_resolved) return;
+            continue :claim;
         },
-    }
+    };
     defer zcu.releaseClaim(anal_unit);
+
+    zcu.semaLock();
+    defer zcu.semaUnlock();
 
     _ = zcu.nav_val_analysis_queued.swapRemove(nav_id);
 
@@ -1474,18 +1477,18 @@ pub fn ensureNavTypeUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zc
         .unresolved => {},
     };
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
     switch (try zcu.claimOrWait(anal_unit)) {
         .claimed => {},
         .recursed => return error.AnalysisFail,
         .done => {
-            if (zcu.failed_analysis.contains(anal_unit) or zcu.transitive_failed_analysis.contains(anal_unit))
-                return error.AnalysisFail;
+            if (zcu.anyAnalysisFailed(anal_unit)) return error.AnalysisFail;
             return;
         },
     }
     defer zcu.releaseClaim(anal_unit);
+
+    zcu.semaLock();
+    defer zcu.semaUnlock();
     if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(anal_unit));
 
     const type_resolved_by_value: bool = from_val: {
@@ -1743,14 +1746,20 @@ pub fn ensureFuncBodyUpToDate(pt: Zcu.PerThread, func_index: InternPool.Index) Z
     // `claimOrWait` self-locks `unit_claims_mutex`; we only take the global
     // `sema_lock` after the claim succeeds, so the (very hot) entry path no
     // longer contends on `sema_lock`.
-    switch (try zcu.claimOrWait(anal_unit)) {
-        .claimed => {},
+    claim: while (true) switch (try zcu.claimOrWait(anal_unit)) {
+        .claimed => break :claim,
         .recursed => return error.AnalysisFail,
         .done => {
             if (zcu.anyAnalysisFailed(anal_unit)) return error.AnalysisFail;
-            return;
+            // The previous holder may have released its claim via a retry-abort
+            // (yield-and-requeue) without actually finishing the body. Re-check
+            // the analyzed/IES status and loop back to claim if not.
+            const a = func.analysisUnordered(ip);
+            if (a.is_analyzed and
+                (!a.inferred_error_set or func.resolvedErrorSetUnordered(ip) != .none)) return;
+            continue :claim;
         },
-    }
+    };
     defer zcu.releaseClaim(anal_unit);
 
     zcu.semaLock();

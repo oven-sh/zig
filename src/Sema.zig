@@ -34523,7 +34523,7 @@ pub fn resolveStructLayout(sema: *Sema, ty: Type) SemaError!void {
     for (aligns, sizes, 0..) |*field_align, *field_size, i| {
         const field_ty: Type = .fromInterned(struct_type.field_types.get(ip)[i]);
         if (struct_type.fieldIsComptime(ip, i) or try field_ty.comptimeOnlySema(pt)) {
-            struct_type.offsets.get(ip)[i] = 0;
+            struct_type.setOffset(ip, @intCast(i), 0);
             field_size.* = 0;
             field_align.* = .none;
             continue;
@@ -34566,7 +34566,10 @@ pub fn resolveStructLayout(sema: *Sema, ty: Type) SemaError!void {
     }
 
     if (struct_type.hasReorderedFields()) {
-        const runtime_order = struct_type.runtime_order.get(ip);
+        const RuntimeOrder = InternPool.LoadedStructType.RuntimeOrder;
+        // Compute into a temp to avoid cross-tid writes to InternPool extra
+        // without `extra.mutex` while calling back into Sema.
+        const runtime_order = try sema.arena.alloc(RuntimeOrder, struct_type.field_types.len);
 
         for (runtime_order, 0..) |*ro, i| {
             const field_ty: Type = .fromInterned(struct_type.field_types.get(ip)[i]);
@@ -34576,8 +34579,6 @@ pub fn resolveStructLayout(sema: *Sema, ty: Type) SemaError!void {
                 ro.* = @enumFromInt(i);
             }
         }
-
-        const RuntimeOrder = InternPool.LoadedStructType.RuntimeOrder;
 
         const AlignSortContext = struct {
             aligns: []const Alignment,
@@ -34614,16 +34615,20 @@ pub fn resolveStructLayout(sema: *Sema, ty: Type) SemaError!void {
                 .aligns = aligns,
             }, AlignSortContext.lessThan);
         }
+        struct_type.setRuntimeOrderAll(ip, runtime_order);
     }
 
-    // Calculate size, alignment, and field offsets.
-    const offsets = struct_type.offsets.get(ip);
+    // Calculate size, alignment, and field offsets in a temp, then publish
+    // under `extra.mutex` so a foreign-tid realloc cannot lose our writes.
+    const offsets = try sema.arena.alloc(u32, struct_type.field_types.len);
+    @memcpy(offsets, struct_type.offsets.get(ip));
     var it = struct_type.iterateRuntimeOrder(ip);
     var offset: u64 = 0;
     while (it.next()) |i| {
         offsets[i] = @intCast(aligns[i].forward(offset));
         offset = offsets[i] + sizes[i];
     }
+    struct_type.setOffsetsAll(ip, offsets);
     const size = std.math.cast(u32, big_align.forward(offset)) orelse {
         const msg = try sema.errMsg(
             ty.srcLoc(zcu),
@@ -35474,7 +35479,7 @@ fn structFields(
             break :ty try sema.analyzeAsType(&block_scope, ty_src, ty_ref);
         };
 
-        struct_type.field_types.get(ip)[field_i] = field_ty.toIntern();
+        struct_type.setFieldType(ip, field_i, field_ty.toIntern());
 
         if (field_ty.zigTypeTag(zcu) == .@"opaque") {
             const msg = msg: {
@@ -35533,7 +35538,7 @@ fn structFields(
                 .offset = .{ .container_field_align = @intCast(field_i) },
             };
             const field_align = try sema.analyzeAsAlign(&block_scope, align_src, align_ref);
-            struct_type.field_aligns.get(ip)[field_i] = field_align;
+            struct_type.setFieldAlign(ip, field_i, field_align);
         }
 
         extra_index += zir_field.init_body_len;
@@ -35664,7 +35669,7 @@ fn structFieldInits(
                 const field_name = struct_type.fieldName(ip, field_i).unwrap().?;
                 return sema.failWithContainsReferenceToComptimeVar(&block_scope, init_src, field_name, "field default value", default_val);
             }
-            struct_type.field_inits.get(ip)[field_i] = default_val.toIntern();
+            struct_type.setFieldInit(ip, field_i, default_val.toIntern());
         }
     }
 

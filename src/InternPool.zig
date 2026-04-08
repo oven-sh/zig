@@ -3851,6 +3851,27 @@ pub const LoadedStructType = struct {
         @memcpy(s.field_inits.get(ip), inits);
     }
 
+    pub fn setOffset(s: LoadedStructType, ip: *InternPool, i: usize, off: u32) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        s.offsets.get(ip)[i] = off;
+    }
+
+    pub fn setOffsetsAll(s: LoadedStructType, ip: *InternPool, offs: []const u32) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        @memcpy(s.offsets.get(ip), offs);
+    }
+
+    pub fn setRuntimeOrderAll(s: LoadedStructType, ip: *InternPool, ro: []const RuntimeOrder) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        @memcpy(s.runtime_order.get(ip), ro);
+    }
+
     pub fn fieldAlign(s: LoadedStructType, ip: *const InternPool, i: usize) Alignment {
         if (s.field_aligns.len == 0) return .none;
         return s.field_aligns.get(ip)[i];
@@ -7814,6 +7835,10 @@ const GetOrPutKey = union(enum) {
 /// it; with parallel Sema another thread that dedups to `.existing` may, and
 /// must spin via `awaitNamespaceTypeFinished` before reading namespace/name.
 pub const wip_namespace_sentinel: u32 = std.math.maxInt(u32);
+/// Written by `WipNamespaceType.cancel`/`WipEnumType.cancel` so a thread spinning
+/// in `awaitNamespaceTypeFinished` exits without mistaking the slot for a real
+/// `NamespaceIndex` (0 is a valid index).
+pub const cancelled_namespace_sentinel: u32 = std.math.maxInt(u32) - 1;
 
 /// Spin until `ty`'s namespace slot is no longer the wip sentinel.
 pub fn awaitNamespaceTypeFinished(ip: *const InternPool, ty: Index) void {
@@ -9018,11 +9043,13 @@ pub const WipNamespaceType = struct {
         // If `finish` was already called the index is published; another
         // thread may be using it, so removal is unsafe. Leave it.
         if (@atomicLoad(u32, &extra_items[wip.namespace_extra_index], .acquire) != wip_namespace_sentinel) return;
-        // Clear the wip sentinel so any thread spinning in
-        // `awaitNamespaceTypeFinished` exits instead of livelocking; the
-        // index is then removed so subsequent lookups won't see this entry.
-        @atomicStore(u32, &extra_items[wip.namespace_extra_index], 0, .release);
+        // Tombstone the item first so a concurrent thread that already holds
+        // `.existing` and is about to read this index sees `.removed` instead
+        // of a half-dead entry, then publish `cancelled_namespace_sentinel`
+        // (NOT 0, which is a real `NamespaceIndex`) so spinners in
+        // `awaitNamespaceTypeFinished` exit without dereferencing namespace 0.
         ip.remove(tid, wip.index);
+        @atomicStore(u32, &extra_items[wip.namespace_extra_index], cancelled_namespace_sentinel, .release);
     }
 
     pub const Result = union(enum) {
@@ -10114,10 +10141,9 @@ pub const WipEnumType = struct {
         const extra = ip.getLocalShared(wip.tid).extra.acquire();
         const extra_items = extra.view().items(.@"0");
         if (@atomicLoad(u32, &extra_items[wip.namespace_extra_index], .acquire) != wip_namespace_sentinel) return;
-        // Clear the wip sentinel so any thread spinning in
-        // `awaitNamespaceTypeFinished` exits instead of livelocking.
-        @atomicStore(u32, &extra_items[wip.namespace_extra_index], 0, .release);
+        // See `WipNamespaceType.cancel`.
         ip.remove(tid, wip.index);
+        @atomicStore(u32, &extra_items[wip.namespace_extra_index], cancelled_namespace_sentinel, .release);
     }
 
     pub const Result = union(enum) {
@@ -11904,10 +11930,17 @@ pub fn resolveNavValue(
     assert(nav_analysis_namespace[unwrapped.index] != .none);
     assert(nav_analysis_zir_index[unwrapped.index] != .none);
 
+    // Seqlock-style write paired with the loop in `getNav`: invalidate `bits`
+    // before mutating `type_or_val` so a concurrent reader cannot pair the old
+    // `.type_resolved` status with the new value (it will see b1 != b2 and
+    // retry). The other `bits` fields are unchanged by this prelude store.
+    var bits = nav_bits[unwrapped.index];
+    bits.status = .unresolved;
+    @atomicStore(Nav.Repr.Bits, &nav_bits[unwrapped.index], bits, .release);
+
     @atomicStore(InternPool.Index, &nav_vals[unwrapped.index], resolved.val, .release);
     @atomicStore(OptionalNullTerminatedString, &nav_linksections[unwrapped.index], resolved.@"linksection", .release);
 
-    var bits = nav_bits[unwrapped.index];
     bits.status = .fully_resolved;
     bits.is_const = resolved.is_const;
     bits.alignment = resolved.alignment;
