@@ -5281,7 +5281,20 @@ fn processOneJob(tid: usize, comp: *Compilation, job: Job) JobError!void {
                 comp.link_prog_node.completeOne();
                 air.deinit(gpa);
             }
-            if (!air.typesFullyResolved(zcu)) {
+            // Under serial Sema, FIFO dispatch guarantees every
+            // `resolve_type_fully` queued before this body's analysis has
+            // completed, so `typesFullyResolved == false` means the type
+            // *failed*. Under parallel Sema both job kinds run concurrently —
+            // a struct or union may simply be mid-resolution. Dropping the
+            // body would leave a dangling cross-shard `__N<nav>` undef.
+            // Force-resolve via `resolveTypesFully`, which blocks on the
+            // claimOrWait-gated resolution; drop only if that errors.
+            const types_ok: bool = if (zcu.parallel_sema) ok: {
+                const pt: Zcu.PerThread = .activate(zcu, @enumFromInt(tid));
+                defer pt.deactivate();
+                break :ok air.resolveTypesFully(pt);
+            } else air.typesFullyResolved(zcu);
+            if (!types_ok) {
                 // Type resolution failed in a way which affects this function. This is a transitive
                 // failure, but it doesn't need recording, because this function semantically depends
                 // on the failed type, so when it is changed the function is updated.
