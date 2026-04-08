@@ -1023,7 +1023,11 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
     zcu.semaLock();
     defer zcu.semaUnlock();
 
-    _ = zcu.nav_val_analysis_queued.swapRemove(nav_id);
+    {
+        zcu.nav_queued_mutex.lock();
+        defer zcu.nav_queued_mutex.unlock();
+        _ = zcu.nav_val_analysis_queued.swapRemove(nav_id);
+    }
 
     if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(anal_unit));
 

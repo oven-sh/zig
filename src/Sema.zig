@@ -37415,9 +37415,6 @@ pub fn flushExports(sema: *Sema) !void {
         sema.references.count() == 0 and
         sema.type_references.count() == 0) return;
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
-
     {
         var it = sema.references.iterator();
         while (it.next()) |e|
@@ -37432,6 +37429,9 @@ pub fn flushExports(sema: *Sema) !void {
     }
 
     if (sema.exports.items.len == 0) return;
+
+    zcu.exports_mutex.lock();
+    defer zcu.exports_mutex.unlock();
 
     // There may be existing exports. For instance, a struct may export
     // things during both field type resolution and field default resolution.
@@ -37455,7 +37455,7 @@ pub fn flushExports(sema: *Sema) !void {
             } else try sema.exports.append(gpa, e);
         }
     }
-    zcu.deleteUnitExports(sema.owner);
+    zcu.deleteUnitExportsAssumeLocked(sema.owner);
 
     // `sema.exports` is completed; store the data into the `Zcu`.
     if (sema.exports.items.len == 1) {
