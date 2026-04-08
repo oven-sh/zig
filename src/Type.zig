@@ -3826,16 +3826,33 @@ fn resolveStructInner(
     const owner: InternPool.AnalUnit = .wrap(.{ .type = ty.toIntern() });
 
     zcu.semaLock();
-    defer zcu.semaUnlock();
-
-    if (zcu.failed_analysis.contains(owner) or zcu.transitive_failed_analysis.contains(owner)) {
-        return error.AnalysisFail;
-    }
-
+    const claimed = if (!zcu.parallel_sema) false else loop: while (true) {
+        switch (try zcu.claimOrWait(owner)) {
+            .claimed => break :loop true,
+            // Nested same-thread re-entry: proceed under the held lock; wip
+            // flags detect true cycles.
+            .recursed => break :loop false,
+            // Another thread released; re-claim so two threads cannot both
+            // run the resolution body.
+            .done => continue,
+        }
+    };
+    const already_failed = zcu.failed_analysis.contains(owner) or
+        zcu.transitive_failed_analysis.contains(owner);
     if (zcu.comp.debugIncremental()) {
         const info = try zcu.incremental_debug_state.getUnitInfo(gpa, owner);
         info.last_update_gen = zcu.generation;
     }
+    // When we own the claim, run the resolution body without the global lock
+    // so distinct types resolve concurrently. Otherwise keep the lock (we are
+    // either nested same-thread or another thread already holds the claim).
+    if (claimed) zcu.semaUnlock() else {}
+    defer if (claimed) {
+        zcu.semaLock();
+        zcu.releaseClaim(owner);
+        zcu.semaUnlock();
+    } else zcu.semaUnlock();
+    if (already_failed) return error.AnalysisFail;
 
     var analysis_arena = std.heap.ArenaAllocator.init(gpa);
     defer analysis_arena.deinit();
@@ -3866,6 +3883,8 @@ fn resolveStructInner(
         .full => sema.resolveStructFully(ty),
     }) catch |err| switch (err) {
         error.AnalysisFail => {
+            if (claimed) zcu.semaLock();
+            defer if (claimed) zcu.semaUnlock();
             if (!zcu.failed_analysis.contains(owner)) {
                 try zcu.transitive_failed_analysis.put(gpa, owner, {});
             }
@@ -3890,16 +3909,26 @@ fn resolveUnionInner(
     const owner: InternPool.AnalUnit = .wrap(.{ .type = ty.toIntern() });
 
     zcu.semaLock();
-    defer zcu.semaUnlock();
-
-    if (zcu.failed_analysis.contains(owner) or zcu.transitive_failed_analysis.contains(owner)) {
-        return error.AnalysisFail;
-    }
-
+    const claimed = if (!zcu.parallel_sema) false else loop: while (true) {
+        switch (try zcu.claimOrWait(owner)) {
+            .claimed => break :loop true,
+            .recursed => break :loop false,
+            .done => continue,
+        }
+    };
+    const already_failed = zcu.failed_analysis.contains(owner) or
+        zcu.transitive_failed_analysis.contains(owner);
     if (zcu.comp.debugIncremental()) {
         const info = try zcu.incremental_debug_state.getUnitInfo(gpa, owner);
         info.last_update_gen = zcu.generation;
     }
+    if (claimed) zcu.semaUnlock() else {}
+    defer if (claimed) {
+        zcu.semaLock();
+        zcu.releaseClaim(owner);
+        zcu.semaUnlock();
+    } else zcu.semaUnlock();
+    if (already_failed) return error.AnalysisFail;
 
     var analysis_arena = std.heap.ArenaAllocator.init(gpa);
     defer analysis_arena.deinit();
@@ -3929,6 +3958,8 @@ fn resolveUnionInner(
         .full => sema.resolveUnionFully(ty),
     }) catch |err| switch (err) {
         error.AnalysisFail => {
+            if (claimed) zcu.semaLock();
+            defer if (claimed) zcu.semaUnlock();
             if (!zcu.failed_analysis.contains(owner)) {
                 try zcu.transitive_failed_analysis.put(gpa, owner, {});
             }

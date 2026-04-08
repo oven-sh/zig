@@ -3508,6 +3508,8 @@ pub fn ensureFuncBodyAnalysisQueued(zcu: *Zcu, func_index: InternPool.Index) !vo
 
     assert(func.ty == func.uncoerced_ty); // analyze the body of the original function, not a coerced one
 
+    if (zcu.parallel_sema and !zcu.comp.incremental and func.analysisUnordered(ip).is_analyzed) return;
+
     zcu.semaLock();
     defer zcu.semaUnlock();
 
@@ -3529,6 +3531,8 @@ pub fn ensureFuncBodyAnalysisQueued(zcu: *Zcu, func_index: InternPool.Index) !vo
 
 pub fn ensureNavValAnalysisQueued(zcu: *Zcu, nav_id: InternPool.Nav.Index) !void {
     const ip = &zcu.intern_pool;
+
+    if (zcu.parallel_sema and !zcu.comp.incremental and ip.getNav(nav_id).status == .fully_resolved) return;
 
     zcu.semaLock();
     defer zcu.semaUnlock();

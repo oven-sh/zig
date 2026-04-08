@@ -3983,6 +3983,8 @@ pub fn ensureTypeUpToDate(pt: Zcu.PerThread, ty: InternPool.Index) Zcu.SemaError
     const gpa = zcu.gpa;
     const ip = &zcu.intern_pool;
 
+    if (zcu.parallel_sema and !zcu.comp.incremental) return ty;
+
     zcu.semaLock();
     defer zcu.semaUnlock();
 
@@ -4338,6 +4340,8 @@ pub fn ensureNamespaceUpToDate(pt: Zcu.PerThread, namespace_index: Zcu.Namespace
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
     const namespace = zcu.namespacePtr(namespace_index);
+
+    if (zcu.parallel_sema and namespace.generation == zcu.generation) return;
 
     zcu.semaLock();
     defer zcu.semaUnlock();
