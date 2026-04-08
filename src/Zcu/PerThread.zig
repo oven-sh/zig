@@ -1076,7 +1076,19 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
         };
     } else |err| switch (err) {
         error.AnalysisFail => res: {
-            if (Zcu.tls_retry_loop != null) return error.AnalysisFail;
+            if (Zcu.tls_retry_loop != null) {
+                // The retry may have triggered after `resolveNavValue` committed
+                // (status .fully_resolved), in which case re-queue is a no-op
+                // and the post-commit work (link_nav, body analysis) is lost.
+                // Queue it here so processExports/codegen sees the definition.
+                if (ip.getNav(nav_id).status == .fully_resolved) {
+                    const v = zcu.navValue(nav_id).toIntern();
+                    if (ip.isFuncBody(v))
+                        zcu.ensureFuncBodyAnalysisQueued(v) catch return error.OutOfMemory;
+                    zcu.comp.queueJob(.{ .link_nav = nav_id }) catch return error.OutOfMemory;
+                }
+                return error.AnalysisFail;
+            }
             if (!zcu.failed_analysis.contains(anal_unit)) {
                 // If this unit caused the error, it would have an entry in `failed_analysis`.
                 // Since it does not, this must be a transitive failure.
