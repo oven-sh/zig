@@ -607,10 +607,14 @@ pub const PartitionSet = struct {
     ) void {
         const pt: Zcu.PerThread = .activate(zcu, @enumFromInt(tid));
         defer pt.deactivate();
+        const t0: i64 = if (std.process.hasNonEmptyEnvVarConstant("ZIG_PHASE_TIMING")) std.time.milliTimestamp() else 0;
         obj.emit(pt, options) catch |err| switch (err) {
             error.OutOfMemory => _ = err_flag.cmpxchgStrong(0, 1, .monotonic, .monotonic),
             error.LinkFailure => _ = err_flag.cmpxchgStrong(0, 2, .monotonic, .monotonic),
         };
+        if (std.process.hasNonEmptyEnvVarConstant("ZIG_PHASE_TIMING")) {
+            std.debug.print("[PHASE] shard {d} emit {d} ms\n", .{ obj.partition_id, std.time.milliTimestamp() - t0 });
+        }
     }
 };
 

@@ -2652,16 +2652,12 @@ pub fn failWithOwnedErrorMsg(sema: *Sema, block: ?*Block, err_msg: *Zcu.ErrorMsg
 
     err_msg.reference_trace_root = sema.owner.toOptional();
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
-    const gop = try zcu.failed_analysis.getOrPut(gpa, sema.owner);
-    if (gop.found_existing) {
+    if (try zcu.failedAnalysisGetOrPut(sema.owner, err_msg)) {
         // If there are multiple errors for the same Decl, prefer the first one added.
         sema.err = null;
         err_msg.destroy(gpa);
     } else {
         sema.err = err_msg;
-        gop.value_ptr.* = err_msg;
     }
 
     return error.AnalysisFail;
@@ -37415,9 +37411,6 @@ pub fn flushExports(sema: *Sema) !void {
         sema.references.count() == 0 and
         sema.type_references.count() == 0) return;
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
-
     {
         var it = sema.references.iterator();
         while (it.next()) |e|
@@ -37432,6 +37425,9 @@ pub fn flushExports(sema: *Sema) !void {
     }
 
     if (sema.exports.items.len == 0) return;
+
+    zcu.exports_mutex.lock();
+    defer zcu.exports_mutex.unlock();
 
     // There may be existing exports. For instance, a struct may export
     // things during both field type resolution and field default resolution.
@@ -37455,7 +37451,7 @@ pub fn flushExports(sema: *Sema) !void {
             } else try sema.exports.append(gpa, e);
         }
     }
-    zcu.deleteUnitExports(sema.owner);
+    zcu.deleteUnitExportsAssumeLocked(sema.owner);
 
     // `sema.exports` is completed; store the data into the `Zcu`.
     if (sema.exports.items.len == 1) {
@@ -37561,8 +37557,8 @@ pub fn resolveDeclaredEnum(
         error.ComptimeReturn => unreachable,
         error.OutOfMemory => |e| return e,
         error.AnalysisFail => {
-            zcu.semaLock();
-            defer zcu.semaUnlock();
+            zcu.failed_analysis_mutex.lock();
+            defer zcu.failed_analysis_mutex.unlock();
             if (!zcu.failed_analysis.contains(sema.owner)) {
                 try zcu.transitive_failed_analysis.put(gpa, sema.owner, {});
             }

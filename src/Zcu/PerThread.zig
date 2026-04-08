@@ -659,7 +659,7 @@ pub fn ensureMemoizedStateUpToDate(pt: Zcu.PerThread, stage: InternPool.Memoized
     if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(unit));
 
     const was_outdated = zcu.outdated.swapRemove(unit) or zcu.potentially_outdated.swapRemove(unit);
-    const prev_failed = zcu.failed_analysis.contains(unit) or zcu.transitive_failed_analysis.contains(unit);
+    const prev_failed = zcu.anyAnalysisFailed(unit);
 
     if (was_outdated) {
         dev.check(.incremental);
@@ -667,10 +667,7 @@ pub fn ensureMemoizedStateUpToDate(pt: Zcu.PerThread, stage: InternPool.Memoized
         // No need for `deleteUnitExports` because we never export anything.
         zcu.deleteUnitReferences(unit);
         zcu.deleteUnitCompileLogs(unit);
-        if (zcu.failed_analysis.fetchSwapRemove(unit)) |kv| {
-            kv.value.destroy(gpa);
-        }
-        _ = zcu.transitive_failed_analysis.swapRemove(unit);
+        if (zcu.clearAnalysisFailures(unit)) |msg| msg.destroy(gpa);
     } else {
         if (prev_failed) return error.AnalysisFail;
         // Probe the *last* entry written for each stage so we never observe a
@@ -695,10 +692,10 @@ pub fn ensureMemoizedStateUpToDate(pt: Zcu.PerThread, stage: InternPool.Memoized
     else |err| switch (err) {
         error.AnalysisFail => res: {
             if (Zcu.tls_retry_loop != null) return error.AnalysisFail;
-            if (!zcu.failed_analysis.contains(unit)) {
+            {
                 // If this unit caused the error, it would have an entry in `failed_analysis`.
                 // Since it does not, this must be a transitive failure.
-                try zcu.transitive_failed_analysis.put(gpa, unit, {});
+                try zcu.markTransitiveFailed(unit);
                 log.debug("mark transitive analysis failure for {f}", .{zcu.fmtAnalUnit(unit)});
             }
             break :res .{ !prev_failed, true };
@@ -839,16 +836,12 @@ pub fn ensureComptimeUnitUpToDate(pt: Zcu.PerThread, cu_id: InternPool.ComptimeU
             zcu.deleteUnitExports(anal_unit);
             zcu.deleteUnitReferences(anal_unit);
             zcu.deleteUnitCompileLogs(anal_unit);
-            if (zcu.failed_analysis.fetchSwapRemove(anal_unit)) |kv| {
-                kv.value.destroy(gpa);
-            }
-            _ = zcu.transitive_failed_analysis.swapRemove(anal_unit);
+            if (zcu.clearAnalysisFailures(anal_unit)) |msg| msg.destroy(gpa);
             zcu.intern_pool.removeDependenciesForDepender(gpa, anal_unit);
         }
     } else {
         // We can trust the current information about this unit.
-        if (zcu.failed_analysis.contains(anal_unit)) return error.AnalysisFail;
-        if (zcu.transitive_failed_analysis.contains(anal_unit)) return error.AnalysisFail;
+        if (zcu.anyAnalysisFailed(anal_unit)) return error.AnalysisFail;
         return;
     }
 
@@ -872,12 +865,8 @@ pub fn ensureComptimeUnitUpToDate(pt: Zcu.PerThread, cu_id: InternPool.ComptimeU
                 try zcu.outdated.put(gpa, anal_unit, 0);
                 return error.AnalysisFail;
             }
-            if (!zcu.failed_analysis.contains(anal_unit)) {
-                // If this unit caused the error, it would have an entry in `failed_analysis`.
-                // Since it does not, this must be a transitive failure.
-                try zcu.transitive_failed_analysis.put(gpa, anal_unit, {});
-                log.debug("mark transitive analysis failure for {f}", .{zcu.fmtAnalUnit(anal_unit)});
-            }
+            try zcu.markTransitiveFailed(anal_unit);
+            log.debug("mark transitive analysis failure for {f}", .{zcu.fmtAnalUnit(anal_unit)});
             return error.AnalysisFail;
         },
         error.OutOfMemory => {
@@ -1023,7 +1012,11 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
     zcu.semaLock();
     defer zcu.semaUnlock();
 
-    _ = zcu.nav_val_analysis_queued.swapRemove(nav_id);
+    {
+        zcu.nav_queued_mutex.lock();
+        defer zcu.nav_queued_mutex.unlock();
+        _ = zcu.nav_val_analysis_queued.swapRemove(nav_id);
+    }
 
     if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(anal_unit));
 
@@ -1039,8 +1032,7 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
     const was_outdated = zcu.outdated.swapRemove(anal_unit) or
         zcu.potentially_outdated.swapRemove(anal_unit);
 
-    const prev_failed = zcu.failed_analysis.contains(anal_unit) or
-        zcu.transitive_failed_analysis.contains(anal_unit);
+    const prev_failed = zcu.anyAnalysisFailed(anal_unit);
 
     if (was_outdated) {
         dev.check(.incremental);
@@ -1048,10 +1040,7 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
         zcu.deleteUnitExports(anal_unit);
         zcu.deleteUnitReferences(anal_unit);
         zcu.deleteUnitCompileLogs(anal_unit);
-        if (zcu.failed_analysis.fetchSwapRemove(anal_unit)) |kv| {
-            kv.value.destroy(gpa);
-        }
-        _ = zcu.transitive_failed_analysis.swapRemove(anal_unit);
+        if (zcu.clearAnalysisFailures(anal_unit)) |msg| msg.destroy(gpa);
         ip.removeDependenciesForDepender(gpa, anal_unit);
     } else {
         // We can trust the current information about this unit.
@@ -1092,12 +1081,8 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
                 }
                 return error.AnalysisFail;
             }
-            if (!zcu.failed_analysis.contains(anal_unit)) {
-                // If this unit caused the error, it would have an entry in `failed_analysis`.
-                // Since it does not, this must be a transitive failure.
-                try zcu.transitive_failed_analysis.put(gpa, anal_unit, {});
-                log.debug("mark transitive analysis failure for {f}", .{zcu.fmtAnalUnit(anal_unit)});
-            }
+            try zcu.markTransitiveFailed(anal_unit);
+            log.debug("mark transitive analysis failure for {f}", .{zcu.fmtAnalUnit(anal_unit)});
             break :res .{ !prev_failed, true };
         },
         error.OutOfMemory => {
@@ -1145,14 +1130,11 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
             zcu.deleteUnitExports(ty_unit);
             zcu.deleteUnitReferences(ty_unit);
             zcu.deleteUnitCompileLogs(ty_unit);
-            if (zcu.failed_analysis.fetchSwapRemove(ty_unit)) |kv| {
-                kv.value.destroy(gpa);
-            }
-            _ = zcu.transitive_failed_analysis.swapRemove(ty_unit);
+            if (zcu.clearAnalysisFailures(ty_unit)) |msg| msg.destroy(gpa);
             ip.removeDependenciesForDepender(gpa, ty_unit);
         }
         try pt.addDependency(ty_unit, .{ .nav_val = nav_id });
-        if (new_failed) try zcu.transitive_failed_analysis.put(gpa, ty_unit, {});
+        if (new_failed) try zcu.putTransitiveFailed(ty_unit);
         if (ty_was_outdated) try zcu.markDependeeOutdated(.marked_po, .{ .nav_ty = nav_id });
     }
 
@@ -1515,8 +1497,7 @@ pub fn ensureNavTypeUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zc
     const was_outdated = zcu.outdated.swapRemove(anal_unit) or
         zcu.potentially_outdated.swapRemove(anal_unit);
 
-    const prev_failed = zcu.failed_analysis.contains(anal_unit) or
-        zcu.transitive_failed_analysis.contains(anal_unit);
+    const prev_failed = zcu.anyAnalysisFailed(anal_unit);
 
     if (was_outdated) {
         dev.check(.incremental);
@@ -1524,10 +1505,7 @@ pub fn ensureNavTypeUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zc
         zcu.deleteUnitExports(anal_unit);
         zcu.deleteUnitReferences(anal_unit);
         zcu.deleteUnitCompileLogs(anal_unit);
-        if (zcu.failed_analysis.fetchSwapRemove(anal_unit)) |kv| {
-            kv.value.destroy(gpa);
-        }
-        _ = zcu.transitive_failed_analysis.swapRemove(anal_unit);
+        if (zcu.clearAnalysisFailures(anal_unit)) |msg| msg.destroy(gpa);
         ip.removeDependenciesForDepender(gpa, anal_unit);
     } else {
         // We can trust the current information about this unit.
@@ -1556,10 +1534,10 @@ pub fn ensureNavTypeUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zc
     } else |err| switch (err) {
         error.AnalysisFail => res: {
             if (Zcu.tls_retry_loop != null) return error.AnalysisFail;
-            if (!zcu.failed_analysis.contains(anal_unit)) {
+            {
                 // If this unit caused the error, it would have an entry in `failed_analysis`.
                 // Since it does not, this must be a transitive failure.
-                try zcu.transitive_failed_analysis.put(gpa, anal_unit, {});
+                try zcu.markTransitiveFailed(anal_unit);
                 log.debug("mark transitive analysis failure for {f}", .{zcu.fmtAnalUnit(anal_unit)});
             }
             break :res .{ !prev_failed, true };
@@ -1772,7 +1750,7 @@ pub fn ensureFuncBodyUpToDate(pt: Zcu.PerThread, func_index: InternPool.Index) Z
     const was_outdated = zcu.outdated.swapRemove(anal_unit) or
         zcu.potentially_outdated.swapRemove(anal_unit);
 
-    const prev_failed = zcu.failed_analysis.contains(anal_unit) or zcu.transitive_failed_analysis.contains(anal_unit);
+    const prev_failed = zcu.anyAnalysisFailed(anal_unit);
 
     if (was_outdated) {
         dev.check(.incremental);
@@ -1780,10 +1758,7 @@ pub fn ensureFuncBodyUpToDate(pt: Zcu.PerThread, func_index: InternPool.Index) Z
         zcu.deleteUnitExports(anal_unit);
         zcu.deleteUnitReferences(anal_unit);
         zcu.deleteUnitCompileLogs(anal_unit);
-        if (zcu.failed_analysis.fetchSwapRemove(anal_unit)) |kv| {
-            kv.value.destroy(gpa);
-        }
-        _ = zcu.transitive_failed_analysis.swapRemove(anal_unit);
+        if (zcu.clearAnalysisFailures(anal_unit)) |msg| msg.destroy(gpa);
     } else {
         // We can trust the current information about this function.
         if (prev_failed) {
@@ -1816,12 +1791,8 @@ pub fn ensureFuncBodyUpToDate(pt: Zcu.PerThread, func_index: InternPool.Index) Z
                 func.clearAnalyzed(ip);
                 return error.AnalysisFail;
             }
-            if (!zcu.failed_analysis.contains(anal_unit)) {
-                // If this function caused the error, it would have an entry in `failed_analysis`.
-                // Since it does not, this must be a transitive failure.
-                try zcu.transitive_failed_analysis.put(gpa, anal_unit, {});
-                log.debug("mark transitive analysis failure for {f}", .{zcu.fmtAnalUnit(anal_unit)});
-            }
+            try zcu.markTransitiveFailed(anal_unit);
+            log.debug("mark transitive analysis failure for {f}", .{zcu.fmtAnalUnit(anal_unit)});
             // We consider the IES to be outdated if the function previously succeeded analysis; in this case,
             // we need to re-analyze dependants to ensure they hit a transitive error here, rather than reporting
             // a different error later (which may now be invalid).
@@ -3417,9 +3388,7 @@ fn processExportsInner(
             const nav = ip.getNav(nav_index);
             if (zcu.failed_codegen.contains(nav_index)) break :failed true;
             if (nav.analysis != null) {
-                const unit: AnalUnit = .wrap(.{ .nav_val = nav_index });
-                if (zcu.failed_analysis.contains(unit)) break :failed true;
-                if (zcu.transitive_failed_analysis.contains(unit)) break :failed true;
+                if (zcu.anyAnalysisFailed(.wrap(.{ .nav_val = nav_index }))) break :failed true;
             }
             const val = switch (nav.status) {
                 .unresolved, .type_resolved => break :failed true,
@@ -3427,9 +3396,7 @@ fn processExportsInner(
             };
             // If the value is a function, we also need to check if that function succeeded analysis.
             if (val.typeOf(zcu).zigTypeTag(zcu) == .@"fn") {
-                const func_unit = AnalUnit.wrap(.{ .func = val.toIntern() });
-                if (zcu.failed_analysis.contains(func_unit)) break :failed true;
-                if (zcu.transitive_failed_analysis.contains(func_unit)) break :failed true;
+                if (zcu.anyAnalysisFailed(.wrap(.{ .func = val.toIntern() }))) break :failed true;
             }
             break :failed false;
         }) {
@@ -3472,8 +3439,7 @@ pub fn populateTestFunctions(pt: Zcu.PerThread) Allocator.Error!void {
         Zcu.Namespace.NameAdapter{ .zcu = zcu },
     ).?;
     // ...but it might not be populated, so let's check that!
-    if (zcu.failed_analysis.contains(.wrap(.{ .nav_val = nav_index })) or
-        zcu.transitive_failed_analysis.contains(.wrap(.{ .nav_val = nav_index })) or
+    if (zcu.anyAnalysisFailed(.wrap(.{ .nav_val = nav_index })) or
         ip.getNav(nav_index).status != .fully_resolved)
     {
         // The value of `builtin.test_functions` was either never referenced, or failed analysis.
@@ -4111,10 +4077,7 @@ pub fn ensureTypeUpToDate(pt: Zcu.PerThread, ty: InternPool.Index) Zcu.SemaError
     zcu.deleteUnitExports(anal_unit);
     zcu.deleteUnitReferences(anal_unit);
     zcu.deleteUnitCompileLogs(anal_unit);
-    if (zcu.failed_analysis.fetchSwapRemove(anal_unit)) |kv| {
-        kv.value.destroy(gpa);
-    }
-    _ = zcu.transitive_failed_analysis.swapRemove(anal_unit);
+    if (zcu.clearAnalysisFailures(anal_unit)) |msg| msg.destroy(gpa);
     zcu.intern_pool.removeDependenciesForDepender(gpa, anal_unit);
 
     if (zcu.comp.debugIncremental()) {

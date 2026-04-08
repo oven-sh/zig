@@ -166,6 +166,7 @@ var debug_allocator: std.heap.DebugAllocator(.{
 }) = .init;
 
 pub fn main() anyerror!void {
+    Compilation.phaseTiming("main.entry");
     crash_report.initialize();
 
     const gpa, const is_debug = gpa: {
@@ -5425,6 +5426,7 @@ fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
 
             try root_mod.deps.put(arena, "@build", build_mod);
 
+            Compilation.phaseTiming("cmdBuild.runner_compile_start");
             var create_diag: Compilation.CreateDiagnostic = undefined;
             const comp = Compilation.create(gpa, arena, &create_diag, .{
                 .libc_installation = libc_installation,
@@ -5458,6 +5460,7 @@ fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
                 error.CompileErrorsReported => process.exit(2),
                 else => |e| return e,
             };
+            Compilation.phaseTiming("cmdBuild.runner_compile_done");
 
             // Since incremental compilation isn't done yet, we use cache_mode = whole
             // above, and thus the output file is already closed.
@@ -5483,6 +5486,7 @@ fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
                 child.progress_node = root_prog_node;
             }
 
+            Compilation.phaseTiming("cmdBuild.runner_spawn");
             const term = t: {
                 std.debug.lockStdErr();
                 defer std.debug.unlockStdErr();
@@ -5490,6 +5494,7 @@ fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
                     fatal("failed to spawn build runner {s}: {s}", .{ child_argv.items[0], @errorName(err) });
                 };
             };
+            Compilation.phaseTiming("cmdBuild.runner_exit");
 
             switch (term) {
                 .Exited => |code| {

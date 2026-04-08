@@ -99,6 +99,17 @@ inline_ref_mutex: std.Thread.Mutex = .{},
 /// `sema_lock` (the entry-lock at ensureFuncBodyUpToDate was the hottest
 /// contention site at 12.4 s × 15 684 stalls).
 unit_claims_mutex: std.Thread.Mutex = .{},
+/// Guards `failed_analysis` + `transitive_failed_analysis`.
+failed_analysis_mutex: std.Thread.Mutex = .{},
+/// Guards `reference_table` / `all_references` / `free_references` and the
+/// `type_reference_table` / `all_type_references` / `free_type_references`.
+references_mutex: std.Thread.Mutex = .{},
+/// Guards `single_exports` / `multi_exports` / `all_exports` / `free_exports`
+/// / `failed_exports`.
+exports_mutex: std.Thread.Mutex = .{},
+/// Guards `nav_val_analysis_queued` so `ensureNavValAnalysisQueued` does not
+/// contend on `sema_lock`.
+nav_queued_mutex: std.Thread.Mutex = .{},
 /// True while parallel Sema is enabled for this update.
 parallel_sema: bool = false,
 /// The number of codegen jobs which are pending or in-progress. Whichever thread drops this value
@@ -3551,7 +3562,16 @@ pub fn ensureFuncBodyAnalysisQueued(zcu: *Zcu, func_index: InternPool.Index) !vo
 pub fn ensureNavValAnalysisQueued(zcu: *Zcu, nav_id: InternPool.Nav.Index) !void {
     const ip = &zcu.intern_pool;
 
-    if (zcu.parallel_sema and !zcu.comp.incremental and ip.getNav(nav_id).status == .fully_resolved) return;
+    if (zcu.parallel_sema and !zcu.comp.incremental) {
+        if (ip.getNav(nav_id).status == .fully_resolved) return;
+        zcu.nav_queued_mutex.lock();
+        defer zcu.nav_queued_mutex.unlock();
+        if (zcu.nav_val_analysis_queued.contains(nav_id)) return;
+        try zcu.nav_val_analysis_queued.ensureUnusedCapacity(zcu.gpa, 1);
+        try zcu.comp.queueJob(.{ .analyze_comptime_unit = .wrap(.{ .nav_val = nav_id }) });
+        zcu.nav_val_analysis_queued.putAssumeCapacityNoClobber(nav_id, {});
+        return;
+    }
 
     zcu.semaLock();
     defer zcu.semaUnlock();
@@ -3730,6 +3750,12 @@ pub fn aipRemove(zcu: *Zcu, unit: AnalUnit) void {
 /// Delete all the Export objects that are caused by this `AnalUnit`. Re-analysis of
 /// this `AnalUnit` will cause them to be re-created (or not).
 pub fn deleteUnitExports(zcu: *Zcu, anal_unit: AnalUnit) void {
+    zcu.exports_mutex.lock();
+    defer zcu.exports_mutex.unlock();
+    zcu.deleteUnitExportsAssumeLocked(anal_unit);
+}
+
+pub fn deleteUnitExportsAssumeLocked(zcu: *Zcu, anal_unit: AnalUnit) void {
     const gpa = zcu.gpa;
 
     const exports_base, const exports_len = if (zcu.single_exports.fetchSwapRemove(anal_unit)) |kv|
@@ -3773,6 +3799,9 @@ pub fn deleteUnitExports(zcu: *Zcu, anal_unit: AnalUnit) void {
 pub fn deleteUnitReferences(zcu: *Zcu, anal_unit: AnalUnit) void {
     const gpa = zcu.gpa;
 
+    zcu.references_mutex.lock();
+    defer zcu.references_mutex.unlock();
+
     zcu.clearCachedResolvedReferences();
 
     unit_refs: {
@@ -3794,11 +3823,15 @@ pub fn deleteUnitReferences(zcu: *Zcu, anal_unit: AnalUnit) void {
                 // detect this case to avoid adding it to `free_inline_reference_frames` more
                 // than once. We do that by setting `parent` to itself as a marker.
                 if (inline_frame.ptr(zcu).parent == inline_frame.toOptional()) break;
-                zcu.free_inline_reference_frames.append(gpa, inline_frame) catch {
-                    // This space will be reused eventually, so we need not propagate this error.
-                    // Just leak it for now, and let GC reclaim it later on.
-                    break :unit_refs;
-                };
+                {
+                    zcu.inline_ref_mutex.lock();
+                    defer zcu.inline_ref_mutex.unlock();
+                    zcu.free_inline_reference_frames.append(gpa, inline_frame) catch {
+                        // This space will be reused eventually, so we need not propagate this error.
+                        // Just leak it for now, and let GC reclaim it later on.
+                        break :unit_refs;
+                    };
+                }
                 opt_inline_frame = inline_frame.ptr(zcu).parent;
                 inline_frame.ptr(zcu).parent = inline_frame.toOptional(); // signal to code above
             }
@@ -3856,6 +3889,9 @@ pub fn addUnitReference(
 ) Allocator.Error!void {
     const gpa = zcu.gpa;
 
+    zcu.references_mutex.lock();
+    defer zcu.references_mutex.unlock();
+
     zcu.clearCachedResolvedReferences();
 
     try zcu.reference_table.ensureUnusedCapacity(gpa, 1);
@@ -3881,6 +3917,9 @@ pub fn addUnitReference(
 
 pub fn addTypeReference(zcu: *Zcu, src_unit: AnalUnit, referenced_type: InternPool.Index, ref_src: LazySrcLoc) Allocator.Error!void {
     const gpa = zcu.gpa;
+
+    zcu.references_mutex.lock();
+    defer zcu.references_mutex.unlock();
 
     zcu.clearCachedResolvedReferences();
 
@@ -3972,12 +4011,45 @@ pub fn handleUpdateExports(
 }
 
 /// Locked check whether `unit` has a (transitive) analysis failure.
-/// `failed_analysis` writers hold `sema_lock`; under parallel Sema a
-/// concurrent rehash during `.contains` is unsafe.
+/// `failed_analysis` writers hold `failed_analysis_mutex`; under parallel Sema
+/// a concurrent rehash during `.contains` is unsafe.
 pub fn anyAnalysisFailed(zcu: *Zcu, unit: AnalUnit) bool {
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    zcu.failed_analysis_mutex.lock();
+    defer zcu.failed_analysis_mutex.unlock();
     return zcu.failed_analysis.contains(unit) or zcu.transitive_failed_analysis.contains(unit);
+}
+
+/// Locked accessors so writers and `anyAnalysisFailed` readers agree on the
+/// same mutex (otherwise `.contains` can observe a mid-rehash map).
+pub fn putTransitiveFailed(zcu: *Zcu, unit: AnalUnit) Allocator.Error!void {
+    zcu.failed_analysis_mutex.lock();
+    defer zcu.failed_analysis_mutex.unlock();
+    try zcu.transitive_failed_analysis.put(zcu.gpa, unit, {});
+}
+
+/// Locked: mark `unit` as transitively-failed only if it has no direct
+/// `failed_analysis` entry (the common post-AnalysisFail bookkeeping).
+pub fn markTransitiveFailed(zcu: *Zcu, unit: AnalUnit) Allocator.Error!void {
+    zcu.failed_analysis_mutex.lock();
+    defer zcu.failed_analysis_mutex.unlock();
+    if (zcu.failed_analysis.contains(unit)) return;
+    try zcu.transitive_failed_analysis.put(zcu.gpa, unit, {});
+}
+
+pub fn clearAnalysisFailures(zcu: *Zcu, unit: AnalUnit) ?*ErrorMsg {
+    zcu.failed_analysis_mutex.lock();
+    defer zcu.failed_analysis_mutex.unlock();
+    const msg: ?*ErrorMsg = if (zcu.failed_analysis.fetchSwapRemove(unit)) |kv| kv.value else null;
+    _ = zcu.transitive_failed_analysis.swapRemove(unit);
+    return msg;
+}
+
+pub fn failedAnalysisGetOrPut(zcu: *Zcu, unit: AnalUnit, msg: *ErrorMsg) Allocator.Error!bool {
+    zcu.failed_analysis_mutex.lock();
+    defer zcu.failed_analysis_mutex.unlock();
+    const gop = try zcu.failed_analysis.getOrPut(zcu.gpa, unit);
+    if (!gop.found_existing) gop.value_ptr.* = msg;
+    return gop.found_existing;
 }
 
 pub fn addGlobalAssembly(zcu: *Zcu, unit: AnalUnit, source: []const u8) !void {

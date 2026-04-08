@@ -3146,7 +3146,9 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
                 try pt.populateTestFunctions();
             }
 
+            comp.phaseTimingC("update.processExports.start");
             try pt.processExports();
+            comp.phaseTimingC("update.processExports.done");
         }
 
         if (comp.llvm_shard_stats or std.process.hasNonEmptyEnvVarConstant("ZIG_JOB_STATS")) {
@@ -3416,6 +3418,7 @@ fn flush(
     arena: Allocator,
     tid: Zcu.PerThread.Id,
 ) Allocator.Error!void {
+    comp.phaseTimingC("flush.start");
     if (comp.zcu) |zcu| {
         if (zcu.llvm_object) |llvm_object| {
             const pt: Zcu.PerThread = .activate(zcu, tid);
@@ -3494,6 +3497,7 @@ fn flush(
                 error.LinkFailure => {}, // Already reported.
                 error.OutOfMemory => return error.OutOfMemory,
             };
+            comp.phaseTimingC("flush.llvm_emit_done");
         }
     }
     if (comp.bin_file) |lf| {
@@ -3511,6 +3515,7 @@ fn flush(
                 error.OutOfMemory => return error.OutOfMemory,
             };
         }
+        comp.phaseTimingC("flush.lf_flush_done");
     }
     if (comp.zcu) |zcu| {
         try link.File.C.flushEmitH(zcu);
@@ -4709,10 +4714,20 @@ pub fn unableToLoadZcuFile(
     });
 }
 
+pub fn phaseTiming(label: []const u8) void {
+    if (!std.process.hasNonEmptyEnvVarConstant("ZIG_PHASE_TIMING")) return;
+    std.debug.print("[PHASE] {d} - {s}\n", .{ std.time.milliTimestamp(), label });
+}
+fn phaseTimingC(comp: *const Compilation, label: []const u8) void {
+    if (!std.process.hasNonEmptyEnvVarConstant("ZIG_PHASE_TIMING")) return;
+    std.debug.print("[PHASE] {d} {s} {s}\n", .{ std.time.milliTimestamp(), comp.root_name, label });
+}
+
 fn performAllTheWork(
     comp: *Compilation,
     main_progress_node: std.Progress.Node,
 ) JobError!void {
+    comp.phaseTimingC("performAllTheWork.start");
     // Regardless of errors, `comp.zcu` needs to update its generation number.
     defer if (comp.zcu) |zcu| {
         zcu.generation += 1;
@@ -4737,8 +4752,10 @@ fn performAllTheWork(
     var work_queue_wait_group: WaitGroup = .{};
     defer work_queue_wait_group.wait();
 
+    defer comp.phaseTimingC("performAllTheWork.codegen_wait_done");
     comp.link_task_wait_group.reset();
     defer comp.link_task_wait_group.wait();
+    defer comp.phaseTimingC("performAllTheWork.work_loop_done");
 
     // Already-queued prelink tasks
     comp.link_prog_node.increaseEstimatedTotalItems(comp.link_task_queue.queued_prelink.items.len);
@@ -5139,6 +5156,7 @@ fn performAllTheWork(
         // Start the timer for the "decls" part of the pipeline (Sema, CodeGen, link).
         decl_work_timer = comp.startTimer();
     }
+    comp.phaseTimingC("performAllTheWork.work_loop_start");
 
     if (comp.zcu) |zcu| {
         // Sub-compilations (compiler_rt, ubsan_rt, etc.) and the build runner
