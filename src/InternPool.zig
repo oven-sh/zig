@@ -3417,7 +3417,9 @@ pub const LoadedUnionType = struct {
     }
 
     pub fn flagsUnordered(u: LoadedUnionType, ip: *const InternPool) Tag.TypeUnion.Flags {
-        return @atomicLoad(Tag.TypeUnion.Flags, u.flagsPtr(ip), .unordered);
+        // Despite the name, use .acquire so a true status-done flag synchronises
+        // with the prior release-store and makes preceding field writes visible.
+        return @atomicLoad(Tag.TypeUnion.Flags, u.flagsPtr(ip), .acquire);
     }
 
     pub fn setStatus(u: LoadedUnionType, ip: *InternPool, status: Status) void {
@@ -3858,7 +3860,9 @@ pub const LoadedStructType = struct {
     }
 
     pub fn flagsUnordered(s: LoadedStructType, ip: *const InternPool) Tag.TypeStruct.Flags {
-        return @atomicLoad(Tag.TypeStruct.Flags, s.flagsPtr(ip), .unordered);
+        // Despite the name, use .acquire so a true status-done flag synchronises
+        // with the prior release-store and makes preceding field writes visible.
+        return @atomicLoad(Tag.TypeStruct.Flags, s.flagsPtr(ip), .acquire);
     }
 
     /// The returned pointer expires with any addition to the `InternPool`.
@@ -3871,7 +3875,7 @@ pub const LoadedStructType = struct {
     }
 
     pub fn packedFlagsUnordered(s: LoadedStructType, ip: *const InternPool) Tag.TypeStructPacked.Flags {
-        return @atomicLoad(Tag.TypeStructPacked.Flags, s.packedFlagsPtr(ip), .unordered);
+        return @atomicLoad(Tag.TypeStructPacked.Flags, s.packedFlagsPtr(ip), .acquire);
     }
 
     /// Reads the non-opv flag calculated during AstGen. Used to short-circuit more
