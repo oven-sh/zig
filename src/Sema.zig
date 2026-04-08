@@ -35355,7 +35355,8 @@ fn structFields(
 
             // This string needs to outlive the ZIR code.
             const field_name = try ip.getOrPutString(gpa, pt.tid, field_name_zir, .no_embedded_nulls);
-            assert(struct_type.addFieldName(ip, field_name) == null);
+            // A previous yield-and-requeue may have populated some names already.
+            if (struct_type.addFieldName(ip, field_name)) |existing| assert(existing == field_i);
 
             if (has_align) {
                 fields[field_i].align_body_len = zir.extra[extra_index];
