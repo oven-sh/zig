@@ -1486,14 +1486,17 @@ pub fn ensureNavTypeUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zc
         .unresolved => {},
     };
 
-    switch (try zcu.claimOrWait(anal_unit)) {
-        .claimed => {},
+    claim: while (true) switch (try zcu.claimOrWait(anal_unit)) {
+        .claimed => break :claim,
         .recursed => return error.AnalysisFail,
         .done => {
             if (zcu.anyAnalysisFailed(anal_unit)) return error.AnalysisFail;
-            return;
+            switch (ip.getNav(nav_id).status) {
+                .fully_resolved, .type_resolved => return,
+                .unresolved => continue :claim,
+            }
         },
-    }
+    };
     defer zcu.releaseClaim(anal_unit);
 
     const need_sema_lock = !zcu.parallel_sema or zcu.comp.incremental;

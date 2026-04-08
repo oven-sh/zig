@@ -31352,7 +31352,10 @@ fn maybeRetryTypeLoop(sema: *Sema, ty: Type) Allocator.Error!bool {
     const gop = try zcu.sema_retry_counts.getOrPut(zcu.gpa, unit);
     if (!gop.found_existing) gop.value_ptr.* = 0;
     gop.value_ptr.* +|= 1;
-    if (gop.value_ptr.* < 8) {
+    // Cap scaled to thread count: with the ensure*UpToDate sema_lock gate
+    // dropped, far more workers can hit the same wip-flag concurrently and
+    // each bumps this counter; 8 was tuned for the serialised path.
+    if (gop.value_ptr.* < 128) {
         Zcu.tls_retry_loop = unit;
         return true;
     }
@@ -31397,7 +31400,7 @@ pub fn ensureNavResolved(sema: *Sema, block: *Block, src: LazySrcLoc, nav_index:
                 break :blk gop.value_ptr.*;
             };
             zcu.sema_retry_mutex.unlock();
-            if (tries < 8) {
+            if (tries < 128) {
                 Zcu.tls_retry_loop = anal_unit;
                 return error.AnalysisFail;
             }
