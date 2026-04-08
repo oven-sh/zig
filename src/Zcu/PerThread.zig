@@ -644,18 +644,18 @@ pub fn ensureMemoizedStateUpToDate(pt: Zcu.PerThread, stage: InternPool.Memoized
         if (@atomicLoad(InternPool.Index, zcu.builtin_decl_values.getPtrConst(to_check), .acquire) != .none) return;
     }
 
+    zcu.semaLock();
+    defer zcu.semaUnlock();
     switch (try zcu.claimOrWait(unit)) {
         .claimed => {},
         .recursed => return error.AnalysisFail,
         .done => {
-            if (zcu.anyAnalysisFailed(unit)) return error.AnalysisFail;
+            if (zcu.failed_analysis.contains(unit) or zcu.transitive_failed_analysis.contains(unit))
+                return error.AnalysisFail;
             return;
         },
     }
     defer zcu.releaseClaim(unit);
-
-    zcu.semaLock();
-    defer zcu.semaUnlock();
     if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(unit));
 
     const was_outdated = zcu.outdated.swapRemove(unit) or zcu.potentially_outdated.swapRemove(unit);
@@ -806,18 +806,18 @@ pub fn ensureComptimeUnitUpToDate(pt: Zcu.PerThread, cu_id: InternPool.ComptimeU
 
     log.debug("ensureComptimeUnitUpToDate {f}", .{zcu.fmtAnalUnit(anal_unit)});
 
+    zcu.semaLock();
+    defer zcu.semaUnlock();
     switch (try zcu.claimOrWait(anal_unit)) {
         .claimed => {},
         .recursed => return error.AnalysisFail,
         .done => {
-            if (zcu.anyAnalysisFailed(anal_unit)) return error.AnalysisFail;
+            if (zcu.failed_analysis.contains(anal_unit) or zcu.transitive_failed_analysis.contains(anal_unit))
+                return error.AnalysisFail;
             return;
         },
     }
     defer zcu.releaseClaim(anal_unit);
-
-    zcu.semaLock();
-    defer zcu.semaUnlock();
     if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(anal_unit));
 
     // Determine whether or not this `ComptimeUnit` is outdated. For this kind of `AnalUnit`, that's
@@ -1006,18 +1006,19 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
 
     if (zcu.parallel_sema and !zcu.comp.incremental and nav.status == .fully_resolved) return;
 
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+
     switch (try zcu.claimOrWait(anal_unit)) {
         .claimed => {},
         .recursed => return error.AnalysisFail,
         .done => {
-            if (zcu.anyAnalysisFailed(anal_unit)) return error.AnalysisFail;
+            if (zcu.failed_analysis.contains(anal_unit) or zcu.transitive_failed_analysis.contains(anal_unit))
+                return error.AnalysisFail;
             return;
         },
     }
     defer zcu.releaseClaim(anal_unit);
-
-    zcu.semaLock();
-    defer zcu.semaUnlock();
 
     _ = zcu.nav_val_analysis_queued.swapRemove(nav_id);
 
@@ -1473,18 +1474,18 @@ pub fn ensureNavTypeUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zc
         .unresolved => {},
     };
 
+    zcu.semaLock();
+    defer zcu.semaUnlock();
     switch (try zcu.claimOrWait(anal_unit)) {
         .claimed => {},
         .recursed => return error.AnalysisFail,
         .done => {
-            if (zcu.anyAnalysisFailed(anal_unit)) return error.AnalysisFail;
+            if (zcu.failed_analysis.contains(anal_unit) or zcu.transitive_failed_analysis.contains(anal_unit))
+                return error.AnalysisFail;
             return;
         },
     }
     defer zcu.releaseClaim(anal_unit);
-
-    zcu.semaLock();
-    defer zcu.semaUnlock();
     if (!zcu.parallel_sema) assert(!zcu.analysis_in_progress.contains(anal_unit));
 
     const type_resolved_by_value: bool = from_val: {
