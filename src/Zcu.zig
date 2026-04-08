@@ -79,17 +79,14 @@ codegen_prog_node: std.Progress.Node = .none,
 sema_lock: std.Thread.Mutex = .{},
 sema_lock_owner: std.atomic.Value(std.Thread.Id) = .init(no_sema_owner),
 sema_lock_depth: u32 = 0,
-/// Guards `unit_claims` / `claim_waits` independently of `sema_lock` so that
-/// claim acquisition does not contend with type resolution, flushExports, etc.
-unit_claims_mutex: std.Thread.Mutex = .{},
 /// Signalled whenever a claim in `unit_claims` is released.
 sema_claim_cond: std.Thread.Condition = .{},
 /// AnalUnits currently being analysed by some worker; value is the owning tid.
-/// Guarded by `unit_claims_mutex`. A worker that finds an entry here for a
-/// unit it needs waits on `sema_claim_cond` until the entry is removed.
+/// Guarded by `sema_lock`. A worker that finds an entry here for a unit it
+/// needs waits on `sema_claim_cond` until the entry is removed.
 unit_claims: std.AutoHashMapUnmanaged(AnalUnit, std.Thread.Id) = .empty,
 /// Tracks which unit each thread is currently waiting on, for deadlock
-/// detection in `claimOrWait`. Guarded by `unit_claims_mutex`.
+/// detection in `claimOrWait`. Guarded by `sema_lock`.
 claim_waits: std.AutoHashMapUnmanaged(std.Thread.Id, AnalUnit) = .empty,
 /// Per-unit retry count for order-dependent dependency loops, to avoid
 /// livelock on a true source-level cycle. Guarded by `sema_lock`.
@@ -3634,8 +3631,6 @@ pub fn awaitNamespaceTypeFinished(zcu: *Zcu, ty: InternPool.Index) void {
 pub fn claimOrWait(zcu: *Zcu, unit: AnalUnit) Allocator.Error!enum { claimed, recursed, done } {
     if (!zcu.parallel_sema) return .claimed;
     const me = std.Thread.getCurrentId();
-    zcu.unit_claims_mutex.lock();
-    defer zcu.unit_claims_mutex.unlock();
     while (true) {
         const gop = try zcu.unit_claims.getOrPut(zcu.gpa, unit);
         if (!gop.found_existing) {
@@ -3650,29 +3645,23 @@ pub fn claimOrWait(zcu: *Zcu, unit: AnalUnit) Allocator.Error!enum { claimed, re
             if (holder == me) return .recursed;
             chain_unit = zcu.claim_waits.get(holder) orelse break;
         }
-        // Another thread holds the claim; record our wait and sleep on the
-        // dedicated condvar. Drop sema_lock for the duration so we do not
-        // serialize unrelated Sema work behind this dependency wait.
+        // Another thread holds the claim; record our wait, fully release, sleep.
         try zcu.claim_waits.put(zcu.gpa, me, unit);
-        zcu.unit_claims_mutex.unlock();
-        const d = zcu.semaRelease();
-        zcu.unit_claims_mutex.lock();
-        // Re-check after re-acquiring the claims mutex: the holder may have
-        // finished while we were releasing sema_lock.
-        if (zcu.unit_claims.contains(unit))
-            zcu.sema_claim_cond.wait(&zcu.unit_claims_mutex);
+        const d = zcu.sema_lock_depth;
+        zcu.sema_lock_depth = 0;
+        zcu.sema_lock_owner.store(no_sema_owner, .release);
+        zcu.sema_claim_cond.wait(&zcu.sema_lock);
+        zcu.sema_lock_owner.store(std.Thread.getCurrentId(), .release);
+        zcu.sema_lock_depth = d;
         _ = zcu.claim_waits.remove(me);
-        zcu.unit_claims_mutex.unlock();
-        zcu.semaReacquire(d);
-        zcu.unit_claims_mutex.lock();
+        // After wake, check whether the unit is now resolved; if the claim is
+        // gone, another thread finished it.
         if (!zcu.unit_claims.contains(unit)) return .done;
     }
 }
 
 pub fn releaseClaim(zcu: *Zcu, unit: AnalUnit) void {
     if (!zcu.parallel_sema) return;
-    zcu.unit_claims_mutex.lock();
-    defer zcu.unit_claims_mutex.unlock();
     _ = zcu.unit_claims.remove(unit);
     zcu.sema_claim_cond.broadcast();
 }

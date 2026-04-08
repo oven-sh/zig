@@ -3848,7 +3848,6 @@ fn resolveStructInner(
 ) SemaError!void {
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
-    const ip = &zcu.intern_pool;
 
     zcu.awaitNamespaceTypeFinished(ty.toIntern());
 
@@ -3864,39 +3863,6 @@ fn resolveStructInner(
         const info = try zcu.incremental_debug_state.getUnitInfo(gpa, owner);
         info.last_update_gen = zcu.generation;
     }
-
-    // Per-type claim under parallel Sema so resolution of different types
-    // runs concurrently. `.done` re-checks below; `.recursed` (same-thread
-    // re-entry) is treated as an order-dependent loop and handed to the
-    // yield-and-requeue mechanism, falling through under the global lock
-    // after a few retries so a true source-level cycle still errors.
-    var keep_global_lock = !zcu.parallel_sema;
-    claim: while (zcu.parallel_sema) {
-        switch (try zcu.claimOrWait(owner)) {
-            .done => continue :claim,
-            .claimed => break :claim,
-            .recursed => {
-                const gop = try zcu.sema_retry_counts.getOrPut(gpa, owner);
-                if (!gop.found_existing) gop.value_ptr.* = 0;
-                gop.value_ptr.* +|= 1;
-                if (gop.value_ptr.* < 8) {
-                    Zcu.tls_retry_loop = owner;
-                    return error.AnalysisFail;
-                }
-                keep_global_lock = true;
-                break :claim;
-            },
-        }
-    }
-    defer if (!keep_global_lock) zcu.releaseClaim(owner);
-
-    if (zcu.parallel_sema) switch (resolution) {
-        .fields => if (struct_obj.haveFieldTypes(ip)) return,
-        .inits => if (struct_obj.haveFieldInits(ip)) return,
-        .alignment => if (struct_obj.flagsUnordered(ip).alignment != .none) return,
-        .layout => if (struct_obj.haveLayout(ip)) return,
-        .full => if (struct_obj.flagsUnordered(ip).fully_resolved) return,
-    };
 
     var analysis_arena = std.heap.ArenaAllocator.init(gpa);
     defer analysis_arena.deinit();
@@ -3919,18 +3885,13 @@ fn resolveStructInner(
     };
     defer sema.deinit();
 
-    const body_result: SemaError!void = blk: {
-        const d = if (keep_global_lock) 0 else zcu.semaRelease();
-        defer if (!keep_global_lock) zcu.semaReacquire(d);
-        break :blk switch (resolution) {
-            .fields => sema.resolveStructFieldTypes(ty.toIntern(), struct_obj),
-            .inits => sema.resolveStructFieldInits(ty),
-            .alignment => sema.resolveStructAlignment(ty.toIntern(), struct_obj),
-            .layout => sema.resolveStructLayout(ty),
-            .full => sema.resolveStructFully(ty),
-        };
-    };
-    body_result catch |err| switch (err) {
+    (switch (resolution) {
+        .fields => sema.resolveStructFieldTypes(ty.toIntern(), struct_obj),
+        .inits => sema.resolveStructFieldInits(ty),
+        .alignment => sema.resolveStructAlignment(ty.toIntern(), struct_obj),
+        .layout => sema.resolveStructLayout(ty),
+        .full => sema.resolveStructFully(ty),
+    }) catch |err| switch (err) {
         error.AnalysisFail => {
             if (Zcu.tls_retry_loop != null) return error.AnalysisFail;
             if (!zcu.failed_analysis.contains(owner)) {
@@ -3950,7 +3911,6 @@ fn resolveUnionInner(
 ) SemaError!void {
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
-    const ip = &zcu.intern_pool;
 
     zcu.awaitNamespaceTypeFinished(ty.toIntern());
 
@@ -3966,33 +3926,6 @@ fn resolveUnionInner(
         const info = try zcu.incremental_debug_state.getUnitInfo(gpa, owner);
         info.last_update_gen = zcu.generation;
     }
-
-    var keep_global_lock = !zcu.parallel_sema;
-    claim: while (zcu.parallel_sema) {
-        switch (try zcu.claimOrWait(owner)) {
-            .done => continue :claim,
-            .claimed => break :claim,
-            .recursed => {
-                const gop = try zcu.sema_retry_counts.getOrPut(gpa, owner);
-                if (!gop.found_existing) gop.value_ptr.* = 0;
-                gop.value_ptr.* +|= 1;
-                if (gop.value_ptr.* < 8) {
-                    Zcu.tls_retry_loop = owner;
-                    return error.AnalysisFail;
-                }
-                keep_global_lock = true;
-                break :claim;
-            },
-        }
-    }
-    defer if (!keep_global_lock) zcu.releaseClaim(owner);
-
-    if (zcu.parallel_sema) switch (resolution) {
-        .fields => if (union_obj.haveFieldTypes(ip)) return,
-        .alignment => if (union_obj.flagsUnordered(ip).alignment != .none) return,
-        .layout => if (union_obj.haveLayout(ip)) return,
-        .full => if (union_obj.flagsUnordered(ip).status == .fully_resolved) return,
-    };
 
     var analysis_arena = std.heap.ArenaAllocator.init(gpa);
     defer analysis_arena.deinit();
@@ -4015,17 +3948,12 @@ fn resolveUnionInner(
     };
     defer sema.deinit();
 
-    const body_result: SemaError!void = blk: {
-        const d = if (keep_global_lock) 0 else zcu.semaRelease();
-        defer if (!keep_global_lock) zcu.semaReacquire(d);
-        break :blk switch (resolution) {
-            .fields => sema.resolveUnionFieldTypes(ty, union_obj),
-            .alignment => sema.resolveUnionAlignment(ty, union_obj),
-            .layout => sema.resolveUnionLayout(ty),
-            .full => sema.resolveUnionFully(ty),
-        };
-    };
-    body_result catch |err| switch (err) {
+    (switch (resolution) {
+        .fields => sema.resolveUnionFieldTypes(ty, union_obj),
+        .alignment => sema.resolveUnionAlignment(ty, union_obj),
+        .layout => sema.resolveUnionLayout(ty),
+        .full => sema.resolveUnionFully(ty),
+    }) catch |err| switch (err) {
         error.AnalysisFail => {
             if (Zcu.tls_retry_loop != null) return error.AnalysisFail;
             if (!zcu.failed_analysis.contains(owner)) {

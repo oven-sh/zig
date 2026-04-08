@@ -7564,9 +7564,11 @@ fn analyzeCall(
             } else resolved_ret_ty;
 
             // We now need to actually create the function instance.
-            // `getFuncInstanceIes` internally takes its shard mutexes in
-            // sorted order so concurrent callers cannot ABBA-deadlock.
-            const func_instance = try ip.getFuncInstance(gpa, pt.tid, .{
+            // `getFuncInstanceIes` holds up to four shard mutexes at once; under
+            // parallel Sema concurrent calls can ABBA-deadlock on those shards.
+            // Serialize via sema_lock.
+            zcu.semaLock();
+            const func_instance = ip.getFuncInstance(gpa, pt.tid, .{
                 .param_types = runtime_param_tys.items,
                 .noalias_bits = noalias_bits,
                 .bare_return_type = bare_ret_ty.toIntern(),
@@ -7574,7 +7576,11 @@ fn analyzeCall(
                 .inferred_error_set = fn_zir_info.inferred_error_set,
                 .generic_owner = func_val.?.toIntern(),
                 .comptime_args = comptime_args,
-            });
+            }) catch |err| {
+                zcu.semaUnlock();
+                return err;
+            };
+            zcu.semaUnlock();
             if (zcu.comp.debugIncremental()) {
                 const nav = ip.indexToKey(func_instance).func.owner_nav;
                 const gop = try zcu.incremental_debug_state.navs.getOrPut(gpa, nav);
