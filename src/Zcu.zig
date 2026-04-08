@@ -92,6 +92,13 @@ claim_waits: std.AutoHashMapUnmanaged(std.Thread.Id, AnalUnit) = .empty,
 /// livelock on a true source-level cycle. Guarded by `sema_lock`.
 sema_retry_counts: std.AutoHashMapUnmanaged(AnalUnit, u8) = .empty,
 sema_pending_jobs: std.atomic.Value(u32) = .init(0),
+/// Guards `inline_reference_frames` / `free_inline_reference_frames` so that
+/// the very hot `Inlining.refFrame` path does not contend on `sema_lock`.
+inline_ref_mutex: std.Thread.Mutex = .{},
+/// Guards `unit_claims` / `claim_waits` so `claimOrWait` does not contend on
+/// `sema_lock` (the entry-lock at ensureFuncBodyUpToDate was the hottest
+/// contention site at 12.4 s × 15 684 stalls).
+unit_claims_mutex: std.Thread.Mutex = .{},
 /// True while parallel Sema is enabled for this update.
 parallel_sema: bool = false,
 /// The number of codegen jobs which are pending or in-progress. Whichever thread drops this value
@@ -3512,7 +3519,15 @@ pub fn ensureFuncBodyAnalysisQueued(zcu: *Zcu, func_index: InternPool.Index) !vo
 
     assert(func.ty == func.uncoerced_ty); // analyze the body of the original function, not a coerced one
 
-    if (zcu.parallel_sema and !zcu.comp.incremental and func.analysisUnordered(ip).is_analyzed) return;
+    if (zcu.parallel_sema and !zcu.comp.incremental) {
+        // Lock-free dedup via the per-func atomic `is_queued` bit instead of
+        // contending on `sema_lock` for the global `func_body_analysis_queued`
+        // set (this site is hit ~40k× and was the second-hottest contention
+        // point in the profile).
+        if (!func.trySetQueued(ip)) return;
+        try zcu.comp.queueJob(.{ .analyze_func = func_index });
+        return;
+    }
 
     zcu.semaLock();
     defer zcu.semaUnlock();
@@ -3627,10 +3642,13 @@ pub fn awaitNamespaceTypeFinished(zcu: *Zcu, ty: InternPool.Index) void {
 ///    handled by caller as before via `analysis_in_progress`).
 ///  - `.done` if another thread finished analysing it while we waited; caller
 ///    should re-read the unit's resolved status and return.
-/// Must be called with `sema_lock` HELD; may temporarily release it while waiting.
+/// Uses its own `unit_claims_mutex`; may temporarily release any held
+/// `sema_lock` while waiting on the per-unit condvar.
 pub fn claimOrWait(zcu: *Zcu, unit: AnalUnit) Allocator.Error!enum { claimed, recursed, done } {
     if (!zcu.parallel_sema) return .claimed;
     const me = std.Thread.getCurrentId();
+    zcu.unit_claims_mutex.lock();
+    defer zcu.unit_claims_mutex.unlock();
     while (true) {
         const gop = try zcu.unit_claims.getOrPut(zcu.gpa, unit);
         if (!gop.found_existing) {
@@ -3645,15 +3663,19 @@ pub fn claimOrWait(zcu: *Zcu, unit: AnalUnit) Allocator.Error!enum { claimed, re
             if (holder == me) return .recursed;
             chain_unit = zcu.claim_waits.get(holder) orelse break;
         }
-        // Another thread holds the claim; record our wait, fully release, sleep.
+        // Another thread holds the claim; record our wait, fully release any
+        // held sema_lock, then sleep on the dedicated claims condvar.
         try zcu.claim_waits.put(zcu.gpa, me, unit);
-        const d = zcu.sema_lock_depth;
-        zcu.sema_lock_depth = 0;
-        zcu.sema_lock_owner.store(no_sema_owner, .release);
-        zcu.sema_claim_cond.wait(&zcu.sema_lock);
-        zcu.sema_lock_owner.store(std.Thread.getCurrentId(), .release);
-        zcu.sema_lock_depth = d;
+        zcu.unit_claims_mutex.unlock();
+        const d = zcu.semaRelease();
+        zcu.unit_claims_mutex.lock();
+        // Lost-wakeup guard: holder may have released between our two locks.
+        if (zcu.unit_claims.contains(unit))
+            zcu.sema_claim_cond.wait(&zcu.unit_claims_mutex);
         _ = zcu.claim_waits.remove(me);
+        zcu.unit_claims_mutex.unlock();
+        zcu.semaReacquire(d);
+        zcu.unit_claims_mutex.lock();
         // After wake, check whether the unit is now resolved; if the claim is
         // gone, another thread finished it.
         if (!zcu.unit_claims.contains(unit)) return .done;
@@ -3662,7 +3684,9 @@ pub fn claimOrWait(zcu: *Zcu, unit: AnalUnit) Allocator.Error!enum { claimed, re
 
 pub fn releaseClaim(zcu: *Zcu, unit: AnalUnit) void {
     if (!zcu.parallel_sema) return;
+    zcu.unit_claims_mutex.lock();
     _ = zcu.unit_claims.remove(unit);
+    zcu.unit_claims_mutex.unlock();
     zcu.sema_claim_cond.broadcast();
 }
 
@@ -3810,8 +3834,8 @@ pub fn deleteUnitCompileLogs(zcu: *Zcu, anal_unit: AnalUnit) void {
 }
 
 pub fn addInlineReferenceFrame(zcu: *Zcu, frame: InlineReferenceFrame) Allocator.Error!Zcu.InlineReferenceFrame.Index {
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    zcu.inline_ref_mutex.lock();
+    defer zcu.inline_ref_mutex.unlock();
     const frame_idx: InlineReferenceFrame.Index = zcu.free_inline_reference_frames.pop() orelse idx: {
         _ = try zcu.inline_reference_frames.addOne(zcu.gpa);
         break :idx @enumFromInt(zcu.inline_reference_frames.items.len - 1);

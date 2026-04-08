@@ -2408,6 +2408,21 @@ pub const Key = union(enum) {
             @atomicStore(FuncAnalysis, analysis_ptr, analysis, .release);
         }
 
+        /// Atomically set `is_queued`; returns true if WE set it (i.e. the
+        /// caller should enqueue the analyze_func job), false if already set.
+        pub fn trySetQueued(func: Func, ip: *InternPool) bool {
+            const extra_mutex = &ip.getLocal(func.tid).mutate.extra.mutex;
+            extra_mutex.lock();
+            defer extra_mutex.unlock();
+
+            const analysis_ptr = func.analysisPtr(ip);
+            var analysis = analysis_ptr.*;
+            if (analysis.is_queued or analysis.is_analyzed) return false;
+            analysis.is_queued = true;
+            @atomicStore(FuncAnalysis, analysis_ptr, analysis, .release);
+            return true;
+        }
+
         /// Returns a pointer that becomes invalid after any additions to the `InternPool`.
         fn zirBodyInstPtr(func: Func, ip: *const InternPool) *TrackedInst.Index {
             const extra = ip.getLocalShared(func.zir_body_inst_tid).extra.acquire();
@@ -6346,8 +6361,11 @@ pub const FuncAnalysis = packed struct(u32) {
     inferred_error_set: bool,
     disable_instrumentation: bool,
     disable_intrinsics: bool,
+    /// Under parallel Sema, set atomically by `ensureFuncBodyAnalysisQueued`
+    /// to dedupe work-queue dispatch without taking the global lock.
+    is_queued: bool = false,
 
-    _: u23 = 0,
+    _: u22 = 0,
 };
 
 pub const Bytes = struct {

@@ -5162,6 +5162,12 @@ fn performAllTheWork(
         };
         if (maybe_job) |job| {
             if (comp.zcu) |zcu| if (zcu.parallel_sema and job == .analyze_func) {
+                // Skip dispatch if a worker already holds this unit (or it has
+                // since been analyzed) — re-queues from the retry path can
+                // produce duplicate analyze_func jobs and N-1 workers then
+                // condvar-wait on the one analyzer.
+                const a = zcu.intern_pool.funcAnalysisUnordered(job.analyze_func);
+                if (a.is_analyzed) continue :work;
                 _ = zcu.sema_pending_jobs.rmw(.Add, 1, .acquire);
                 comp.thread_pool.spawnWgId(&comp.link_task_wait_group, workerAnalyzeFunc, .{ comp, job.analyze_func });
                 continue :work;

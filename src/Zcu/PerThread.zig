@@ -1740,19 +1740,21 @@ pub fn ensureFuncBodyUpToDate(pt: Zcu.PerThread, func_index: InternPool.Index) Z
         return;
     }
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
-
+    // `claimOrWait` self-locks `unit_claims_mutex`; we only take the global
+    // `sema_lock` after the claim succeeds, so the (very hot) entry path no
+    // longer contends on `sema_lock`.
     switch (try zcu.claimOrWait(anal_unit)) {
         .claimed => {},
         .recursed => return error.AnalysisFail,
         .done => {
-            if (zcu.failed_analysis.contains(anal_unit) or zcu.transitive_failed_analysis.contains(anal_unit))
-                return error.AnalysisFail;
+            if (zcu.anyAnalysisFailed(anal_unit)) return error.AnalysisFail;
             return;
         },
     }
     defer zcu.releaseClaim(anal_unit);
+
+    zcu.semaLock();
+    defer zcu.semaUnlock();
 
     _ = zcu.func_body_analysis_queued.swapRemove(func_index);
 
