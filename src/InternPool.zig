@@ -11658,15 +11658,27 @@ pub fn getNav(ip: *const InternPool, index: Nav.Index) Nav {
     const unwrapped = index.unwrap(ip);
     const navs = ip.getLocalShared(unwrapped.tid).navs.acquire();
     const view = navs.view();
+    const bits_ptr = &view.items(.bits)[unwrapped.index];
+    const tov_ptr = &view.items(.type_or_val)[unwrapped.index];
+    const ls_ptr = &view.items(.@"linksection")[unwrapped.index];
     var repr = view.get(unwrapped.index);
-    // `resolveNavType`/`resolveNavValue` release-store `bits` last, after
-    // `type_or_val` etc. Re-load `bits` with acquire then re-load the
-    // status-dependent fields so a concurrent reader cannot observe a new
-    // status with a stale `type_or_val`.
-    repr.bits = @atomicLoad(Nav.Repr.Bits, &view.items(.bits)[unwrapped.index], .acquire);
-    repr.type_or_val = @atomicLoad(InternPool.Index, &view.items(.type_or_val)[unwrapped.index], .unordered);
-    repr.@"linksection" = @atomicLoad(OptionalNullTerminatedString, &view.items(.@"linksection")[unwrapped.index], .unordered);
-    return repr.unpack();
+    // Seqlock-style read: bits is release-stored last by both
+    // `resolveNavType` and `resolveNavValue`. The .type_resolved →
+    // .fully_resolved transition rewrites `type_or_val` from a type to a
+    // value, so a single acquire is not enough — re-read bits after
+    // type_or_val and retry until stable so we never pair an old status
+    // with a new payload (or vice versa).
+    while (true) {
+        const b1 = @atomicLoad(Nav.Repr.Bits, bits_ptr, .acquire);
+        repr.type_or_val = @atomicLoad(InternPool.Index, tov_ptr, .unordered);
+        repr.@"linksection" = @atomicLoad(OptionalNullTerminatedString, ls_ptr, .unordered);
+        const b2 = @atomicLoad(Nav.Repr.Bits, bits_ptr, .acquire);
+        if (@as(u32, @bitCast(b1)) == @as(u32, @bitCast(b2))) {
+            repr.bits = b2;
+            return repr.unpack();
+        }
+        std.atomic.spinLoopHint();
+    }
 }
 
 /// Total number of Navs across all per-thread locals. Intended for diagnostics.
@@ -11866,10 +11878,18 @@ pub fn resolveNavValue(
     assert(nav_analysis_namespace[unwrapped.index] != .none);
     assert(nav_analysis_zir_index[unwrapped.index] != .none);
 
+    var bits = nav_bits[unwrapped.index];
+    // Seqlock-style write: a concurrent `getNav` does bits-acquire,
+    // type_or_val, bits-acquire and retries until stable. Because
+    // .type_resolved → .fully_resolved REWRITES type_or_val from a type to
+    // a value, mark .unresolved first so a reader cannot pair the old
+    // .type_resolved status with the new value.
+    bits.status = .unresolved;
+    @atomicStore(Nav.Repr.Bits, &nav_bits[unwrapped.index], bits, .release);
+
     @atomicStore(InternPool.Index, &nav_vals[unwrapped.index], resolved.val, .release);
     @atomicStore(OptionalNullTerminatedString, &nav_linksections[unwrapped.index], resolved.@"linksection", .release);
 
-    var bits = nav_bits[unwrapped.index];
     bits.status = .fully_resolved;
     bits.is_const = resolved.is_const;
     bits.alignment = resolved.alignment;
