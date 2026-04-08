@@ -31506,7 +31506,21 @@ fn maybeQueueFuncBodyAnalysis(sema: *Sema, block: *Block, src: LazySrcLoc, nav_i
     try sema.ensureNavResolved(block, src, nav_index, .type);
     const nav_ty: Type = .fromInterned(ip.getNav(nav_index).typeOf(ip));
     if (nav_ty.zigTypeTag(zcu) != .@"fn") return;
-    if (!try nav_ty.fnHasRuntimeBitsSema(pt)) return;
+    // `fnHasRuntimeBitsSema` may trigger a yield-and-requeue retry; if so,
+    // the caller has already committed (export registered / pointer taken),
+    // so swallow it and conservatively queue analysis rather than dropping
+    // the func body and crashing in `processExports`.
+    const has_rt_bits = nav_ty.fnHasRuntimeBitsSema(pt) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AnalysisFail => blk: {
+            if (Zcu.tls_retry_loop != null) {
+                Zcu.tls_retry_loop = null;
+                break :blk true;
+            }
+            return error.AnalysisFail;
+        },
+    };
+    if (!has_rt_bits) return;
 
     try sema.ensureNavResolved(block, src, nav_index, .fully);
     const nav_val = zcu.navValue(nav_index);

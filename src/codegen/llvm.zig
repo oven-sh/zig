@@ -1812,15 +1812,21 @@ pub const Object = struct {
         const ip = &zcu.intern_pool;
         const global_index = self.nav_map.get(nav_index) orelse gi: {
             // The nav was exported but its `link_nav` / `codegen_func` job
-            // never ran (likely a post-commit retry under parallel Sema). Emit
-            // it now so the export aliases have a definition to point at.
-            switch (ip.indexToKey(ip.getNav(nav_index).status.fully_resolved.val)) {
-                .func => break :gi (try self.resolveLlvmFunction(pt, nav_index)).ptrConst(&self.builder).global,
-                else => {
-                    try self.updateNav(pt, nav_index);
-                    break :gi self.nav_map.get(nav_index).?;
+            // never ran (likely a post-commit retry under parallel Sema dropping
+            // a queued job). For variables we can emit late; for functions we
+            // cannot synthesise a body — skip so the missing symbol surfaces
+            // at link rather than tripping the verifier with an alias-to-decl.
+            const nav = ip.getNav(nav_index);
+            switch (ip.indexToKey(nav.status.fully_resolved.val)) {
+                .func => |f| if (f.owner_nav == nav_index) {
+                    log.warn("updateExports: function nav '{f}' not codegenned; skipping export", .{nav.fqn.fmt(ip)});
+                    return;
                 },
+                else => {},
             }
+            log.warn("updateExports: nav '{f}' not in nav_map; emitting late", .{nav.fqn.fmt(ip)});
+            try self.updateNav(pt, nav_index);
+            break :gi self.nav_map.get(nav_index).?;
         };
         const comp = zcu.comp;
 
