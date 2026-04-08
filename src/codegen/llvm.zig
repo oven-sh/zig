@@ -1814,10 +1814,7 @@ pub const Object = struct {
             // The nav was exported but its `link_nav` job never ran (likely a
             // post-commit retry under parallel Sema). Emit it now so the
             // export aliases have a definition to point at.
-            self.updateNav(pt, nav_index) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.AnalysisFail,
-            };
+            try self.updateNav(pt, nav_index);
             break :gi self.nav_map.get(nav_index).?;
         };
         const comp = zcu.comp;

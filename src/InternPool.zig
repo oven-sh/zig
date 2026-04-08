@@ -3850,7 +3850,8 @@ pub const LoadedStructType = struct {
     /// Returns `none` in the case the struct is a tuple.
     pub fn fieldName(s: LoadedStructType, ip: *const InternPool, i: usize) OptionalNullTerminatedString {
         if (s.field_names.len == 0) return .none;
-        return s.field_names.get(ip)[i].toOptional();
+        const names = s.field_names.get(ip);
+        return @atomicLoad(NullTerminatedString, &names[i], .acquire).toOptional();
     }
 
     pub fn fieldIsComptime(s: LoadedStructType, ip: *const InternPool, i: usize) bool {
@@ -12951,8 +12952,16 @@ pub fn addFieldName(
     const strings = extra_items[names_start..][0..field_index];
     const adapter: NullTerminatedString.Adapter = .{ .strings = @ptrCast(strings) };
     const gop = map.getOrPutAssumeCapacityAdapted(name, adapter);
-    if (gop.found_existing) return @intCast(gop.index);
-    extra_items[names_start + field_index] = @intFromEnum(name);
+    if (gop.found_existing) {
+        // Re-store the slot so a re-run of `structFields` after a retry has
+        // its own happens-before edge to this slot via the subsequent
+        // flags release-store; otherwise a reader synchronising on the
+        // re-run's flags may not transitively see the original writer's
+        // slot write under weak memory.
+        @atomicStore(u32, &extra_items[names_start + gop.index], @intFromEnum(name), .release);
+        return @intCast(gop.index);
+    }
+    @atomicStore(u32, &extra_items[names_start + field_index], @intFromEnum(name), .release);
     return null;
 }
 
