@@ -1810,7 +1810,16 @@ pub const Object = struct {
         };
         if (!self.ownsNav(zcu, nav_index)) return;
         const ip = &zcu.intern_pool;
-        const global_index = self.nav_map.get(nav_index).?;
+        const global_index = self.nav_map.get(nav_index) orelse gi: {
+            // The nav was exported but its `link_nav` job never ran (likely a
+            // post-commit retry under parallel Sema). Emit it now so the
+            // export aliases have a definition to point at.
+            self.updateNav(pt, nav_index) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.CodegenFail => return error.AnalysisFail,
+            };
+            break :gi self.nav_map.get(nav_index).?;
+        };
         const comp = zcu.comp;
 
         // If we're on COFF and linking with LLD, the linker cares about our exports to determine the subsystem in use.
