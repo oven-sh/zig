@@ -7015,7 +7015,8 @@ pub fn init(ip: *InternPool, gpa: Allocator, available_threads: usize) !void {
     ip.tid_shift_30 = if (single_threaded) 0 else 30 - ip.tid_width;
     ip.tid_shift_31 = if (single_threaded) 0 else 31 - ip.tid_width;
     ip.tid_shift_32 = if (single_threaded) 0 else ip.tid_shift_31 +| 1;
-    ip.shards = try gpa.alloc(Shard, @as(usize, 1) << ip.tid_width);
+    const shard_count: usize = @max(@as(usize, 1) << ip.tid_width, 256);
+    ip.shards = try gpa.alloc(Shard, shard_count);
     @memset(ip.shards, .{
         .shared = .{
             .map = Shard.Map(Index).empty,
