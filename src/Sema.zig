@@ -37309,10 +37309,22 @@ pub fn flushExports(sema: *Sema) !void {
     //
     // So, pick up and delete any existing exports. This strategy performs
     // redundant work, but that's okay, because this case is exceedingly rare.
+    // Skip any existing entry that is identical to one already in
+    // `sema.exports` (re-analysis under parallel-Sema retry can re-flush the
+    // same export, which would otherwise duplicate it and trip the symbol
+    // collision check).
+    const new_len = sema.exports.items.len;
     if (zcu.single_exports.get(sema.owner)) |export_idx| {
-        try sema.exports.append(gpa, export_idx.ptr(zcu).*);
+        const e = export_idx.ptr(zcu).*;
+        for (sema.exports.items[0..new_len]) |n| {
+            if (std.meta.eql(n.exported, e.exported) and n.opts.name == e.opts.name) break;
+        } else try sema.exports.append(gpa, e);
     } else if (zcu.multi_exports.get(sema.owner)) |info| {
-        try sema.exports.appendSlice(gpa, zcu.all_exports.items[info.index..][0..info.len]);
+        for (zcu.all_exports.items[info.index..][0..info.len]) |e| {
+            for (sema.exports.items[0..new_len]) |n| {
+                if (std.meta.eql(n.exported, e.exported) and n.opts.name == e.opts.name) break;
+            } else try sema.exports.append(gpa, e);
+        }
     }
     zcu.deleteUnitExports(sema.owner);
 

@@ -866,7 +866,12 @@ pub fn ensureComptimeUnitUpToDate(pt: Zcu.PerThread, cu_id: InternPool.ComptimeU
 
     return pt.analyzeComptimeUnit(cu_id) catch |err| switch (err) {
         error.AnalysisFail => {
-            if (Zcu.tls_retry_loop != null) return error.AnalysisFail;
+            if (Zcu.tls_retry_loop != null) {
+                // Re-mark outdated so the re-queued attempt actually re-runs
+                // instead of taking the was_outdated=false early return.
+                try zcu.outdated.put(gpa, anal_unit, 0);
+                return error.AnalysisFail;
+            }
             if (!zcu.failed_analysis.contains(anal_unit)) {
                 // If this unit caused the error, it would have an entry in `failed_analysis`.
                 // Since it does not, this must be a transitive failure.
@@ -1388,7 +1393,21 @@ fn analyzeNavVal(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu.CompileErr
     queue_codegen: {
         if (!queue_linker_work) break :queue_codegen;
 
-        if (!try nav_ty.hasRuntimeBitsSema(pt)) {
+        // `hasRuntimeBitsSema` may trigger a retry-loop after we have already
+        // committed (status .fully_resolved + exports flushed); a re-queue would
+        // be a no-op. Swallow the retry here and queue the link_nav so codegen
+        // sees the export's definition.
+        const has_rt_bits = nav_ty.hasRuntimeBitsSema(pt) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.AnalysisFail => blk: {
+                if (Zcu.tls_retry_loop != null) {
+                    Zcu.tls_retry_loop = null;
+                    break :blk true;
+                }
+                return error.AnalysisFail;
+            },
+        };
+        if (!has_rt_bits) {
             if (zcu.comp.config.use_llvm) break :queue_codegen;
             if (file.mod.?.strip) break :queue_codegen;
         }
@@ -1746,7 +1765,13 @@ pub fn ensureFuncBodyUpToDate(pt: Zcu.PerThread, func_index: InternPool.Index) Z
         .{ prev_failed or result.ies_outdated, false }
     else |err| switch (err) {
         error.AnalysisFail => res: {
-            if (Zcu.tls_retry_loop != null) return error.AnalysisFail;
+            if (Zcu.tls_retry_loop != null) {
+                // `setAnalyzed` ran at the start of `analyzeFnBodyInner`; undo
+                // it so the re-queued attempt isn't short-circuited by the
+                // is_analyzed fast-path before codegen_func is queued.
+                func.clearAnalyzed(ip);
+                return error.AnalysisFail;
+            }
             if (!zcu.failed_analysis.contains(anal_unit)) {
                 // If this function caused the error, it would have an entry in `failed_analysis`.
                 // Since it does not, this must be a transitive failure.

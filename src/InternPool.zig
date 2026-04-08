@@ -2397,6 +2397,17 @@ pub const Key = union(enum) {
             @atomicStore(FuncAnalysis, analysis_ptr, analysis, .release);
         }
 
+        pub fn clearAnalyzed(func: Func, ip: *InternPool) void {
+            const extra_mutex = &ip.getLocal(func.tid).mutate.extra.mutex;
+            extra_mutex.lock();
+            defer extra_mutex.unlock();
+
+            const analysis_ptr = func.analysisPtr(ip);
+            var analysis = analysis_ptr.*;
+            analysis.is_analyzed = false;
+            @atomicStore(FuncAnalysis, analysis_ptr, analysis, .release);
+        }
+
         /// Returns a pointer that becomes invalid after any additions to the `InternPool`.
         fn zirBodyInstPtr(func: Func, ip: *const InternPool) *TrackedInst.Index {
             const extra = ip.getLocalShared(func.zir_body_inst_tid).extra.acquire();
