@@ -737,7 +737,11 @@ pub const Nav = struct {
             @"addrspace": std.builtin.AddressSpace,
             /// Populated only if `bits.status == .type_resolved`.
             is_threadlocal: bool,
-            _: u1 = 0,
+            /// Seqlock write-in-progress flag. `resolveNavType`/`resolveNavValue`
+            /// set this before mutating `type_or_val` and clear it on the final
+            /// `bits` store; `getNav` spins while it is set so it never returns
+            /// the transient prelude state.
+            writing: bool = false,
         };
 
         fn unpack(repr: Repr) Nav {
@@ -10118,14 +10122,26 @@ fn finishFuncInstance(
     const nav_name = try ip.getOrPutStringFmt(gpa, tid, "{f}__anon_{d}", .{
         fn_owner_nav.name.fmt(ip), @intFromEnum(func_index),
     }, .no_embedded_nulls);
+    // The generic owner's nav is normally `.fully_resolved` by the time we
+    // reach instantiation, but under parallel Sema another thread may hold the
+    // generic's func index (via an alias nav) before the owner nav itself
+    // commits. The modifiers we need are present from `.type_resolved`
+    // onward; switch instead of unconditionally accessing `.fully_resolved`.
+    const owner_mods = switch (fn_owner_nav.status) {
+        .fully_resolved => |r| .{ r.is_const, r.alignment, r.@"linksection", r.@"addrspace" },
+        .type_resolved => |r| .{ r.is_const, r.alignment, r.@"linksection", r.@"addrspace" },
+        // The `getNav` seqlock guarantees we never see the transient prelude
+        // state; a genuine `.unresolved` cannot reach instantiation.
+        .unresolved => unreachable,
+    };
     const nav_index = try ip.createNav(gpa, tid, .{
         .name = nav_name,
         .fqn = try ip.namespacePtr(fn_namespace).internFullyQualifiedName(ip, gpa, tid, nav_name),
         .val = func_index,
-        .is_const = fn_owner_nav.status.fully_resolved.is_const,
-        .alignment = fn_owner_nav.status.fully_resolved.alignment,
-        .@"linksection" = fn_owner_nav.status.fully_resolved.@"linksection",
-        .@"addrspace" = fn_owner_nav.status.fully_resolved.@"addrspace",
+        .is_const = owner_mods[0],
+        .alignment = owner_mods[1],
+        .@"linksection" = owner_mods[2],
+        .@"addrspace" = owner_mods[3],
     });
 
     // Populate the owner_nav field which was left undefined until now.
@@ -11816,7 +11832,7 @@ pub fn getNav(ip: *const InternPool, index: Nav.Index) Nav {
         repr.type_or_val = @atomicLoad(InternPool.Index, tov_ptr, .unordered);
         repr.@"linksection" = @atomicLoad(OptionalNullTerminatedString, ls_ptr, .unordered);
         const b2 = @atomicLoad(Nav.Repr.Bits, bits_ptr, .acquire);
-        if (@as(u16, @bitCast(b1)) == @as(u16, @bitCast(b2))) {
+        if (!b1.writing and @as(u16, @bitCast(b1)) == @as(u16, @bitCast(b2))) {
             repr.bits = b2;
             return repr.unpack();
         }
@@ -12026,12 +12042,13 @@ pub fn resolveNavValue(
     // `.type_resolved` status with the new value (it will see b1 != b2 and
     // retry). The other `bits` fields are unchanged by this prelude store.
     var bits = nav_bits[unwrapped.index];
-    bits.status = .unresolved;
+    bits.writing = true;
     @atomicStore(Nav.Repr.Bits, &nav_bits[unwrapped.index], bits, .release);
 
     @atomicStore(InternPool.Index, &nav_vals[unwrapped.index], resolved.val, .release);
     @atomicStore(OptionalNullTerminatedString, &nav_linksections[unwrapped.index], resolved.@"linksection", .release);
 
+    bits.writing = false;
     bits.status = .fully_resolved;
     bits.is_const = resolved.is_const;
     bits.alignment = resolved.alignment;

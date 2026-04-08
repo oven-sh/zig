@@ -2826,6 +2826,15 @@ pub fn comptimeOnlyInner(
                                 const i: u32 = @intCast(i_usize);
                                 if (struct_type.fieldIsComptime(ip, i)) continue;
                                 const field_ty = struct_type.field_types.get(ip)[i];
+                                // Under parallel Sema, `resolveFields` may have
+                                // returned before every slot is published; an
+                                // unpublished slot is still being resolved and
+                                // we treat the answer as unknown (false-neg ok
+                                // per the contract above).
+                                if (zcu.parallel_sema and field_ty == .none) {
+                                    struct_type.setRequiresComptime(ip, .unknown);
+                                    return false;
+                                }
                                 if (try Type.fromInterned(field_ty).comptimeOnlyInner(strat, zcu, tid)) {
                                     // Note that this does not cause the layout to
                                     // be considered resolved. Comptime-only types
@@ -2876,6 +2885,10 @@ pub fn comptimeOnlyInner(
 
                             for (0..union_type.field_types.len) |field_idx| {
                                 const field_ty = union_type.field_types.get(ip)[field_idx];
+                                if (zcu.parallel_sema and field_ty == .none) {
+                                    union_type.setRequiresComptime(ip, .unknown);
+                                    return false;
+                                }
                                 if (try Type.fromInterned(field_ty).comptimeOnlyInner(strat, zcu, tid)) {
                                     union_type.setRequiresComptime(ip, .yes);
                                     return true;
@@ -3851,8 +3864,38 @@ fn resolveStructInner(
 
     zcu.awaitNamespaceTypeFinished(ty.toIntern());
 
+    const ip = &zcu.intern_pool;
     const struct_obj = zcu.typeToStruct(ty).?;
     const owner: InternPool.AnalUnit = .wrap(.{ .type = ty.toIntern() });
+
+    // Under parallel Sema, gate per-type so only one thread runs this body for
+    // a given type at a time. Cross-thread waits use the claimOrWait condvar
+    // (not retry-requeue), and the wip-flags inside `Sema.resolveStruct*`
+    // revert to their original role of detecting same-thread recursion.
+    var owns_claim = false;
+    claim: while (true) switch (try zcu.claimOrWait(owner)) {
+        .claimed => {
+            owns_claim = true;
+            break :claim;
+        },
+        .recursed => break :claim,
+        .done => {
+            if (zcu.anyAnalysisFailed(owner)) return error.AnalysisFail;
+            const reached = switch (resolution) {
+                .fields => struct_obj.haveFieldTypes(ip),
+                .inits => struct_obj.haveFieldInits(ip),
+                .alignment => struct_obj.layout != .@"packed" and struct_obj.flagsUnordered(ip).alignment != .none,
+                .layout => struct_obj.haveLayout(ip),
+                .full => switch (struct_obj.layout) {
+                    .@"packed" => struct_obj.haveLayout(ip),
+                    .auto, .@"extern" => struct_obj.flagsUnordered(ip).fully_resolved,
+                },
+            };
+            if (reached) return;
+            continue :claim;
+        },
+    };
+    defer if (owns_claim) zcu.releaseClaim(owner);
 
     zcu.semaLock();
     defer zcu.semaUnlock();
@@ -3914,8 +3957,31 @@ fn resolveUnionInner(
 
     zcu.awaitNamespaceTypeFinished(ty.toIntern());
 
+    const ip = &zcu.intern_pool;
     const union_obj = zcu.typeToUnion(ty).?;
     const owner: InternPool.AnalUnit = .wrap(.{ .type = ty.toIntern() });
+
+    var owns_claim = false;
+    claim: while (true) switch (try zcu.claimOrWait(owner)) {
+        .claimed => {
+            owns_claim = true;
+            break :claim;
+        },
+        .recursed => break :claim,
+        .done => {
+            if (zcu.anyAnalysisFailed(owner)) return error.AnalysisFail;
+            const flags = union_obj.flagsUnordered(ip);
+            const reached = switch (resolution) {
+                .fields => flags.status.haveFieldTypes(),
+                .alignment => flags.alignment != .none,
+                .layout => flags.status.haveLayout(),
+                .full => flags.status == .fully_resolved,
+            };
+            if (reached) return;
+            continue :claim;
+        },
+    };
+    defer if (owns_claim) zcu.releaseClaim(owner);
 
     zcu.semaLock();
     defer zcu.semaUnlock();

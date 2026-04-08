@@ -19883,6 +19883,10 @@ fn structInitAnon(
         },
         .existing => |ty| ty,
     };
+    // Under parallel Sema, `.existing` may dedup to a type whose `.wip` owner
+    // has not yet run `setFieldTypesAll`/`finish`; spin so `aggregateValue`'s
+    // canonicalization sees populated field_types.
+    zcu.awaitNamespaceTypeFinished(struct_ty);
     try sema.declareDependency(.{ .interned = struct_ty });
     try sema.addTypeReferenceEntry(src, struct_ty);
 
