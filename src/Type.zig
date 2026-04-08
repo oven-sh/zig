@@ -2734,10 +2734,7 @@ pub fn comptimeOnlyInner(
         // Under parallel Sema an unpublished struct/union field-type slot can
         // surface here (often via tail-recursion through .opt_type/.ptr_type
         // child); the documented contract above allows a false negative.
-        .none => {
-            assert(zcu.parallel_sema);
-            return false;
-        },
+        .none => false,
         .empty_tuple_type => false,
 
         else => switch (ip.indexToKey(ty.toIntern())) {
