@@ -2524,6 +2524,11 @@ pub fn embedFile(
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
+    // `embed_table` and `EmbedFile` allocation are shared state accessed
+    // from the carve-out under parallel Sema.
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+
     const opt_mod: ?*Module = m: {
         if (mem.eql(u8, import_string, "std")) break :m zcu.std_mod;
         if (mem.eql(u8, import_string, "root")) break :m zcu.root_mod;

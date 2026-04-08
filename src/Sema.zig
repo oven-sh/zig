@@ -13865,7 +13865,9 @@ fn zirEmbedFile(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!A
     };
     try sema.declareDependency(.{ .embed_file = ef_idx });
 
-    const result = ef_idx.get(zcu);
+    zcu.semaLock();
+    const result = ef_idx.get(zcu).*;
+    zcu.semaUnlock();
     if (result.val == .none) {
         return sema.fail(block, operand_src, "unable to open '{s}': {s}", .{ name, @errorName(result.err.?) });
     }
