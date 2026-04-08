@@ -457,7 +457,7 @@ pub fn hasRuntimeBitsIgnoreComptime(ty: Type, zcu: *const Zcu) bool {
 
 pub fn hasRuntimeBitsIgnoreComptimeSema(ty: Type, pt: Zcu.PerThread) SemaError!bool {
     return hasRuntimeBitsInner(ty, true, .sema, pt.zcu, pt.tid) catch |err| switch (err) {
-        error.NeedLazy => unreachable, // this would require a resolve strat of lazy
+        error.NeedLazy => if (pt.zcu.parallel_sema) error.AnalysisFail else unreachable,
         else => |e| return e,
     };
 }
@@ -1191,7 +1191,7 @@ fn abiAlignmentInnerErrorUnion(
                         .ty = .comptime_int_type,
                         .storage = .{ .lazy_align = ty.toIntern() },
                     } })) };
-                } else unreachable,
+                } else return error.AnalysisFail,
                 else => |e| return e,
             })) {
                 return .{ .scalar = code_align };
@@ -1239,7 +1239,7 @@ fn abiAlignmentInnerOptional(
                         .ty = .comptime_int_type,
                         .storage = .{ .lazy_align = ty.toIntern() },
                     } })) };
-                } else unreachable,
+                } else return error.AnalysisFail,
                 else => |e| return e,
             })) {
                 return .{ .scalar = .@"1" };
