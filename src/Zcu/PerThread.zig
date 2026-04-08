@@ -2720,8 +2720,9 @@ pub fn scanNamespace(
     }
     // Mark the namespace fully scanned while still holding `sema_lock` so a
     // concurrent `ensureNamespaceUpToDate` doesn't observe a current
-    // generation with empty decls.
-    namespace.generation = zcu.generation;
+    // generation with empty decls. Release store pairs with the acquire in
+    // the lock-free fast-path.
+    @atomicStore(u32, &namespace.generation, zcu.generation, .release);
 }
 
 const ScanDeclIter = struct {
@@ -4341,7 +4342,7 @@ pub fn ensureNamespaceUpToDate(pt: Zcu.PerThread, namespace_index: Zcu.Namespace
     const ip = &zcu.intern_pool;
     const namespace = zcu.namespacePtr(namespace_index);
 
-    if (zcu.parallel_sema and namespace.generation == zcu.generation) return;
+    if (zcu.parallel_sema and @atomicLoad(u32, &namespace.generation, .acquire) == zcu.generation) return;
 
     zcu.semaLock();
     defer zcu.semaUnlock();

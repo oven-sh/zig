@@ -3634,9 +3634,6 @@ pub fn claimOrWait(zcu: *Zcu, unit: AnalUnit) Allocator.Error!enum { claimed, re
             return .claimed;
         }
         if (gop.value_ptr.* == me) return .recursed;
-        // Cross-thread cycle: walk the wait-for chain. Never observed firing
-        // on Bun (IES dependencies are queued, not analysed inline from
-        // workers), but kept as a safety net against deadlock.
         var chain_unit = unit;
         var hops: u32 = 0;
         while (hops < 64) : (hops += 1) {
@@ -3799,6 +3796,8 @@ pub fn deleteUnitCompileLogs(zcu: *Zcu, anal_unit: AnalUnit) void {
 }
 
 pub fn addInlineReferenceFrame(zcu: *Zcu, frame: InlineReferenceFrame) Allocator.Error!Zcu.InlineReferenceFrame.Index {
+    zcu.semaLock();
+    defer zcu.semaUnlock();
     const frame_idx: InlineReferenceFrame.Index = zcu.free_inline_reference_frames.pop() orelse idx: {
         _ = try zcu.inline_reference_frames.addOne(zcu.gpa);
         break :idx @enumFromInt(zcu.inline_reference_frames.items.len - 1);

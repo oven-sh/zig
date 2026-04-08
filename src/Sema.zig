@@ -117,11 +117,14 @@ comptime_allocs: std.ArrayListUnmanaged(ComptimeAlloc) = .empty,
 /// these are flushed to `Zcu.single_exports` or `Zcu.multi_exports`.
 exports: std.ArrayListUnmanaged(Zcu.Export) = .empty,
 
-/// All references registered so far by this `Sema`. This is a temporary duplicate
-/// of data stored in `Zcu.all_references`. It exists to avoid adding references to
-/// a given `AnalUnit` multiple times.
-references: std.AutoArrayHashMapUnmanaged(AnalUnit, void) = .empty,
-type_references: std.AutoArrayHashMapUnmanaged(InternPool.Index, void) = .empty,
+/// All references registered so far by this `Sema`. Buffered locally and
+/// flushed to `Zcu.all_references` in `flushExports` so reference recording
+/// is lock-free during the body.
+references: std.AutoArrayHashMapUnmanaged(AnalUnit, struct {
+    src: LazySrcLoc,
+    inline_frame: Zcu.InlineReferenceFrame.Index.Optional,
+}) = .empty,
+type_references: std.AutoArrayHashMapUnmanaged(InternPool.Index, LazySrcLoc) = .empty,
 
 /// All dependencies registered so far by this `Sema`. This is a temporary duplicate
 /// of the main dependency data. It exists to avoid adding dependencies to a given
@@ -31232,14 +31235,15 @@ fn addReferenceEntry(
     if (!zcu.comp.incremental and zcu.comp.reference_trace == 0) return;
     const gop = try sema.references.getOrPut(sema.gpa, referenced_unit);
     if (gop.found_existing) return;
-    zcu.semaLock();
-    defer zcu.semaUnlock();
-    try zcu.addUnitReference(sema.owner, referenced_unit, src, inline_frame: {
-        const block = opt_block orelse break :inline_frame .none;
-        const inlining = block.inlining orelse break :inline_frame .none;
-        const frame = try inlining.refFrame(zcu);
-        break :inline_frame frame.toOptional();
-    });
+    gop.value_ptr.* = .{
+        .src = src,
+        .inline_frame = inline_frame: {
+            const block = opt_block orelse break :inline_frame .none;
+            const inlining = block.inlining orelse break :inline_frame .none;
+            const frame = try inlining.refFrame(zcu);
+            break :inline_frame frame.toOptional();
+        },
+    };
 }
 
 pub fn addTypeReferenceEntry(
@@ -31251,9 +31255,7 @@ pub fn addTypeReferenceEntry(
     if (!zcu.comp.incremental and zcu.comp.reference_trace == 0) return;
     const gop = try sema.type_references.getOrPut(sema.gpa, referenced_type);
     if (gop.found_existing) return;
-    zcu.semaLock();
-    defer zcu.semaUnlock();
-    try zcu.addTypeReference(sema.owner, referenced_type, src);
+    gop.value_ptr.* = src;
 }
 
 fn ensureMemoizedStateResolved(sema: *Sema, src: LazySrcLoc, stage: InternPool.MemoizedStateStage) SemaError!void {
@@ -37223,13 +37225,30 @@ fn analyzeUnreachable(sema: *Sema, block: *Block, src: LazySrcLoc, safety_check:
 /// It takes the exports stored in `sema.export` and flushes them to the `Zcu`
 /// to be processed by the linker after the update.
 pub fn flushExports(sema: *Sema) !void {
-    if (sema.exports.items.len == 0) return;
-
     const zcu = sema.pt.zcu;
     const gpa = zcu.gpa;
 
+    if (sema.exports.items.len == 0 and
+        sema.references.count() == 0 and
+        sema.type_references.count() == 0) return;
+
     zcu.semaLock();
     defer zcu.semaUnlock();
+
+    {
+        var it = sema.references.iterator();
+        while (it.next()) |e|
+            try zcu.addUnitReference(sema.owner, e.key_ptr.*, e.value_ptr.src, e.value_ptr.inline_frame);
+        sema.references.clearRetainingCapacity();
+    }
+    {
+        var it = sema.type_references.iterator();
+        while (it.next()) |e|
+            try zcu.addTypeReference(sema.owner, e.key_ptr.*, e.value_ptr.*);
+        sema.type_references.clearRetainingCapacity();
+    }
+
+    if (sema.exports.items.len == 0) return;
 
     // There may be existing exports. For instance, a struct may export
     // things during both field type resolution and field default resolution.

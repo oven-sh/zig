@@ -3617,10 +3617,16 @@ pub fn resolveLayout(ty: Type, pt: Zcu.PerThread) SemaError!void {
                 const field_ty = Type.fromInterned(tuple_type.types.get(ip)[i]);
                 try field_ty.resolveLayout(pt);
             },
-            .struct_type => return ty.resolveStructInner(pt, .layout),
+            .struct_type => {
+                if (ip.loadStructType(ty.toIntern()).haveLayout(ip)) return;
+                return ty.resolveStructInner(pt, .layout);
+            },
             else => unreachable,
         },
-        .@"union" => return ty.resolveUnionInner(pt, .layout),
+        .@"union" => {
+            if (ip.loadUnionType(ty.toIntern()).haveLayout(ip)) return;
+            return ty.resolveUnionInner(pt, .layout);
+        },
         .array => {
             if (ty.arrayLenIncludingSentinel(zcu) == 0) return;
             const elem_ty = ty.childType(zcu);
@@ -3738,9 +3744,15 @@ pub fn resolveFields(ty: Type, pt: Zcu.PerThread) SemaError!void {
             .type_struct,
             .type_struct_packed,
             .type_struct_packed_inits,
-            => return ty.resolveStructInner(pt, .fields),
+            => {
+                if (ip.loadStructType(ty_ip).haveFieldTypes(ip)) return;
+                return ty.resolveStructInner(pt, .fields);
+            },
 
-            .type_union => return ty.resolveUnionInner(pt, .fields),
+            .type_union => {
+                if (ip.loadUnionType(ty_ip).haveFieldTypes(ip)) return;
+                return ty.resolveUnionInner(pt, .fields);
+            },
 
             else => {},
         },
@@ -3790,24 +3802,38 @@ pub fn resolveFully(ty: Type, pt: Zcu.PerThread) SemaError!void {
                 const field_ty = Type.fromInterned(tuple_type.types.get(ip)[i]);
                 try field_ty.resolveFully(pt);
             },
-            .struct_type => return ty.resolveStructInner(pt, .full),
+            .struct_type => {
+                const s = ip.loadStructType(ty.toIntern());
+                if (s.layout != .@"packed" and s.flagsUnordered(ip).fully_resolved) return;
+                if (s.layout == .@"packed" and s.haveLayout(ip)) return;
+                return ty.resolveStructInner(pt, .full);
+            },
             else => unreachable,
         },
-        .@"union" => return ty.resolveUnionInner(pt, .full),
+        .@"union" => {
+            if (ip.loadUnionType(ty.toIntern()).flagsUnordered(ip).status == .fully_resolved) return;
+            return ty.resolveUnionInner(pt, .full);
+        },
     }
 }
 
 pub fn resolveStructFieldInits(ty: Type, pt: Zcu.PerThread) SemaError!void {
-    // TODO: stop calling this for tuples!
-    _ = pt.zcu.typeToStruct(ty) orelse return;
+    const ip = &pt.zcu.intern_pool;
+    const s = pt.zcu.typeToStruct(ty) orelse return;
+    if (s.haveFieldInits(ip)) return;
     return ty.resolveStructInner(pt, .inits);
 }
 
 pub fn resolveStructAlignment(ty: Type, pt: Zcu.PerThread) SemaError!void {
+    const ip = &pt.zcu.intern_pool;
+    const s = ip.loadStructType(ty.toIntern());
+    if (s.layout != .@"packed" and s.flagsUnordered(ip).alignment != .none) return;
     return ty.resolveStructInner(pt, .alignment);
 }
 
 pub fn resolveUnionAlignment(ty: Type, pt: Zcu.PerThread) SemaError!void {
+    const ip = &pt.zcu.intern_pool;
+    if (ip.loadUnionType(ty.toIntern()).flagsUnordered(ip).alignment != .none) return;
     return ty.resolveUnionInner(pt, .alignment);
 }
 
@@ -3826,33 +3852,14 @@ fn resolveStructInner(
     const owner: InternPool.AnalUnit = .wrap(.{ .type = ty.toIntern() });
 
     zcu.semaLock();
-    const claimed = if (!zcu.parallel_sema) false else loop: while (true) {
-        switch (try zcu.claimOrWait(owner)) {
-            .claimed => break :loop true,
-            // Nested same-thread re-entry: proceed under the held lock; wip
-            // flags detect true cycles.
-            .recursed => break :loop false,
-            // Another thread released; re-claim so two threads cannot both
-            // run the resolution body.
-            .done => continue,
-        }
-    };
-    const already_failed = zcu.failed_analysis.contains(owner) or
-        zcu.transitive_failed_analysis.contains(owner);
+    defer zcu.semaUnlock();
+    if (zcu.failed_analysis.contains(owner) or zcu.transitive_failed_analysis.contains(owner)) {
+        return error.AnalysisFail;
+    }
     if (zcu.comp.debugIncremental()) {
         const info = try zcu.incremental_debug_state.getUnitInfo(gpa, owner);
         info.last_update_gen = zcu.generation;
     }
-    // When we own the claim, run the resolution body without the global lock
-    // so distinct types resolve concurrently. Otherwise keep the lock (we are
-    // either nested same-thread or another thread already holds the claim).
-    if (claimed) zcu.semaUnlock() else {}
-    defer if (claimed) {
-        zcu.semaLock();
-        zcu.releaseClaim(owner);
-        zcu.semaUnlock();
-    } else zcu.semaUnlock();
-    if (already_failed) return error.AnalysisFail;
 
     var analysis_arena = std.heap.ArenaAllocator.init(gpa);
     defer analysis_arena.deinit();
@@ -3883,8 +3890,6 @@ fn resolveStructInner(
         .full => sema.resolveStructFully(ty),
     }) catch |err| switch (err) {
         error.AnalysisFail => {
-            if (claimed) zcu.semaLock();
-            defer if (claimed) zcu.semaUnlock();
             if (!zcu.failed_analysis.contains(owner)) {
                 try zcu.transitive_failed_analysis.put(gpa, owner, {});
             }
@@ -3909,26 +3914,14 @@ fn resolveUnionInner(
     const owner: InternPool.AnalUnit = .wrap(.{ .type = ty.toIntern() });
 
     zcu.semaLock();
-    const claimed = if (!zcu.parallel_sema) false else loop: while (true) {
-        switch (try zcu.claimOrWait(owner)) {
-            .claimed => break :loop true,
-            .recursed => break :loop false,
-            .done => continue,
-        }
-    };
-    const already_failed = zcu.failed_analysis.contains(owner) or
-        zcu.transitive_failed_analysis.contains(owner);
+    defer zcu.semaUnlock();
+    if (zcu.failed_analysis.contains(owner) or zcu.transitive_failed_analysis.contains(owner)) {
+        return error.AnalysisFail;
+    }
     if (zcu.comp.debugIncremental()) {
         const info = try zcu.incremental_debug_state.getUnitInfo(gpa, owner);
         info.last_update_gen = zcu.generation;
     }
-    if (claimed) zcu.semaUnlock() else {}
-    defer if (claimed) {
-        zcu.semaLock();
-        zcu.releaseClaim(owner);
-        zcu.semaUnlock();
-    } else zcu.semaUnlock();
-    if (already_failed) return error.AnalysisFail;
 
     var analysis_arena = std.heap.ArenaAllocator.init(gpa);
     defer analysis_arena.deinit();
@@ -3958,8 +3951,6 @@ fn resolveUnionInner(
         .full => sema.resolveUnionFully(ty),
     }) catch |err| switch (err) {
         error.AnalysisFail => {
-            if (claimed) zcu.semaLock();
-            defer if (claimed) zcu.semaUnlock();
             if (!zcu.failed_analysis.contains(owner)) {
                 try zcu.transitive_failed_analysis.put(gpa, owner, {});
             }
