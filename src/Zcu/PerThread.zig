@@ -1143,6 +1143,13 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
         // The type does indeed depend on the value. We are responsible for populating all state of
         // the `nav_ty`, including exports, references, errors, and dependencies.
         const ty_unit: AnalUnit = .wrap(.{ .nav_ty = nav_id });
+        // Dependency/outdated bookkeeping is only meaningful under
+        // incremental; under parallel non-incremental these maps are not
+        // sema_lock-guarded here, so writing them is unsafe and pointless.
+        if (!zcu.comp.incremental) {
+            if (new_failed) try zcu.putTransitiveFailed(ty_unit);
+            break :type_deps_on_val;
+        }
         const ty_was_outdated = zcu.outdated.swapRemove(ty_unit) or
             zcu.potentially_outdated.swapRemove(ty_unit);
         if (ty_was_outdated) {
