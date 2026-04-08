@@ -8976,11 +8976,14 @@ pub const WipNamespaceType = struct {
     }
 
     pub fn cancel(wip: WipNamespaceType, ip: *InternPool, tid: Zcu.PerThread.Id) void {
+        const extra = ip.getLocalShared(wip.tid).extra.acquire();
+        const extra_items = extra.view().items(.@"0");
+        // If `finish` was already called the index is published; another
+        // thread may be using it, so removal is unsafe. Leave it.
+        if (@atomicLoad(u32, &extra_items[wip.namespace_extra_index], .acquire) != wip_namespace_sentinel) return;
         // Clear the wip sentinel so any thread spinning in
         // `awaitNamespaceTypeFinished` exits instead of livelocking; the
         // index is then removed so subsequent lookups won't see this entry.
-        const extra = ip.getLocalShared(wip.tid).extra.acquire();
-        const extra_items = extra.view().items(.@"0");
         @atomicStore(u32, &extra_items[wip.namespace_extra_index], 0, .release);
         ip.remove(tid, wip.index);
     }
@@ -10071,10 +10074,11 @@ pub const WipEnumType = struct {
     }
 
     pub fn cancel(wip: WipEnumType, ip: *InternPool, tid: Zcu.PerThread.Id) void {
-        // Clear the wip sentinel so any thread spinning in
-        // `awaitNamespaceTypeFinished` exits instead of livelocking.
         const extra = ip.getLocalShared(wip.tid).extra.acquire();
         const extra_items = extra.view().items(.@"0");
+        if (@atomicLoad(u32, &extra_items[wip.namespace_extra_index], .acquire) != wip_namespace_sentinel) return;
+        // Clear the wip sentinel so any thread spinning in
+        // `awaitNamespaceTypeFinished` exits instead of livelocking.
         @atomicStore(u32, &extra_items[wip.namespace_extra_index], 0, .release);
         ip.remove(tid, wip.index);
     }
