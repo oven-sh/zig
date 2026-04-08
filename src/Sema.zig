@@ -3262,7 +3262,7 @@ fn zirEnumDecl(
             // `ensureTypeUpToDate` has resolved the new type if necessary.
             // We just need to check for resolution failures.
             const ty_unit: AnalUnit = .wrap(.{ .type = new_ty });
-            if (zcu.failed_analysis.contains(ty_unit) or zcu.transitive_failed_analysis.contains(ty_unit)) {
+            if (zcu.anyAnalysisFailed(ty_unit)) {
                 return error.AnalysisFail;
             }
 
@@ -16852,7 +16852,7 @@ fn zirThis(
             // `ensureTypeUpToDate` has resolved the new type if necessary.
             // We just need to check for resolution failures.
             const ty_unit: AnalUnit = .wrap(.{ .type = new_ty });
-            if (zcu.failed_analysis.contains(ty_unit) or zcu.transitive_failed_analysis.contains(ty_unit)) {
+            if (zcu.anyAnalysisFailed(ty_unit)) {
                 return error.AnalysisFail;
             }
             return Air.internedToRef(new_ty);

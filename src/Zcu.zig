@@ -3944,8 +3944,19 @@ pub fn handleUpdateExports(
     };
 }
 
+/// Locked check whether `unit` has a (transitive) analysis failure.
+/// `failed_analysis` writers hold `sema_lock`; under parallel Sema a
+/// concurrent rehash during `.contains` is unsafe.
+pub fn anyAnalysisFailed(zcu: *Zcu, unit: AnalUnit) bool {
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+    return zcu.failed_analysis.contains(unit) or zcu.transitive_failed_analysis.contains(unit);
+}
+
 pub fn addGlobalAssembly(zcu: *Zcu, unit: AnalUnit, source: []const u8) !void {
     const gpa = zcu.gpa;
+    zcu.semaLock();
+    defer zcu.semaUnlock();
     const gop = try zcu.global_assembly.getOrPut(gpa, unit);
     if (gop.found_existing) {
         const new_value = try std.fmt.allocPrint(gpa, "{s}\n{s}", .{ gop.value_ptr.*, source });
