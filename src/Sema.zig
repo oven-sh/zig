@@ -3029,9 +3029,10 @@ fn zirStructDecl(
         .parent = block.namespace.toOptional(),
         .owner_type = wip_ty.index,
         .file_scope = block.getFileScopeIndex(zcu),
-        .generation = zcu.generation,
+        .generation = zcu.generation -% 1,
     });
     errdefer pt.destroyNamespace(new_namespace_index);
+    _ = wip_ty.finish(ip, new_namespace_index);
 
     if (pt.zcu.comp.incremental) {
         try pt.addDependency(.wrap(.{ .type = wip_ty.index }), .{ .src_hash = tracked_inst });
@@ -3051,7 +3052,7 @@ fn zirStructDecl(
     try sema.declareDependency(.{ .interned = wip_ty.index });
     try sema.addTypeReferenceEntry(src, wip_ty.index);
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    return Air.internedToRef(wip_ty.finish(ip, new_namespace_index));
+    return Air.internedToRef(wip_ty.index);
 }
 
 pub fn createTypeName(
@@ -3284,9 +3285,10 @@ fn zirEnumDecl(
         .parent = block.namespace.toOptional(),
         .owner_type = wip_ty.index,
         .file_scope = block.getFileScopeIndex(zcu),
-        .generation = zcu.generation,
+        .generation = zcu.generation -% 1,
     });
     errdefer if (!done) pt.destroyNamespace(new_namespace_index);
+    wip_ty.prepare(ip, new_namespace_index);
 
     try pt.scanNamespace(new_namespace_index, decls);
 
@@ -3296,7 +3298,6 @@ fn zirEnumDecl(
     // We've finished the initial construction of this type, and are about to perform analysis.
     // Set the namespace appropriately, and don't destroy anything on failure.
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    wip_ty.prepare(ip, new_namespace_index);
     done = true;
 
     {
@@ -3427,9 +3428,10 @@ fn zirUnionDecl(
         .parent = block.namespace.toOptional(),
         .owner_type = wip_ty.index,
         .file_scope = block.getFileScopeIndex(zcu),
-        .generation = zcu.generation,
+        .generation = zcu.generation -% 1,
     });
     errdefer pt.destroyNamespace(new_namespace_index);
+    _ = wip_ty.finish(ip, new_namespace_index);
 
     if (pt.zcu.comp.incremental) {
         try pt.addDependency(.wrap(.{ .type = wip_ty.index }), .{ .src_hash = tracked_inst });
@@ -3449,7 +3451,7 @@ fn zirUnionDecl(
     try sema.declareDependency(.{ .interned = wip_ty.index });
     try sema.addTypeReferenceEntry(src, wip_ty.index);
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    return Air.internedToRef(wip_ty.finish(ip, new_namespace_index));
+    return Air.internedToRef(wip_ty.index);
 }
 
 fn zirOpaqueDecl(
@@ -3521,9 +3523,10 @@ fn zirOpaqueDecl(
         .parent = block.namespace.toOptional(),
         .owner_type = wip_ty.index,
         .file_scope = block.getFileScopeIndex(zcu),
-        .generation = zcu.generation,
+        .generation = zcu.generation -% 1,
     });
     errdefer pt.destroyNamespace(new_namespace_index);
+    _ = wip_ty.finish(ip, new_namespace_index);
 
     const decls = sema.code.bodySlice(extra_index, decls_len);
     try pt.scanNamespace(new_namespace_index, decls);
@@ -3537,7 +3540,7 @@ fn zirOpaqueDecl(
     }
     try sema.addTypeReferenceEntry(src, wip_ty.index);
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    return Air.internedToRef(wip_ty.finish(ip, new_namespace_index));
+    return Air.internedToRef(wip_ty.index);
 }
 
 fn zirErrorSetDecl(
@@ -19790,9 +19793,9 @@ fn structInitAnon(
                 if (init_val != .none) struct_type.setFieldComptime(ip, field_idx);
             }
 
-            @memcpy(struct_type.field_types.get(ip), types);
+            struct_type.setFieldTypesAll(ip, types);
             if (any_values) {
-                @memcpy(struct_type.field_inits.get(ip), values);
+                struct_type.setFieldInitsAll(ip, values);
             }
 
             const new_namespace_index = try pt.createNamespace(.{
@@ -19801,6 +19804,7 @@ fn structInitAnon(
                 .file_scope = block.getFileScopeIndex(zcu),
                 .generation = zcu.generation,
             });
+            _ = wip.finish(ip, new_namespace_index);
             try zcu.comp.queueJob(.{ .resolve_type_fully = wip.index });
             codegen_type: {
                 if (zcu.comp.config.use_llvm) break :codegen_type;
@@ -19809,7 +19813,7 @@ fn structInitAnon(
                 try zcu.comp.queueJob(.{ .link_type = wip.index });
             }
             if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip.index);
-            break :ty wip.finish(ip, new_namespace_index);
+            break :ty wip.index;
         },
         .existing => |ty| ty,
     };
@@ -20828,10 +20832,11 @@ fn zirReify(
                 .file_scope = block.getFileScopeIndex(zcu),
                 .generation = zcu.generation,
             });
+            _ = wip_ty.finish(ip, new_namespace_index);
 
             try sema.addTypeReferenceEntry(src, wip_ty.index);
             if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-            return Air.internedToRef(wip_ty.finish(ip, new_namespace_index));
+            return Air.internedToRef(wip_ty.index);
         },
         .@"union" => {
             const struct_type = ip.loadStructType(ip.typeOf(union_val.val));
@@ -21044,11 +21049,11 @@ fn reifyEnum(
         .file_scope = block.getFileScopeIndex(zcu),
         .generation = zcu.generation,
     });
+    wip_ty.prepare(ip, new_namespace_index);
 
     try sema.declareDependency(.{ .interned = wip_ty.index });
     try sema.addTypeReferenceEntry(src, wip_ty.index);
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    wip_ty.prepare(ip, new_namespace_index);
     wip_ty.setTagTy(ip, tag_ty.toIntern());
     done = true;
 
@@ -21232,12 +21237,12 @@ fn reifyUnion(
             }
             seen_tags.set(enum_index);
 
-            loaded_union.field_types.get(ip)[field_idx] = field_type_val.toIntern();
+            loaded_union.setFieldType(ip, field_idx, field_type_val.toIntern());
             const byte_align = try field_alignment_val.toUnsignedIntSema(pt);
             if (layout == .@"packed") {
                 if (byte_align != 0) return sema.fail(block, src, "alignment of a packed union field must be set to 0", .{});
             } else {
-                loaded_union.field_aligns.get(ip)[field_idx] = try sema.validateAlign(block, src, byte_align);
+                loaded_union.setFieldAlign(ip, field_idx, try sema.validateAlign(block, src, byte_align));
             }
         }
 
@@ -21276,12 +21281,12 @@ fn reifyUnion(
                 return sema.fail(block, src, "duplicate union field {f}", .{field_name.fmt(ip)});
             }
 
-            loaded_union.field_types.get(ip)[field_idx] = field_type_val.toIntern();
+            loaded_union.setFieldType(ip, field_idx, field_type_val.toIntern());
             const byte_align = try field_alignment_val.toUnsignedIntSema(pt);
             if (layout == .@"packed") {
                 if (byte_align != 0) return sema.fail(block, src, "alignment of a packed union field must be set to 0", .{});
             } else {
-                loaded_union.field_aligns.get(ip)[field_idx] = try sema.validateAlign(block, src, byte_align);
+                loaded_union.setFieldAlign(ip, field_idx, try sema.validateAlign(block, src, byte_align));
             }
         }
 
@@ -21333,6 +21338,7 @@ fn reifyUnion(
         .file_scope = block.getFileScopeIndex(zcu),
         .generation = zcu.generation,
     });
+    _ = wip_ty.finish(ip, new_namespace_index);
 
     try zcu.comp.queueJob(.{ .resolve_type_fully = wip_ty.index });
     codegen_type: {
@@ -21345,7 +21351,7 @@ fn reifyUnion(
     try sema.declareDependency(.{ .interned = wip_ty.index });
     try sema.addTypeReferenceEntry(src, wip_ty.index);
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    return Air.internedToRef(wip_ty.finish(ip, new_namespace_index));
+    return Air.internedToRef(wip_ty.index);
 }
 
 fn reifyTuple(
@@ -21572,7 +21578,7 @@ fn reifyStruct(
         if (layout == .@"packed") {
             if (byte_align != 0) return sema.fail(block, src, "alignment of a packed struct field must be set to 0", .{});
         } else {
-            struct_type.field_aligns.get(ip)[field_idx] = try sema.validateAlign(block, src, byte_align);
+            struct_type.setFieldAlign(ip, field_idx, try sema.validateAlign(block, src, byte_align));
         }
 
         const field_is_comptime = field_is_comptime_val.toBool();
@@ -21599,9 +21605,9 @@ fn reifyStruct(
             return sema.fail(block, src, "comptime field without default initialization value", .{});
         }
 
-        struct_type.field_types.get(ip)[field_idx] = field_type_val.toIntern();
+        struct_type.setFieldType(ip, field_idx, field_type_val.toIntern());
         if (field_default != .none) {
-            struct_type.field_inits.get(ip)[field_idx] = field_default;
+            struct_type.setFieldInit(ip, field_idx, field_default);
         }
 
         if (field_ty.zigTypeTag(zcu) == .@"opaque") {
@@ -21676,6 +21682,7 @@ fn reifyStruct(
         .file_scope = block.getFileScopeIndex(zcu),
         .generation = zcu.generation,
     });
+    _ = wip_ty.finish(ip, new_namespace_index);
 
     try zcu.comp.queueJob(.{ .resolve_type_fully = wip_ty.index });
     codegen_type: {
@@ -21688,7 +21695,7 @@ fn reifyStruct(
     try sema.declareDependency(.{ .interned = wip_ty.index });
     try sema.addTypeReferenceEntry(src, wip_ty.index);
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    return Air.internedToRef(wip_ty.finish(ip, new_namespace_index));
+    return Air.internedToRef(wip_ty.index);
 }
 
 fn resolveVaListRef(sema: *Sema, block: *Block, src: LazySrcLoc, zir_ref: Zir.Inst.Ref) CompileError!Air.Inst.Ref {
@@ -34325,7 +34332,9 @@ pub fn resolveStructAlignment(
     assert(sema.owner.unwrap().type == ty);
 
     assert(struct_type.layout != .@"packed");
-    assert(struct_type.flagsUnordered(ip).alignment == .none);
+    // The unlocked caller-side check is a TOCTOU under parallel Sema; another
+    // thread may have completed this resolution while we waited on sema_lock.
+    if (struct_type.flagsUnordered(ip).alignment != .none) return;
 
     const ptr_align = Alignment.fromByteUnits(@divExact(target.ptrBitWidth(), 8));
 
@@ -34670,7 +34679,7 @@ pub fn resolveUnionAlignment(
 
     assert(sema.owner.unwrap().type == ty.toIntern());
 
-    assert(!union_type.haveLayout(ip));
+    if (union_type.haveLayout(ip)) return;
 
     const ptr_align = Alignment.fromByteUnits(@divExact(target.ptrBitWidth(), 8));
 
@@ -35405,7 +35414,7 @@ fn structFieldInits(
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
 
-    assert(!struct_type.haveFieldInits(ip));
+    if (struct_type.haveFieldInits(ip)) return;
 
     const namespace_index = struct_type.namespace;
     const zir = zcu.namespacePtr(namespace_index).fileScope(zcu).zir.?;

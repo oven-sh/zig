@@ -611,6 +611,9 @@ pub fn ensureFileAnalyzed(pt: Zcu.PerThread, file_index: Zcu.File.Index) Zcu.Sem
             else => |e| return e,
         }
     }
+    pt.zcu.semaLock();
+    defer pt.zcu.semaUnlock();
+    if (pt.zcu.fileRootType(file_index) != .none) return;
     return pt.semaFile(file_index);
 }
 
@@ -627,6 +630,16 @@ pub fn ensureMemoizedStateUpToDate(pt: Zcu.PerThread, stage: InternPool.Memoized
     const unit: AnalUnit = .wrap(.{ .memoized_state = stage });
 
     log.debug("ensureMemoizedStateUpToDate", .{});
+
+    if (zcu.parallel_sema and !zcu.comp.incremental) {
+        const to_check: Zcu.BuiltinDecl = switch (stage) {
+            .main => .Type,
+            .panic => .panic,
+            .va_list => .VaList,
+            .assembly => .assembly,
+        };
+        if (zcu.builtin_decl_values.get(to_check) != .none) return;
+    }
 
     zcu.semaLock();
     defer zcu.semaUnlock();
@@ -980,6 +993,8 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
 
     log.debug("ensureNavValUpToDate {f}", .{zcu.fmtAnalUnit(anal_unit)});
 
+    if (zcu.parallel_sema and !zcu.comp.incremental and nav.status == .fully_resolved) return;
+
     zcu.semaLock();
     defer zcu.semaUnlock();
 
@@ -1133,17 +1148,13 @@ fn analyzeNavVal(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu.CompileErr
     const zir_decl = zir.getDeclaration(inst_resolved.inst);
 
     try zcu.aipPut(gpa, anal_unit);
-    errdefer if (!zcu.parallel_sema) {
-        _ = zcu.analysis_in_progress.swapRemove(anal_unit);
-    };
+    errdefer zcu.aipRemove(anal_unit);
 
     // If there's no type body, we are also resolving the type here.
     if (zir_decl.type_body == null) {
         try zcu.aipPut(gpa, .wrap(.{ .nav_ty = nav_id }));
     }
-    errdefer if (zir_decl.type_body == null and !zcu.parallel_sema) {
-        _ = zcu.analysis_in_progress.swapRemove(.wrap(.{ .nav_ty = nav_id }));
-    };
+    errdefer if (zir_decl.type_body == null) zcu.aipRemove(.wrap(.{ .nav_ty = nav_id }));
 
     var analysis_arena: std.heap.ArenaAllocator = .init(gpa);
     defer analysis_arena.deinit();
@@ -1398,6 +1409,11 @@ pub fn ensureNavTypeUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zc
     const nav = ip.getNav(nav_id);
 
     log.debug("ensureNavTypeUpToDate {f}", .{zcu.fmtAnalUnit(anal_unit)});
+
+    if (zcu.parallel_sema and !zcu.comp.incremental) switch (nav.status) {
+        .fully_resolved, .type_resolved => return,
+        .unresolved => {},
+    };
 
     zcu.semaLock();
     defer zcu.semaUnlock();
@@ -1655,6 +1671,15 @@ pub fn ensureFuncBodyUpToDate(pt: Zcu.PerThread, func_index: InternPool.Index) Z
 
     assert(func.ty == func.uncoerced_ty); // analyze the body of the original function, not a coerced one
 
+    if (zcu.parallel_sema and !zcu.comp.incremental) fast: {
+        const a = func.analysisUnordered(ip);
+        if (!a.is_analyzed) break :fast;
+        if (a.inferred_error_set and func.resolvedErrorSetUnordered(ip) == .none) break :fast;
+        // is_analyzed is set at the start of analysis; the body is finished
+        // once the IES (if inferred) has been resolved past `.none`.
+        return;
+    }
+
     zcu.semaLock();
     defer zcu.semaUnlock();
 
@@ -1880,6 +1905,7 @@ fn createFileRootStruct(
 
     wip_ty.setName(ip, try file.internFullyQualifiedName(pt), .none);
     ip.namespacePtr(namespace_index).owner_type = wip_ty.index;
+    _ = wip_ty.finish(ip, namespace_index);
 
     if (zcu.comp.incremental) {
         try pt.addDependency(.wrap(.{ .type = wip_ty.index }), .{ .src_hash = tracked_inst });
@@ -1895,7 +1921,7 @@ fn createFileRootStruct(
     }
     zcu.setFileRootType(file_index, wip_ty.index);
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    return wip_ty.finish(ip, namespace_index);
+    return wip_ty.index;
 }
 
 /// Re-scan the namespace of a file's root struct type on an incremental update.
@@ -1948,7 +1974,7 @@ fn semaFile(pt: Zcu.PerThread, file_index: Zcu.File.Index) Zcu.SemaError!void {
         .parent = .none,
         .owner_type = undefined, // set in `createFileRootStruct`
         .file_scope = file_index,
-        .generation = zcu.generation,
+        .generation = zcu.generation -% 1,
     });
     const struct_ty = try pt.createFileRootStruct(file_index, new_namespace_index, false);
     errdefer zcu.intern_pool.remove(pt.tid, struct_ty);
@@ -2692,6 +2718,10 @@ pub fn scanNamespace(
     for (decls) |decl_inst| {
         try scan_decl_iter.scanDecl(decl_inst);
     }
+    // Mark the namespace fully scanned while still holding `sema_lock` so a
+    // concurrent `ensureNamespaceUpToDate` doesn't observe a current
+    // generation with empty decls.
+    namespace.generation = zcu.generation;
 }
 
 const ScanDeclIter = struct {
@@ -3019,12 +3049,7 @@ fn analyzeFnBodyInner(pt: Zcu.PerThread, func_index: InternPool.Index) Zcu.SemaE
     inner_block.error_return_trace_index = error_return_trace_index;
 
     {
-        // Carve-out disabled: releasing sema_lock here exposes the
-        // `WipNamespaceType` publish-before-`finish()` window (and similar
-        // create-then-set patterns in InternPool) to concurrent readers.
-        // Re-enable once those windows are closed (claim per wip type, or
-        // delay shard publish into `finish()`).
-        const saved_depth: u32 = 0;
+        const saved_depth = if (std.process.hasNonEmptyEnvVarConstant("ZIG_NO_SEMA_CARVEOUT")) 0 else zcu.semaRelease();
         defer zcu.semaReacquire(saved_depth);
         sema.analyzeFnBody(&inner_block, fn_info.body) catch |err| switch (err) {
             error.ComptimeReturn => unreachable,
@@ -4070,8 +4095,9 @@ fn recreateStructType(
     errdefer wip_ty.cancel(ip, pt.tid);
 
     wip_ty.setName(ip, struct_obj.name, struct_obj.name_nav);
-    try pt.addDependency(.wrap(.{ .type = wip_ty.index }), .{ .src_hash = key.zir_index });
     zcu.namespacePtr(struct_obj.namespace).owner_type = wip_ty.index;
+    const new_ty = wip_ty.finish(ip, struct_obj.namespace);
+    try pt.addDependency(.wrap(.{ .type = wip_ty.index }), .{ .src_hash = key.zir_index });
     // No need to re-scan the namespace -- `zirStructDecl` will ultimately do that if the type is still alive.
     try zcu.comp.queueJob(.{ .resolve_type_fully = wip_ty.index });
 
@@ -4083,7 +4109,6 @@ fn recreateStructType(
     }
 
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    const new_ty = wip_ty.finish(ip, struct_obj.namespace);
     if (inst_info.inst == .main_struct_inst) {
         // This is the root type of a file! Update the reference.
         zcu.setFileRootType(inst_info.file, new_ty);
@@ -4163,8 +4188,9 @@ fn recreateUnionType(
     errdefer wip_ty.cancel(ip, pt.tid);
 
     wip_ty.setName(ip, union_obj.name, union_obj.name_nav);
-    try pt.addDependency(.wrap(.{ .type = wip_ty.index }), .{ .src_hash = key.zir_index });
     zcu.namespacePtr(namespace_index).owner_type = wip_ty.index;
+    _ = wip_ty.finish(ip, namespace_index);
+    try pt.addDependency(.wrap(.{ .type = wip_ty.index }), .{ .src_hash = key.zir_index });
     // No need to re-scan the namespace -- `zirUnionDecl` will ultimately do that if the type is still alive.
     try zcu.comp.queueJob(.{ .resolve_type_fully = wip_ty.index });
 
@@ -4176,7 +4202,7 @@ fn recreateUnionType(
     }
 
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    return wip_ty.finish(ip, namespace_index);
+    return wip_ty.index;
 }
 
 /// This *does* call `Sema.resolveDeclaredEnum`, but errors from it are not propagated.
@@ -4275,10 +4301,10 @@ fn recreateEnumType(
     wip_ty.setName(ip, enum_obj.name, enum_obj.name_nav);
 
     zcu.namespacePtr(namespace_index).owner_type = wip_ty.index;
+    wip_ty.prepare(ip, namespace_index);
     // No need to re-scan the namespace -- `zirEnumDecl` will ultimately do that if the type is still alive.
 
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    wip_ty.prepare(ip, namespace_index);
     done = true;
 
     Sema.resolveDeclaredEnum(
@@ -4313,6 +4339,8 @@ pub fn ensureNamespaceUpToDate(pt: Zcu.PerThread, namespace_index: Zcu.Namespace
     const ip = &zcu.intern_pool;
     const namespace = zcu.namespacePtr(namespace_index);
 
+    zcu.semaLock();
+    defer zcu.semaUnlock();
     if (namespace.generation == zcu.generation) return;
 
     const Container = enum { @"struct", @"union", @"enum", @"opaque" };

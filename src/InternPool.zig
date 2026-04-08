@@ -1313,6 +1313,12 @@ const Local = struct {
                     var new_list: ListSelf = .{ .bytes = @ptrCast(buf[bytes_offset..].ptr) };
                     new_list.header().* = .{ .capacity = capacity };
                     const len = mutable.mutate.len;
+                    // Hold the per-list mutex across the copy and release so a
+                    // cross-tid writer that locked this mutex and acquired the
+                    // shared view cannot have its write land in the old buffer
+                    // after this copy has already snapshotted it.
+                    mutable.mutate.mutex.lock();
+                    defer mutable.mutate.mutex.unlock();
                     // this cold, quickly predictable, condition enables
                     // the `MultiArrayList` optimization in `view`
                     if (len > 0) {
@@ -1320,8 +1326,6 @@ const Local = struct {
                         const new_slice = new_list.view().slice();
                         inline for (fields) |field| @memcpy(new_slice.items(field)[0..len], old_slice.items(field)[0..len]);
                     }
-                    mutable.mutate.mutex.lock();
-                    defer mutable.mutate.mutex.unlock();
                     mutable.list.release(new_list);
                 }
 
@@ -3571,14 +3575,34 @@ pub const LoadedUnionType = struct {
         ptr.* = new_zir_index;
     }
 
-    pub fn setFieldTypes(self: LoadedUnionType, ip: *const InternPool, types: []const Index) void {
+    pub fn setFieldTypes(self: LoadedUnionType, ip: *InternPool, types: []const Index) void {
+        const extra_mutex = &ip.getLocal(self.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
         @memcpy(self.field_types.get(ip), types);
     }
 
-    pub fn setFieldAligns(self: LoadedUnionType, ip: *const InternPool, aligns: []const Alignment) void {
+    pub fn setFieldAligns(self: LoadedUnionType, ip: *InternPool, aligns: []const Alignment) void {
         if (aligns.len == 0) return;
         assert(self.flagsUnordered(ip).any_aligned_fields);
+        const extra_mutex = &ip.getLocal(self.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
         @memcpy(self.field_aligns.get(ip), aligns);
+    }
+
+    pub fn setFieldType(self: LoadedUnionType, ip: *InternPool, i: usize, ty: Index) void {
+        const extra_mutex = &ip.getLocal(self.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        self.field_types.get(ip)[i] = ty;
+    }
+
+    pub fn setFieldAlign(self: LoadedUnionType, ip: *InternPool, i: usize, a: Alignment) void {
+        const extra_mutex = &ip.getLocal(self.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        self.field_aligns.get(ip)[i] = a;
     }
 };
 
@@ -3679,11 +3703,17 @@ pub const LoadedStructType = struct {
             return @as(u1, @truncate(this.get(ip)[i / 32] >> @intCast(i % 32))) != 0;
         }
 
-        pub fn setBit(this: ComptimeBits, ip: *const InternPool, i: usize) void {
+        pub fn setBit(this: ComptimeBits, ip: *InternPool, i: usize) void {
+            const extra_mutex = &ip.getLocal(this.tid).mutate.extra.mutex;
+            extra_mutex.lock();
+            defer extra_mutex.unlock();
             this.get(ip)[i / 32] |= @as(u32, 1) << @intCast(i % 32);
         }
 
-        pub fn clearBit(this: ComptimeBits, ip: *const InternPool, i: usize) void {
+        pub fn clearBit(this: ComptimeBits, ip: *InternPool, i: usize) void {
+            const extra_mutex = &ip.getLocal(this.tid).mutate.extra.mutex;
+            extra_mutex.lock();
+            defer extra_mutex.unlock();
             this.get(ip)[i / 32] &= ~(@as(u32, 1) << @intCast(i % 32));
         }
     };
@@ -3749,8 +3779,48 @@ pub const LoadedStructType = struct {
         ip: *InternPool,
         name: NullTerminatedString,
     ) ?u32 {
-        const extra = ip.getLocalShared(s.tid).extra.acquire();
+        const local = ip.getLocal(s.tid);
+        local.mutate.extra.mutex.lock();
+        defer local.mutate.extra.mutex.unlock();
+        local.mutate.maps.mutex.lock();
+        defer local.mutate.maps.mutex.unlock();
+        const extra = local.shared.extra.acquire();
         return ip.addFieldName(extra, s.names_map.unwrap().?, s.field_names.start, name);
+    }
+
+    pub fn setFieldType(s: LoadedStructType, ip: *InternPool, i: usize, ty: Index) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        s.field_types.get(ip)[i] = ty;
+    }
+
+    pub fn setFieldInit(s: LoadedStructType, ip: *InternPool, i: usize, init_val: Index) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        s.field_inits.get(ip)[i] = init_val;
+    }
+
+    pub fn setFieldAlign(s: LoadedStructType, ip: *InternPool, i: usize, a: Alignment) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        s.field_aligns.get(ip)[i] = a;
+    }
+
+    pub fn setFieldTypesAll(s: LoadedStructType, ip: *InternPool, types: []const Index) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        @memcpy(s.field_types.get(ip), types);
+    }
+
+    pub fn setFieldInitsAll(s: LoadedStructType, ip: *InternPool, inits: []const Index) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        @memcpy(s.field_inits.get(ip), inits);
     }
 
     pub fn fieldAlign(s: LoadedStructType, ip: *const InternPool, i: usize) Alignment {
@@ -7700,6 +7770,38 @@ const GetOrPutKey = union(enum) {
         gop.* = undefined;
     }
 };
+
+/// Sentinel stored in a namespace-type's `namespace` extra slot between
+/// `getStructType`/`getUnionType`/etc. publishing the index and the caller
+/// invoking `WipNamespaceType.finish`. Single-threaded Sema never observes
+/// it; with parallel Sema another thread that dedups to `.existing` may, and
+/// must spin via `awaitNamespaceTypeFinished` before reading namespace/name.
+pub const wip_namespace_sentinel: u32 = std.math.maxInt(u32);
+
+/// Spin until `ty`'s namespace slot is no longer the wip sentinel.
+pub fn awaitNamespaceTypeFinished(ip: *const InternPool, ty: Index) void {
+    const ns_idx = ip.namespaceTypeNamespaceExtraIndex(ty) orelse return;
+    const unwrapped = ty.unwrap(ip);
+    const extra = ip.getLocalShared(unwrapped.tid).extra.acquire();
+    const slot: *const u32 = &extra.view().items(.@"0")[ns_idx];
+    while (@atomicLoad(u32, slot, .acquire) == wip_namespace_sentinel) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn namespaceTypeNamespaceExtraIndex(ip: *const InternPool, ty: Index) ?u32 {
+    const unwrapped = ty.unwrap(ip);
+    const item = unwrapped.getItem(ip);
+    return switch (item.tag) {
+        .type_struct => item.data + std.meta.fieldIndex(Tag.TypeStruct, "namespace").?,
+        .type_struct_packed, .type_struct_packed_inits => item.data + std.meta.fieldIndex(Tag.TypeStructPacked, "namespace").?,
+        .type_union => item.data + std.meta.fieldIndex(Tag.TypeUnion, "namespace").?,
+        .type_opaque => item.data + std.meta.fieldIndex(Tag.TypeOpaque, "namespace").?,
+        .type_enum_auto => item.data + std.meta.fieldIndex(EnumAuto, "namespace").?,
+        .type_enum_explicit, .type_enum_nonexhaustive => item.data + std.meta.fieldIndex(EnumExplicit, "namespace").?,
+        else => null,
+    };
+}
 fn getOrPutKey(
     ip: *InternPool,
     gpa: Allocator,
@@ -8776,7 +8878,7 @@ pub fn getUnionType(
         .padding = std.math.maxInt(u32),
         .name = undefined, // set by `finish`
         .name_nav = undefined, // set by `finish`
-        .namespace = undefined, // set by `finish`
+        .namespace = @enumFromInt(wip_namespace_sentinel), // set by `finish`
         .tag_ty = ini.enum_tag_ty,
         .zir_index = switch (ini.key) {
             inline else => |x| x.zir_index,
@@ -8861,7 +8963,10 @@ pub const WipNamespaceType = struct {
         const extra = ip.getLocalShared(wip.tid).extra.acquire();
         const extra_items = extra.view().items(.@"0");
 
-        extra_items[wip.namespace_extra_index] = @intFromEnum(namespace);
+        // Release-store so a concurrent reader spinning in
+        // `awaitNamespaceTypeFinished` sees this and the prior `setName`
+        // writes once the sentinel is replaced.
+        @atomicStore(u32, &extra_items[wip.namespace_extra_index], @intFromEnum(namespace), .release);
 
         return wip.index;
     }
@@ -8962,7 +9067,7 @@ pub fn getStructType(
                 .name_nav = undefined, // set by `finish`
                 .zir_index = zir_index,
                 .fields_len = ini.fields_len,
-                .namespace = undefined, // set by `finish`
+                .namespace = @enumFromInt(wip_namespace_sentinel), // set by `finish`
                 .backing_int_ty = .none,
                 .names_map = names_map,
                 .flags = .{
@@ -9029,7 +9134,7 @@ pub fn getStructType(
         .name = undefined, // set by `finish`
         .name_nav = undefined, // set by `finish`
         .zir_index = zir_index,
-        .namespace = undefined, // set by `finish`
+        .namespace = @enumFromInt(wip_namespace_sentinel), // set by `finish`
         .fields_len = ini.fields_len,
         .size = std.math.maxInt(u32),
         .flags = .{
@@ -9914,7 +10019,7 @@ pub const WipEnumType = struct {
         const extra = ip.getLocalShared(wip.tid).extra.acquire();
         const extra_items = extra.view().items(.@"0");
 
-        extra_items[wip.namespace_extra_index] = @intFromEnum(namespace);
+        @atomicStore(u32, &extra_items[wip.namespace_extra_index], @intFromEnum(namespace), .release);
     }
 
     pub fn setTagTy(wip: WipEnumType, ip: *InternPool, tag_ty: Index) void {
@@ -10023,7 +10128,7 @@ pub fn getEnumType(
                     inline .declared, .declared_owned_captures => |d| @intCast(d.captures.len),
                     .reified => std.math.maxInt(u32),
                 },
-                .namespace = undefined, // set by `prepare`
+                .namespace = @enumFromInt(wip_namespace_sentinel), // set by `prepare`
                 .int_tag_type = .none, // set by `prepare`
                 .fields_len = ini.fields_len,
                 .names_map = names_map,
@@ -10082,7 +10187,7 @@ pub fn getEnumType(
                     inline .declared, .declared_owned_captures => |d| @intCast(d.captures.len),
                     .reified => std.math.maxInt(u32),
                 },
-                .namespace = undefined, // set by `prepare`
+                .namespace = @enumFromInt(wip_namespace_sentinel), // set by `prepare`
                 .int_tag_type = .none, // set by `prepare`
                 .fields_len = ini.fields_len,
                 .names_map = names_map,
@@ -10293,7 +10398,7 @@ pub fn getOpaqueType(
     const extra_index = addExtraAssumeCapacity(extra, Tag.TypeOpaque{
         .name = undefined, // set by `finish`
         .name_nav = undefined, // set by `finish`
-        .namespace = undefined, // set by `finish`
+        .namespace = @enumFromInt(wip_namespace_sentinel), // set by `finish`
         .zir_index = switch (ini.key) {
             inline else => |x| x.zir_index,
         },
@@ -11662,10 +11767,10 @@ pub fn resolveNavType(
     const unwrapped = nav.unwrap(ip);
 
     const local = ip.getLocal(unwrapped.tid);
-    local.mutate.extra.mutex.lock();
-    defer local.mutate.extra.mutex.unlock();
+    local.mutate.navs.mutex.lock();
+    defer local.mutate.navs.mutex.unlock();
 
-    const navs = local.shared.navs.view();
+    const navs = local.shared.navs.acquire().view();
 
     const nav_analysis_namespace = navs.items(.analysis_namespace);
     const nav_analysis_zir_index = navs.items(.analysis_zir_index);
@@ -11704,10 +11809,10 @@ pub fn resolveNavValue(
     const unwrapped = nav.unwrap(ip);
 
     const local = ip.getLocal(unwrapped.tid);
-    local.mutate.extra.mutex.lock();
-    defer local.mutate.extra.mutex.unlock();
+    local.mutate.navs.mutex.lock();
+    defer local.mutate.navs.mutex.unlock();
 
-    const navs = local.shared.navs.view();
+    const navs = local.shared.navs.acquire().view();
 
     const nav_analysis_namespace = navs.items(.analysis_namespace);
     const nav_analysis_zir_index = navs.items(.analysis_zir_index);

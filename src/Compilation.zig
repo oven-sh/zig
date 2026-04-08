@@ -5164,6 +5164,15 @@ fn performAllTheWork(
                 std.Thread.yield() catch {};
                 continue :work;
             }
+            // A worker may have enqueued between our queue read and the
+            // counter dropping to zero; re-check the queues before exiting.
+            const drained = drained: {
+                comp.work_queue_mutex.lock();
+                defer comp.work_queue_mutex.unlock();
+                for (&comp.work_queues) |*q| if (q.count > 0) break :drained false;
+                break :drained true;
+            };
+            if (!drained) continue :work;
             // If there's no work queued, check if there's anything outdated
             // which we need to work on, and queue it if so.
             if (try zcu.findOutdatedToAnalyze()) |outdated| {

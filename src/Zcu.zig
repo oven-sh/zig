@@ -85,6 +85,9 @@ sema_claim_cond: std.Thread.Condition = .{},
 /// Guarded by `sema_lock`. A worker that finds an entry here for a unit it
 /// needs waits on `sema_claim_cond` until the entry is removed.
 unit_claims: std.AutoHashMapUnmanaged(AnalUnit, std.Thread.Id) = .empty,
+/// Tracks which unit each thread is currently waiting on, for deadlock
+/// detection in `claimOrWait`. Guarded by `sema_lock`.
+claim_waits: std.AutoHashMapUnmanaged(std.Thread.Id, AnalUnit) = .empty,
 sema_pending_jobs: std.atomic.Value(u32) = .init(0),
 /// True while parallel Sema is enabled for this update.
 parallel_sema: bool = false,
@@ -2823,6 +2826,7 @@ pub fn deinit(zcu: *Zcu) void {
         for (zcu.failed_types.values()) |value| value.destroy(gpa);
         zcu.analysis_in_progress.deinit(gpa);
         zcu.unit_claims.deinit(gpa);
+        zcu.claim_waits.deinit(gpa);
         zcu.failed_analysis.deinit(gpa);
         zcu.transitive_failed_analysis.deinit(gpa);
         zcu.failed_codegen.deinit(gpa);
@@ -3603,6 +3607,11 @@ pub fn semaReacquire(zcu: *Zcu, depth: u32) void {
     zcu.sema_lock_depth = depth;
 }
 
+pub fn awaitNamespaceTypeFinished(zcu: *Zcu, ty: InternPool.Index) void {
+    if (!zcu.parallel_sema) return;
+    zcu.intern_pool.awaitNamespaceTypeFinished(ty);
+}
+
 /// Try to claim `unit` for analysis on behalf of `tid`. Returns:
 ///  - `.claimed` if the caller now owns analysis of this unit and must call
 ///    `releaseClaim` when done.
@@ -3621,13 +3630,25 @@ pub fn claimOrWait(zcu: *Zcu, unit: AnalUnit) Allocator.Error!enum { claimed, re
             return .claimed;
         }
         if (gop.value_ptr.* == me) return .recursed;
-        // Another thread holds the claim; fully release and wait.
+        // Cross-thread cycle: walk the wait-for chain. Never observed firing
+        // on Bun (IES dependencies are queued, not analysed inline from
+        // workers), but kept as a safety net against deadlock.
+        var chain_unit = unit;
+        var hops: u32 = 0;
+        while (hops < 64) : (hops += 1) {
+            const holder = zcu.unit_claims.get(chain_unit) orelse break;
+            if (holder == me) return .recursed;
+            chain_unit = zcu.claim_waits.get(holder) orelse break;
+        }
+        // Another thread holds the claim; record our wait, fully release, sleep.
+        try zcu.claim_waits.put(zcu.gpa, me, unit);
         const d = zcu.sema_lock_depth;
         zcu.sema_lock_depth = 0;
         zcu.sema_lock_owner.store(no_sema_owner, .release);
         zcu.sema_claim_cond.wait(&zcu.sema_lock);
         zcu.sema_lock_owner.store(std.Thread.getCurrentId(), .release);
         zcu.sema_lock_depth = d;
+        _ = zcu.claim_waits.remove(me);
         // After wake, check whether the unit is now resolved; if the claim is
         // gone, another thread finished it.
         if (!zcu.unit_claims.contains(unit)) return .done;
@@ -3641,23 +3662,26 @@ pub fn releaseClaim(zcu: *Zcu, unit: AnalUnit) void {
 }
 
 
-/// Locked check whether `unit` is currently being analysed by THIS thread,
-/// for dependency-loop detection from inside Sema.
+/// Under parallel Sema, `analysis_in_progress` is per-OS-thread (lock-free).
+threadlocal var tls_aip: std.AutoArrayHashMapUnmanaged(AnalUnit, void) = .empty;
+
 pub fn semaAipContains(zcu: *Zcu, unit: AnalUnit) bool {
     if (!zcu.parallel_sema) return zcu.analysis_in_progress.contains(unit);
-    zcu.semaLock();
-    defer zcu.semaUnlock();
-    return zcu.analysis_in_progress.contains(unit);
+    return tls_aip.contains(unit);
 }
 
-/// `analysis_in_progress` put that is skipped under parallel Sema (cycle
-/// detection is handled by `unit_claims` instead, which is per-tid).
 pub fn aipPut(zcu: *Zcu, gpa: Allocator, unit: AnalUnit) Allocator.Error!void {
-    if (zcu.parallel_sema) return;
+    if (zcu.parallel_sema) {
+        try tls_aip.put(gpa, unit, {});
+        return;
+    }
     try zcu.analysis_in_progress.putNoClobber(gpa, unit, {});
 }
 pub fn aipRemove(zcu: *Zcu, unit: AnalUnit) void {
-    if (zcu.parallel_sema) return;
+    if (zcu.parallel_sema) {
+        _ = tls_aip.swapRemove(unit);
+        return;
+    }
     assert(zcu.analysis_in_progress.swapRemove(unit));
 }
 

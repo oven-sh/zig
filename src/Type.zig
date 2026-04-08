@@ -1793,6 +1793,37 @@ pub fn layoutIsResolved(ty: Type, zcu: *const Zcu) bool {
     };
 }
 
+/// True iff the `.normal`-strategy queries (`abiSize`, `comptimeOnly`,
+/// `hasRuntimeBits`) can be answered without hitting `unreachable`.
+/// Stronger than `layoutIsResolved`: also requires `requires_comptime` to
+/// have been decided. Recurses through optional/array/error-union/vector.
+pub fn eagerResolved(ty: Type, zcu: *const Zcu) bool {
+    const ip = &zcu.intern_pool;
+    return switch (ip.indexToKey(ty.toIntern())) {
+        .struct_type => b: {
+            const s = ip.loadStructType(ty.toIntern());
+            if (!s.haveLayout(ip)) break :b false;
+            if (s.layout == .@"packed") break :b true;
+            break :b switch (s.requiresComptime(ip)) {
+                .unknown, .wip => false,
+                .yes, .no => true,
+            };
+        },
+        .union_type => b: {
+            const u = ip.loadUnionType(ty.toIntern());
+            break :b u.haveLayout(ip) and switch (u.requiresComptime(ip)) {
+                .unknown, .wip => false,
+                .yes, .no => true,
+            };
+        },
+        .array_type => |a| if (a.lenIncludingSentinel() == 0) true else Type.fromInterned(a.child).eagerResolved(zcu),
+        .vector_type => |v| Type.fromInterned(v.child).eagerResolved(zcu),
+        .opt_type => |c| Type.fromInterned(c).eagerResolved(zcu),
+        .error_union_type => |k| Type.fromInterned(k.payload_type).eagerResolved(zcu),
+        else => true,
+    };
+}
+
 pub fn isSinglePointer(ty: Type, zcu: *const Zcu) bool {
     return switch (zcu.intern_pool.indexToKey(ty.toIntern())) {
         .ptr_type => |ptr_info| ptr_info.flags.size == .one,
@@ -2943,6 +2974,7 @@ pub fn getNamespaceIndex(ty: Type, zcu: *Zcu) InternPool.NamespaceIndex {
 /// Returns null if the type has no namespace.
 pub fn getNamespace(ty: Type, zcu: *Zcu) InternPool.OptionalNamespaceIndex {
     const ip = &zcu.intern_pool;
+    zcu.awaitNamespaceTypeFinished(ty.toIntern());
     return switch (ip.indexToKey(ty.toIntern())) {
         .opaque_type => ip.loadOpaqueType(ty.toIntern()).namespace.toOptional(),
         .struct_type => ip.loadStructType(ty.toIntern()).namespace.toOptional(),
@@ -3788,11 +3820,13 @@ fn resolveStructInner(
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    zcu.awaitNamespaceTypeFinished(ty.toIntern());
 
     const struct_obj = zcu.typeToStruct(ty).?;
     const owner: InternPool.AnalUnit = .wrap(.{ .type = ty.toIntern() });
+
+    zcu.semaLock();
+    defer zcu.semaUnlock();
 
     if (zcu.failed_analysis.contains(owner) or zcu.transitive_failed_analysis.contains(owner)) {
         return error.AnalysisFail;
@@ -3850,11 +3884,13 @@ fn resolveUnionInner(
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    zcu.awaitNamespaceTypeFinished(ty.toIntern());
 
     const union_obj = zcu.typeToUnion(ty).?;
     const owner: InternPool.AnalUnit = .wrap(.{ .type = ty.toIntern() });
+
+    zcu.semaLock();
+    defer zcu.semaUnlock();
 
     if (zcu.failed_analysis.contains(owner) or zcu.transitive_failed_analysis.contains(owner)) {
         return error.AnalysisFail;

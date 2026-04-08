@@ -2200,6 +2200,7 @@ pub const Object = struct {
             .pointer => {
                 // Normalize everything that the debug info does not represent.
                 const ptr_info = ty.ptrInfo(zcu);
+                const child_unresolved = !Type.fromInterned(ptr_info.child).eagerResolved(zcu);
 
                 if (ptr_info.sentinel != .none or
                     ptr_info.flags.address_space != .generic or
@@ -2210,10 +2211,11 @@ pub const Object = struct {
                     ptr_info.flags.is_const or
                     ptr_info.flags.is_volatile or
                     ptr_info.flags.size == .many or ptr_info.flags.size == .c or
+                    child_unresolved or
                     !Type.fromInterned(ptr_info.child).hasRuntimeBitsIgnoreComptime(zcu))
                 {
                     const bland_ptr_ty = try pt.ptrType(.{
-                        .child = if (!Type.fromInterned(ptr_info.child).hasRuntimeBitsIgnoreComptime(zcu))
+                        .child = if (child_unresolved or !Type.fromInterned(ptr_info.child).hasRuntimeBitsIgnoreComptime(zcu))
                             .anyopaque_type
                         else
                             ptr_info.child,
@@ -2352,14 +2354,15 @@ pub const Object = struct {
                 return debug_opaque_type;
             },
             .array => {
+                const arr_safe = ty.eagerResolved(zcu);
                 const debug_array_type = try o.builder.debugArrayType(
                     .none, // Name
                     .none, // File
                     .none, // Scope
                     0, // Line
                     try o.lowerDebugType(pt, ty.childType(zcu)),
-                    ty.abiSize(zcu) * 8,
-                    (ty.abiAlignment(zcu).toByteUnits() orelse 0) * 8,
+                    if (arr_safe) ty.abiSize(zcu) * 8 else 0,
+                    if (arr_safe) (ty.abiAlignment(zcu).toByteUnits() orelse 0) * 8 else 0,
                     try o.builder.metadataTuple(&.{
                         try o.builder.debugSubrange(
                             try o.builder.metadataConstant(try o.builder.intConst(.i64, 0)),
@@ -2418,7 +2421,7 @@ pub const Object = struct {
                 const name = try o.allocTypeName(pt, ty);
                 defer gpa.free(name);
                 const child_ty = ty.optionalChild(zcu);
-                if (!child_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
+                if (!child_ty.eagerResolved(zcu) or !child_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
                     const debug_bool_type = try o.builder.debugBoolType(
                         try o.builder.metadataString(name),
                         8,
@@ -2497,7 +2500,7 @@ pub const Object = struct {
             },
             .error_union => {
                 const payload_ty = ty.errorUnionPayload(zcu);
-                if (!payload_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
+                if (!payload_ty.eagerResolved(zcu) or !payload_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
                     // TODO: Maybe remove?
                     const debug_error_union_type = try o.lowerDebugType(pt, Type.anyerror);
                     try o.debug_type_map.put(gpa, ty, debug_error_union_type);
@@ -2606,7 +2609,12 @@ pub const Object = struct {
 
                         const debug_fwd_ref = try o.builder.debugForwardReference();
 
+                        var any_unresolved = false;
                         for (tuple.types.get(ip), tuple.values.get(ip), 0..) |field_ty, field_val, i| {
+                            if (!Type.fromInterned(field_ty).eagerResolved(zcu)) {
+                                any_unresolved = true;
+                                continue;
+                            }
                             if (field_val != .none or !Type.fromInterned(field_ty).hasRuntimeBits(zcu)) continue;
 
                             const field_size = Type.fromInterned(field_ty).abiSize(zcu);
@@ -2635,8 +2643,8 @@ pub const Object = struct {
                             o.debug_compile_unit, // Scope
                             0, // Line
                             .none, // Underlying type
-                            ty.abiSize(zcu) * 8,
-                            (ty.abiAlignment(zcu).toByteUnits() orelse 0) * 8,
+                            if (any_unresolved) 0 else ty.abiSize(zcu) * 8,
+                            if (any_unresolved) 0 else (ty.abiAlignment(zcu).toByteUnits() orelse 0) * 8,
                             try o.builder.metadataTuple(fields.items),
                         );
 
@@ -2646,14 +2654,12 @@ pub const Object = struct {
                         return debug_struct_type;
                     },
                     .struct_type => {
-                        if (!ip.loadStructType(ty.toIntern()).haveFieldTypes(ip)) {
-                            // This can happen if a struct type makes it all the way to
-                            // flush() without ever being instantiated or referenced (even
-                            // via pointer). The only reason we are hearing about it now is
-                            // that it is being used as a namespace to put other debug types
-                            // into. Therefore we can satisfy this by making an empty namespace,
-                            // rather than changing the frontend to unnecessarily resolve the
-                            // struct field types.
+                        if (!ty.eagerResolved(zcu)) {
+                            // Reachable when a struct is only reachable via pointer
+                            // chains (so the frontend didn't fully resolve it) or
+                            // under parallel Sema when a concurrent worker hasn't
+                            // finished resolving it yet. Emit an empty namespace
+                            // type so debug info stays self-consistent.
                             const debug_struct_type = try o.makeEmptyNamespaceDebugType(pt, ty);
                             try o.debug_type_map.put(gpa, ty, debug_struct_type);
                             return debug_struct_type;
@@ -2684,6 +2690,7 @@ pub const Object = struct {
                 var it = struct_type.iterateRuntimeOrder(ip);
                 while (it.next()) |field_index| {
                     const field_ty = Type.fromInterned(struct_type.field_types.get(ip)[field_index]);
+                    if (!field_ty.eagerResolved(zcu)) continue;
                     if (!field_ty.hasRuntimeBitsIgnoreComptime(zcu)) continue;
                     const field_size = field_ty.abiSize(zcu);
                     const field_align = ty.fieldAlignment(field_index, zcu);
@@ -2726,9 +2733,8 @@ pub const Object = struct {
                 defer gpa.free(name);
 
                 const union_type = ip.loadUnionType(ty.toIntern());
-                if (!union_type.haveFieldTypes(ip) or
-                    !ty.hasRuntimeBitsIgnoreComptime(zcu) or
-                    !union_type.haveLayout(ip))
+                if (!ty.eagerResolved(zcu) or
+                    !ty.hasRuntimeBitsIgnoreComptime(zcu))
                 {
                     const debug_union_type = try o.makeEmptyNamespaceDebugType(pt, ty);
                     try o.debug_type_map.put(gpa, ty, debug_union_type);
@@ -2777,6 +2783,7 @@ pub const Object = struct {
 
                 for (0..tag_type.names.len) |field_index| {
                     const field_ty = union_type.field_types.get(ip)[field_index];
+                    if (!Type.fromInterned(field_ty).eagerResolved(zcu)) continue;
                     if (!Type.fromInterned(field_ty).hasRuntimeBitsIgnoreComptime(zcu)) continue;
 
                     const field_size = Type.fromInterned(field_ty).abiSize(zcu);
@@ -2892,7 +2899,9 @@ pub const Object = struct {
                 try debug_param_types.ensureUnusedCapacity(3 + fn_info.param_types.len);
 
                 // Return type goes first.
-                if (Type.fromInterned(fn_info.return_type).hasRuntimeBitsIgnoreComptime(zcu)) {
+                if (Type.fromInterned(fn_info.return_type).eagerResolved(zcu) and
+                    Type.fromInterned(fn_info.return_type).hasRuntimeBitsIgnoreComptime(zcu))
+                {
                     const sret = firstParamSRet(fn_info, zcu, target);
                     const ret_ty = if (sret) Type.void else Type.fromInterned(fn_info.return_type);
                     debug_param_types.appendAssumeCapacity(try o.lowerDebugType(pt, ret_ty));
@@ -2912,6 +2921,7 @@ pub const Object = struct {
 
                 for (0..fn_info.param_types.len) |i| {
                     const param_ty = Type.fromInterned(fn_info.param_types.get(ip)[i]);
+                    if (!param_ty.eagerResolved(zcu)) continue;
                     if (!param_ty.hasRuntimeBitsIgnoreComptime(zcu)) continue;
 
                     if (isByRef(param_ty, zcu)) {
