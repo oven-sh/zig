@@ -10526,7 +10526,11 @@ pub fn remove(ip: *InternPool, tid: Zcu.PerThread.Id, index: Index) void {
     if (unwrapped_index.tid == tid) {
         const items_len = &ip.getLocal(unwrapped_index.tid).mutate.items.len;
         if (unwrapped_index.index == items_len.* - 1) {
-            // Happy case - we can just drop the item without affecting any other indices.
+            // Tombstone first so a stale shard-map entry that still points
+            // here is skipped by the `.removed` check in the lockless probe
+            // even after this slot is reused by the next append.
+            const items = ip.getLocalShared(unwrapped_index.tid).items.acquire().view();
+            @atomicStore(Tag, &items.items(.tag)[unwrapped_index.index], .removed, .release);
             items_len.* -= 1;
             return;
         }
