@@ -5542,8 +5542,8 @@ fn zirCompileLog(
 
     const line_data = try zcu.intern_pool.getOrPutString(gpa, pt.tid, aw.written(), .no_embedded_nulls);
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    zcu.compile_log_mutex.lock();
+    defer zcu.compile_log_mutex.unlock();
     const line_idx: Zcu.CompileLogLine.Index = if (zcu.free_compile_log_lines.pop()) |idx| idx: {
         zcu.compile_log_lines.items[@intFromEnum(idx)] = .{
             .next = .none,
@@ -5764,8 +5764,8 @@ fn zirCImport(sema: *Sema, parent_block: *Block, inst: Zir.Inst.Index) CompileEr
             if (!comp.config.link_libc)
                 try sema.errNote(src, msg, "libc headers not available; compilation does not link against libc", .{});
 
-            zcu.semaLock();
-            defer zcu.semaUnlock();
+            zcu.cimport_errors_mutex.lock();
+            defer zcu.cimport_errors_mutex.unlock();
             const gop = try zcu.cimport_errors.getOrPut(gpa, sema.owner);
             if (!gop.found_existing) {
                 gop.value_ptr.* = c_import_res.errors;
@@ -31347,8 +31347,8 @@ fn ensureMemoizedStateResolved(sema: *Sema, src: LazySrcLoc, stage: InternPool.M
 fn maybeRetryTypeLoop(sema: *Sema, ty: Type) Allocator.Error!bool {
     const zcu = sema.pt.zcu;
     const unit: AnalUnit = .wrap(.{ .type = ty.toIntern() });
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    zcu.sema_retry_mutex.lock();
+    defer zcu.sema_retry_mutex.unlock();
     const gop = try zcu.sema_retry_counts.getOrPut(zcu.gpa, unit);
     if (!gop.found_existing) gop.value_ptr.* = 0;
     gop.value_ptr.* +|= 1;
@@ -31389,14 +31389,14 @@ pub fn ensureNavResolved(sema: *Sema, block: *Block, src: LazySrcLoc, nav_index:
             // The loop may be order-dependent: another thread could resolve
             // an intermediate nav and break the chain. Signal the outermost
             // analyze_func to release-and-requeue instead of marking failed.
-            zcu.semaLock();
+            zcu.sema_retry_mutex.lock();
             const tries: u8 = blk: {
                 const gop = zcu.sema_retry_counts.getOrPut(zcu.gpa, anal_unit) catch break :blk 255;
                 if (!gop.found_existing) gop.value_ptr.* = 0;
                 gop.value_ptr.* +|= 1;
                 break :blk gop.value_ptr.*;
             };
-            zcu.semaUnlock();
+            zcu.sema_retry_mutex.unlock();
             if (tries < 8) {
                 Zcu.tls_retry_loop = anal_unit;
                 return error.AnalysisFail;

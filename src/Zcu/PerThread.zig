@@ -873,6 +873,8 @@ pub fn ensureComptimeUnitUpToDate(pt: Zcu.PerThread, cu_id: InternPool.ComptimeU
             if (Zcu.tls_retry_loop != null) {
                 // Re-mark outdated so the re-queued attempt actually re-runs
                 // instead of taking the was_outdated=false early return.
+                zcu.outdated_mutex.lock();
+                defer zcu.outdated_mutex.unlock();
                 try zcu.outdated.put(gpa, anal_unit, 0);
                 return error.AnalysisFail;
             }
@@ -2770,7 +2772,9 @@ pub fn scanNamespace(
         const zir_index = ip.getNav(nav).analysis.?.zir_index;
         existing_by_inst.putAssumeCapacityNoClobber(zir_index, .wrap(.{ .nav_val = nav }));
         // This test will be re-added to `test_functions` later on if it's still alive. Remove it for now.
+        zcu.test_functions_mutex.lock();
         _ = zcu.test_functions.swapRemove(nav);
+        zcu.test_functions_mutex.unlock();
     }
 
     var seen_decls: std.AutoHashMapUnmanaged(InternPool.NullTerminatedString, void) = .empty;
@@ -2940,7 +2944,11 @@ const ScanDeclIter = struct {
                                 if (std.mem.indexOf(u8, fqn_slice, test_filter) != null) break;
                             } else break :a false;
                         }
-                        try zcu.test_functions.put(gpa, nav, {});
+                        {
+                            zcu.test_functions_mutex.lock();
+                            defer zcu.test_functions_mutex.unlock();
+                            try zcu.test_functions.put(gpa, nav, {});
+                        }
                         break :a true;
                     },
                     .@"const", .@"var" => a: {

@@ -115,6 +115,14 @@ nav_queued_mutex: std.Thread.Mutex = .{},
 /// fresh ones, ensureComptimeUnitUpToDate consumes), so this mutex is rarely
 /// contended.
 outdated_mutex: std.Thread.Mutex = .{},
+/// Guards `test_functions`.
+test_functions_mutex: std.Thread.Mutex = .{},
+/// Guards `cimport_errors`.
+cimport_errors_mutex: std.Thread.Mutex = .{},
+/// Guards `sema_retry_counts`.
+sema_retry_mutex: std.Thread.Mutex = .{},
+/// Guards `compile_logs` + `compile_log_lines` + `free_compile_log_lines`.
+compile_log_mutex: std.Thread.Mutex = .{},
 /// True while parallel Sema is enabled for this update.
 parallel_sema: bool = false,
 /// The number of codegen jobs which are pending or in-progress. Whichever thread drops this value
@@ -3861,6 +3869,8 @@ pub fn deleteUnitReferences(zcu: *Zcu, anal_unit: AnalUnit) void {
 /// Delete all compile logs performed by this `AnalUnit`.
 /// Re-analysis of the `AnalUnit` will cause logs to be rediscovered.
 pub fn deleteUnitCompileLogs(zcu: *Zcu, anal_unit: AnalUnit) void {
+    zcu.compile_log_mutex.lock();
+    defer zcu.compile_log_mutex.unlock();
     const kv = zcu.compile_logs.fetchSwapRemove(anal_unit) orelse return;
     const gpa = zcu.gpa;
     var opt_line_idx = kv.value.first_line.toOptional();
