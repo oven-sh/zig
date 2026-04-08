@@ -2713,6 +2713,18 @@ pub fn onePossibleValue(starting_type: Type, pt: Zcu.PerThread) !?Value {
 
 /// During semantic analysis, instead call `ty.comptimeOnlySema` which
 /// resolves field types rather than asserting they are already resolved.
+/// Recurse `comptimeOnlyInner` without tripping `fromInterned`/`toIntern`
+/// asserts when `child` is an unpublished `.none` slot under parallel Sema.
+fn childComptimeOnly(
+    child: InternPool.Index,
+    comptime strat: ResolveStrat,
+    zcu: strat.ZcuPtr(),
+    tid: strat.Tid(),
+) SemaError!bool {
+    if (child == .none) return false;
+    return (Type{ .ip_index = child }).comptimeOnlyInner(strat, zcu, tid);
+}
+
 pub fn comptimeOnly(ty: Type, zcu: *const Zcu) bool {
     return ty.comptimeOnlyInner(.normal, zcu, {}) catch unreachable;
 }
@@ -2741,6 +2753,7 @@ pub fn comptimeOnlyInner(
         else => switch (ip.indexToKey(ty.toIntern())) {
             .int_type => false,
             .ptr_type => |ptr_type| {
+                if (ptr_type.child == .none) return false;
                 const child_ty = Type.fromInterned(ptr_type.child);
                 switch (child_ty.zigTypeTag(zcu)) {
                     .@"fn" => return !try child_ty.fnHasRuntimeBitsInner(strat, zcu, tid),
@@ -2752,10 +2765,10 @@ pub fn comptimeOnlyInner(
                 if (child == .none) return false;
                 return Type.fromInterned(child).comptimeOnlyInner(strat, zcu, tid);
             },
-            .array_type => |array_type| return Type.fromInterned(array_type.child).comptimeOnlyInner(strat, zcu, tid),
-            .vector_type => |vector_type| return Type.fromInterned(vector_type.child).comptimeOnlyInner(strat, zcu, tid),
-            .opt_type => |child| return Type.fromInterned(child).comptimeOnlyInner(strat, zcu, tid),
-            .error_union_type => |error_union_type| return Type.fromInterned(error_union_type.payload_type).comptimeOnlyInner(strat, zcu, tid),
+            .array_type => |array_type| return childComptimeOnly(array_type.child, strat, zcu, tid),
+            .vector_type => |vector_type| return childComptimeOnly(vector_type.child, strat, zcu, tid),
+            .opt_type => |child| return childComptimeOnly(child, strat, zcu, tid),
+            .error_union_type => |error_union_type| return childComptimeOnly(error_union_type.payload_type, strat, zcu, tid),
 
             .error_set_type,
             .inferred_error_set_type,
@@ -2840,7 +2853,7 @@ pub fn comptimeOnlyInner(
                                     struct_type.setRequiresComptime(ip, .unknown);
                                     return false;
                                 }
-                                if (try Type.fromInterned(field_ty).comptimeOnlyInner(strat, zcu, tid)) {
+                                if (try childComptimeOnly(field_ty, strat, zcu, tid)) {
                                     // Note that this does not cause the layout to
                                     // be considered resolved. Comptime-only types
                                     // still maintain a layout of their
@@ -2860,7 +2873,7 @@ pub fn comptimeOnlyInner(
             .tuple_type => |tuple| {
                 for (tuple.types.get(ip), tuple.values.get(ip)) |field_ty, val| {
                     const have_comptime_val = val != .none;
-                    if (!have_comptime_val and try Type.fromInterned(field_ty).comptimeOnlyInner(strat, zcu, tid)) return true;
+                    if (!have_comptime_val and try childComptimeOnly(field_ty, strat, zcu, tid)) return true;
                 }
                 return false;
             },
@@ -2894,7 +2907,7 @@ pub fn comptimeOnlyInner(
                                     union_type.setRequiresComptime(ip, .unknown);
                                     return false;
                                 }
-                                if (try Type.fromInterned(field_ty).comptimeOnlyInner(strat, zcu, tid)) {
+                                if (try childComptimeOnly(field_ty, strat, zcu, tid)) {
                                     union_type.setRequiresComptime(ip, .yes);
                                     return true;
                                 }
@@ -2909,7 +2922,7 @@ pub fn comptimeOnlyInner(
 
             .opaque_type => false,
 
-            .enum_type => return Type.fromInterned(ip.loadEnumType(ty.toIntern()).tag_ty).comptimeOnlyInner(strat, zcu, tid),
+            .enum_type => return childComptimeOnly(ip.loadEnumType(ty.toIntern()).tag_ty, strat, zcu, tid),
 
             // values, not types
             .undef,
