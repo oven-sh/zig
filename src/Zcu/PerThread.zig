@@ -632,13 +632,16 @@ pub fn ensureMemoizedStateUpToDate(pt: Zcu.PerThread, stage: InternPool.Memoized
     log.debug("ensureMemoizedStateUpToDate", .{});
 
     if (zcu.parallel_sema and !zcu.comp.incremental) {
+        // Probe the *last* entry written for each stage so we never observe a
+        // partially-populated stage as complete. Paired with the release fence
+        // in `Sema.analyzeMemoizedState`.
         const to_check: Zcu.BuiltinDecl = switch (stage) {
-            .main => .Type,
-            .panic => .panic,
+            .main => .@"Type.Declaration",
+            .panic => .@"panic.noreturnReturned",
             .va_list => .VaList,
-            .assembly => .assembly,
+            .assembly => .@"assembly.Clobbers",
         };
-        if (zcu.builtin_decl_values.get(to_check) != .none) return;
+        if (@atomicLoad(InternPool.Index, zcu.builtin_decl_values.getPtrConst(to_check), .acquire) != .none) return;
     }
 
     zcu.semaLock();
@@ -670,12 +673,13 @@ pub fn ensureMemoizedStateUpToDate(pt: Zcu.PerThread, stage: InternPool.Memoized
         _ = zcu.transitive_failed_analysis.swapRemove(unit);
     } else {
         if (prev_failed) return error.AnalysisFail;
-        // We use an arbitrary element to check if the state has been resolved yet.
+        // Probe the *last* entry written for each stage so we never observe a
+        // partially-populated stage as complete.
         const to_check: Zcu.BuiltinDecl = switch (stage) {
-            .main => .Type,
-            .panic => .panic,
+            .main => .@"Type.Declaration",
+            .panic => .@"panic.noreturnReturned",
             .va_list => .VaList,
-            .assembly => .assembly,
+            .assembly => .@"assembly.Clobbers",
         };
         if (zcu.builtin_decl_values.get(to_check) != .none) return;
     }

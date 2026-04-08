@@ -3017,7 +3017,8 @@ fn zirStructDecl(
         },
         .wip => |wip| wip,
     };
-    errdefer wip_ty.cancel(ip, pt.tid);
+    var published = false;
+    errdefer if (!published) wip_ty.cancel(ip, pt.tid);
 
     const type_name = try sema.createTypeName(
         block,
@@ -3034,8 +3035,9 @@ fn zirStructDecl(
         .file_scope = block.getFileScopeIndex(zcu),
         .generation = zcu.generation -% 1,
     });
-    errdefer pt.destroyNamespace(new_namespace_index);
+    errdefer if (!published) pt.destroyNamespace(new_namespace_index);
     _ = wip_ty.finish(ip, new_namespace_index);
+    published = true;
 
     if (pt.zcu.comp.incremental) {
         try pt.addDependency(.wrap(.{ .type = wip_ty.index }), .{ .src_hash = tracked_inst });
@@ -3416,7 +3418,8 @@ fn zirUnionDecl(
         },
         .wip => |wip| wip,
     };
-    errdefer wip_ty.cancel(ip, pt.tid);
+    var published = false;
+    errdefer if (!published) wip_ty.cancel(ip, pt.tid);
 
     const type_name = try sema.createTypeName(
         block,
@@ -3433,8 +3436,9 @@ fn zirUnionDecl(
         .file_scope = block.getFileScopeIndex(zcu),
         .generation = zcu.generation -% 1,
     });
-    errdefer pt.destroyNamespace(new_namespace_index);
+    errdefer if (!published) pt.destroyNamespace(new_namespace_index);
     _ = wip_ty.finish(ip, new_namespace_index);
+    published = true;
 
     if (pt.zcu.comp.incremental) {
         try pt.addDependency(.wrap(.{ .type = wip_ty.index }), .{ .src_hash = tracked_inst });
@@ -3511,7 +3515,8 @@ fn zirOpaqueDecl(
         },
         .wip => |wip| wip,
     };
-    errdefer wip_ty.cancel(ip, pt.tid);
+    var published = false;
+    errdefer if (!published) wip_ty.cancel(ip, pt.tid);
 
     const type_name = try sema.createTypeName(
         block,
@@ -3528,8 +3533,9 @@ fn zirOpaqueDecl(
         .file_scope = block.getFileScopeIndex(zcu),
         .generation = zcu.generation -% 1,
     });
-    errdefer pt.destroyNamespace(new_namespace_index);
+    errdefer if (!published) pt.destroyNamespace(new_namespace_index);
     _ = wip_ty.finish(ip, new_namespace_index);
+    published = true;
 
     const decls = sema.code.bodySlice(extra_index, decls_len);
     try pt.scanNamespace(new_namespace_index, decls);
@@ -20818,7 +20824,8 @@ fn zirReify(
                 },
                 .wip => |wip| wip,
             };
-            errdefer wip_ty.cancel(ip, pt.tid);
+            var published = false;
+            errdefer if (!published) wip_ty.cancel(ip, pt.tid);
 
             const type_name = try sema.createTypeName(
                 block,
@@ -20836,6 +20843,7 @@ fn zirReify(
                 .generation = zcu.generation,
             });
             _ = wip_ty.finish(ip, new_namespace_index);
+            published = true;
 
             try sema.addTypeReferenceEntry(src, wip_ty.index);
             if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
@@ -21194,7 +21202,8 @@ fn reifyUnion(
             return Air.internedToRef(ty);
         },
     };
-    errdefer wip_ty.cancel(ip, pt.tid);
+    var published = false;
+    errdefer if (!published) wip_ty.cancel(ip, pt.tid);
 
     const type_name = try sema.createTypeName(
         block,
@@ -21342,6 +21351,7 @@ fn reifyUnion(
         .generation = zcu.generation,
     });
     _ = wip_ty.finish(ip, new_namespace_index);
+    published = true;
 
     try zcu.comp.queueJob(.{ .resolve_type_fully = wip_ty.index });
     codegen_type: {
@@ -21544,7 +21554,8 @@ fn reifyStruct(
             return Air.internedToRef(ty);
         },
     };
-    errdefer wip_ty.cancel(ip, pt.tid);
+    var published = false;
+    errdefer if (!published) wip_ty.cancel(ip, pt.tid);
 
     const type_name = try sema.createTypeName(
         block,
@@ -21686,6 +21697,7 @@ fn reifyStruct(
         .generation = zcu.generation,
     });
     _ = wip_ty.finish(ip, new_namespace_index);
+    published = true;
 
     try zcu.comp.queueJob(.{ .resolve_type_fully = wip_ty.index });
     codegen_type: {
@@ -37653,7 +37665,10 @@ pub fn analyzeMemoizedState(sema: *Sema, block: *Block, simple_src: LazySrcLoc, 
 
             const prev = zcu.builtin_decl_values.get(builtin_decl);
             if (val.toIntern() != prev) {
-                zcu.builtin_decl_values.set(builtin_decl, val.toIntern());
+                // Release-store so that once the final entry of a stage becomes
+                // visible to the acquire fast-path in `PerThread.ensureMemoizedStateUpToDate`,
+                // all prior entries for that stage are visible too.
+                @atomicStore(InternPool.Index, zcu.builtin_decl_values.getPtr(builtin_decl), val.toIntern(), .release);
                 any_changed = true;
             }
         }
