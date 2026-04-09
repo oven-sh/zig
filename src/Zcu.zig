@@ -3678,13 +3678,13 @@ pub fn wipTypeExit(zcu: *Zcu, ty: InternPool.Index) void {
     _ = tls_wip_types.swapRemove(ty);
 }
 
-pub fn awaitNamespaceTypeFinished(zcu: *Zcu, ty: InternPool.Index) void {
-    awaitNamespaceTypeFinishedConst(zcu, ty);
+pub fn awaitNamespaceTypeFinished(zcu: *Zcu, ty: InternPool.Index) InternPool.NamespaceTypeAwaitResult {
+    return awaitNamespaceTypeFinishedConst(zcu, ty);
 }
-pub fn awaitNamespaceTypeFinishedConst(zcu: *const Zcu, ty: InternPool.Index) void {
-    if (!zcu.parallel_sema) return;
-    if (tls_wip_types.contains(ty)) return;
-    zcu.intern_pool.awaitNamespaceTypeFinished(ty);
+pub fn awaitNamespaceTypeFinishedConst(zcu: *const Zcu, ty: InternPool.Index) InternPool.NamespaceTypeAwaitResult {
+    if (!zcu.parallel_sema) return .finished;
+    if (tls_wip_types.contains(ty)) return .finished;
+    return zcu.intern_pool.awaitNamespaceTypeFinished(ty);
 }
 
 /// Try to claim `unit` for analysis on behalf of `tid`. Returns:
@@ -3741,7 +3741,6 @@ pub fn releaseClaim(zcu: *Zcu, unit: AnalUnit) void {
     zcu.unit_claims_mutex.unlock();
     zcu.sema_claim_cond.broadcast();
 }
-
 
 /// Under parallel Sema, `analysis_in_progress` is per-OS-thread (lock-free).
 threadlocal var tls_aip: std.AutoArrayHashMapUnmanaged(AnalUnit, void) = .empty;
@@ -3854,18 +3853,22 @@ pub fn deleteUnitReferences(zcu: *Zcu, anal_unit: AnalUnit) void {
                 // The same inline frame could be used multiple times by one unit. We need to
                 // detect this case to avoid adding it to `free_inline_reference_frames` more
                 // than once. We do that by setting `parent` to itself as a marker.
-                if (inline_frame.ptr(zcu).parent == inline_frame.toOptional()) break;
-                {
-                    zcu.inline_ref_mutex.lock();
-                    defer zcu.inline_ref_mutex.unlock();
-                    zcu.free_inline_reference_frames.append(gpa, inline_frame) catch {
-                        // This space will be reused eventually, so we need not propagate this error.
-                        // Just leak it for now, and let GC reclaim it later on.
-                        break :unit_refs;
-                    };
-                }
-                opt_inline_frame = inline_frame.ptr(zcu).parent;
-                inline_frame.ptr(zcu).parent = inline_frame.toOptional(); // signal to code above
+                // All accesses through `inline_frame.ptr(zcu)` must hold `inline_ref_mutex`
+                // because a concurrent `addInlineReferenceFrame` may realloc the backing
+                // array, and once we append to the free list the slot may be popped and
+                // overwritten.
+                zcu.inline_ref_mutex.lock();
+                defer zcu.inline_ref_mutex.unlock();
+                const frame_ptr = inline_frame.ptr(zcu);
+                if (frame_ptr.parent == inline_frame.toOptional()) break;
+                const parent = frame_ptr.parent;
+                frame_ptr.parent = inline_frame.toOptional(); // signal to code above
+                zcu.free_inline_reference_frames.append(gpa, inline_frame) catch {
+                    // This space will be reused eventually, so we need not propagate this error.
+                    // Just leak it for now, and let GC reclaim it later on.
+                    break :unit_refs;
+                };
+                opt_inline_frame = parent;
             }
         }
     }

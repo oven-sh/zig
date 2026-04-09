@@ -3008,7 +3008,10 @@ pub fn getNamespaceIndex(ty: Type, zcu: *Zcu) InternPool.NamespaceIndex {
 /// Returns null if the type has no namespace.
 pub fn getNamespace(ty: Type, zcu: *Zcu) InternPool.OptionalNamespaceIndex {
     const ip = &zcu.intern_pool;
-    zcu.awaitNamespaceTypeFinished(ty.toIntern());
+    // Callers reach here only with indices that have already passed the
+    // `.existing` retry loop in Sema (or are owned by this thread via
+    // `tls_wip_types`), so `.cancelled` is not expected.
+    _ = zcu.awaitNamespaceTypeFinished(ty.toIntern());
     return switch (ip.indexToKey(ty.toIntern())) {
         .opaque_type => ip.loadOpaqueType(ty.toIntern()).namespace.toOptional(),
         .struct_type => ip.loadStructType(ty.toIntern()).namespace.toOptional(),
@@ -3142,7 +3145,7 @@ pub fn enumFieldIndex(ty: Type, field_name: InternPool.NullTerminatedString, zcu
     const ip = &zcu.intern_pool;
     // The `.existing` dedup may return an enum whose `WipEnumType` owner is
     // still populating names; spin until prepare() so the lookup sees them.
-    Zcu.awaitNamespaceTypeFinishedConst(zcu, ty.toIntern());
+    _ = Zcu.awaitNamespaceTypeFinishedConst(zcu, ty.toIntern());
     const enum_type = ip.loadEnumType(ty.toIntern());
     return enum_type.nameIndex(ip, field_name);
 }
@@ -3152,7 +3155,7 @@ pub fn enumFieldIndex(ty: Type, field_name: InternPool.NullTerminatedString, zcu
 /// declaration order, or `null` if `enum_tag` does not match any field.
 pub fn enumTagFieldIndex(ty: Type, enum_tag: Value, zcu: *const Zcu) ?u32 {
     const ip = &zcu.intern_pool;
-    Zcu.awaitNamespaceTypeFinishedConst(zcu, ty.toIntern());
+    _ = Zcu.awaitNamespaceTypeFinishedConst(zcu, ty.toIntern());
     const enum_type = ip.loadEnumType(ty.toIntern());
     const int_tag = switch (ip.indexToKey(enum_tag.toIntern())) {
         .int => enum_tag.toIntern(),
@@ -3884,7 +3887,7 @@ fn resolveStructInner(
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
-    zcu.awaitNamespaceTypeFinished(ty.toIntern());
+    _ = zcu.awaitNamespaceTypeFinished(ty.toIntern());
 
     const ip = &zcu.intern_pool;
     const struct_obj = zcu.typeToStruct(ty).?;
@@ -3979,7 +3982,7 @@ fn resolveUnionInner(
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
-    zcu.awaitNamespaceTypeFinished(ty.toIntern());
+    _ = zcu.awaitNamespaceTypeFinished(ty.toIntern());
 
     const ip = &zcu.intern_pool;
     const union_obj = zcu.typeToUnion(ty).?;
