@@ -875,6 +875,11 @@ fn initSymbols(self: *Object, allocator: Allocator, macho_file: *MachO) !void {
         if (nlist.ext()) {
             if (nlist.undf()) {
                 symbol.flags.weak_ref = nlist.weakRef();
+                // Private-extern commons (e.g. asan's
+                // `____asan_globals_registered`) are N_PEXT|N_EXT|N_UNDF —
+                // record their hidden visibility so `markExportsRelocatable`
+                // and `setOutputSym` emit them as private-extern, not local.
+                if (nlist.pext()) symbol.visibility = .hidden;
             } else if (nlist.pext() or (nlist.weakDef() and nlist.weakRef()) or self.hidden) {
                 symbol.visibility = .hidden;
             } else {
@@ -1586,10 +1591,12 @@ pub fn convertTentativeDefinitions(self: *Object, macho_file: *MachO) !void {
         sym.flags.weak = false;
         sym.flags.weak_ref = false;
         sym.flags.tentative = false;
-        sym.visibility = .global;
+        // Preserve hidden visibility (private-extern commons stay private).
+        if (sym.visibility == .local) sym.visibility = .global;
 
         nlist.n_value = 0;
         nlist.n_type = macho.N_EXT | macho.N_SECT;
+        if (sym.visibility == .hidden) nlist.n_type |= macho.N_PEXT;
         nlist.n_sect = 0;
         nlist.n_desc = 0;
         nlist_atom.* = atom_index;
@@ -1736,15 +1743,10 @@ pub fn calcSymtabSize(self: *Object, macho_file: *MachO) void {
             !is_obj)
             continue;
         sym.flags.output_symtab = true;
-        // In `-r` mode, hidden defined symbols (e.g. cross-shard `external
-        // hidden` LLVM globals) keep `r_extern=1` relocations targeting them.
-        // Apple `ld_new` requires such targets to have N_EXT (i.e. live in the
-        // extdef partition), so emit them as private-extern instead of local.
-        const local_as_pext = is_obj and sym.isLocal() and sym.visibility == .hidden;
-        if (sym.isLocal() and !local_as_pext) {
+        if (sym.isLocal()) {
             sym.addExtra(.{ .symtab = self.output_symtab_ctx.nlocals }, macho_file);
             self.output_symtab_ctx.nlocals += 1;
-        } else if (sym.flags.@"export" or local_as_pext) {
+        } else if (sym.flags.@"export") {
             sym.addExtra(.{ .symtab = self.output_symtab_ctx.nexports }, macho_file);
             self.output_symtab_ctx.nexports += 1;
         } else {

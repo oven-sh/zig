@@ -585,11 +585,10 @@ pub fn calcSymtabSize(self: *InternalObject, macho_file: *MachO) void {
         if (sym.getName(macho_file).len == 0) continue;
         if (macho_file.discard_local_symbols and sym.isLocal()) continue;
         sym.flags.output_symtab = true;
-        const local_as_pext = macho_file.base.isObject() and sym.isLocal() and sym.visibility == .hidden;
-        if (sym.isLocal() and !local_as_pext) {
+        if (sym.isLocal()) {
             sym.addExtra(.{ .symtab = self.output_symtab_ctx.nlocals }, macho_file);
             self.output_symtab_ctx.nlocals += 1;
-        } else if (sym.flags.@"export" or local_as_pext) {
+        } else if (sym.flags.@"export") {
             sym.addExtra(.{ .symtab = self.output_symtab_ctx.nexports }, macho_file);
             self.output_symtab_ctx.nexports += 1;
         } else {

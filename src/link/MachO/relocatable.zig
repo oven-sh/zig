@@ -47,6 +47,14 @@ pub fn flushObject(macho_file: *MachO, arena: Allocator, comp: *Compilation, mod
         error.LinkFailure => return error.LinkFailure,
         else => |e| return diags.fail("failed to update ar size: {s}", .{@errorName(e)}),
     };
+    // Apple `ld_new` rejects `r_extern=1` relocations whose target lands in
+    // the local symtab range. Tentative (common) symbols — notably asan's
+    // private-extern `____asan_globals_registered` — would otherwise be
+    // emitted as locals; convert them to real `__DATA,__common` definitions
+    // so they sit in the extdef partition like other exports.
+    for (macho_file.objects.items) |index| {
+        try macho_file.getFile(index).?.object.convertTentativeDefinitions(macho_file);
+    }
     markExports(macho_file);
     claimUnresolved(macho_file);
     try initOutputSections(macho_file);
