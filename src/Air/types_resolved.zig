@@ -10,6 +10,21 @@ pub fn typesFullyResolved(air: Air, zcu: *Zcu) bool {
     return checkBody(air, air.getMainBody(), zcu);
 }
 
+/// Under parallel Sema, `resolve_type_fully` and `codegen_func` run
+/// concurrently, so types may be mid-resolution rather than failed. Walk the
+/// same AIR shape as `typesFullyResolved` but force-resolve each struct/union
+/// (blocking on `claimOrWait`-gated resolution). Returns false only if
+/// resolution itself errors.
+pub fn resolveTypesFully(air: Air, pt: Zcu.PerThread) bool {
+    tls_resolve_pt = pt;
+    defer tls_resolve_pt = null;
+    return checkBody(air, air.getMainBody(), pt.zcu);
+}
+
+/// `checkType` is reached via a long instruction walk; thread the optional
+/// PerThread via tls instead of plumbing it through every switch arm.
+threadlocal var tls_resolve_pt: ?Zcu.PerThread = null;
+
 fn checkBody(air: Air, body: []const Air.Inst.Index, zcu: *Zcu) bool {
     const tags = air.instructions.items(.tag);
     const datas = air.instructions.items(.data);
@@ -513,6 +528,10 @@ pub fn checkType(ty: Type, zcu: *Zcu) bool {
         },
         .@"struct" => switch (ip.indexToKey(ty.toIntern())) {
             .struct_type => {
+                if (tls_resolve_pt) |pt| {
+                    ty.resolveFully(pt) catch return false;
+                    return true;
+                }
                 const struct_obj = zcu.typeToStruct(ty).?;
                 return switch (struct_obj.layout) {
                     .@"packed" => struct_obj.backingIntTypeUnordered(ip) != .none,
@@ -530,6 +549,12 @@ pub fn checkType(ty: Type, zcu: *Zcu) bool {
             },
             else => unreachable,
         },
-        .@"union" => return zcu.typeToUnion(ty).?.flagsUnordered(ip).status == .fully_resolved,
+        .@"union" => {
+            if (tls_resolve_pt) |pt| {
+                ty.resolveFully(pt) catch return false;
+                return true;
+            }
+            return zcu.typeToUnion(ty).?.flagsUnordered(ip).status == .fully_resolved;
+        },
     };
 }

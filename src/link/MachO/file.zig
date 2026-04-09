@@ -149,7 +149,12 @@ pub const File = union(enum) {
             const ref = file.getSymbolRef(@intCast(i), macho_file);
             const other_file = ref.getFile(macho_file) orelse continue;
             if (other_file.getIndex() != file.getIndex()) continue;
-            if (sym.visibility != .global) continue;
+            // Hidden defined symbols (input N_PEXT|N_EXT, e.g. cross-shard
+            // `external hidden` LLVM globals or private-extern commons) keep
+            // `r_extern=1` relocations targeting them. Apple `ld_new` requires
+            // such targets to live in the extdef partition (have N_EXT), so
+            // mark them as exports here; `setOutputSym` re-adds N_PEXT below.
+            if (sym.visibility == .local) continue;
             sym.flags.@"export" = true;
         }
     }

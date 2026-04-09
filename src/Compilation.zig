@@ -43,6 +43,7 @@ const Zir = std.zig.Zir;
 const Air = @import("Air.zig");
 const Builtin = @import("Builtin.zig");
 const LlvmObject = @import("codegen/llvm.zig").Object;
+const LlvmPartitionSet = @import("codegen/llvm.zig").PartitionSet;
 const dev = @import("dev.zig");
 
 const DeprecatedLinearFifo = @import("deprecated.zig").LinearFifo;
@@ -125,6 +126,8 @@ work_queues: [
         break :len len;
     }
 ]DeprecatedLinearFifo(Job),
+/// Protects `work_queues` when Sema runs on worker threads and calls `queueJob`.
+work_queue_mutex: std.Thread.Mutex = .{},
 
 /// These jobs are to invoke the Clang compiler to create an object file, which
 /// gets linked with the Compilation.
@@ -265,7 +268,12 @@ link_prog_node: std.Progress.Node = std.Progress.Node.none,
 
 llvm_opt_bisect_limit: c_int,
 llvm_codegen_threads: u32,
+llvm_shard_stats: bool,
 no_link_obj: bool,
+/// When true, the N shard `.o` files emitted by partitioned LLVM codegen are
+/// left as-is (no relocatable -r merge). They land at `{emit}.{i}.o` next to
+/// the would-be merged output. The downstream linker consumes them directly.
+no_merge_shards: bool,
 
 time_report: ?TimeReport,
 
@@ -1729,7 +1737,9 @@ pub const CreateOptions = struct {
     linker_print_map: bool = false,
     llvm_opt_bisect_limit: i32 = -1,
     llvm_codegen_threads: u32 = 0,
+    llvm_shard_stats: bool = false,
     no_link_obj: bool = false,
+    llvm_no_merge_shards: bool = false,
     build_id: ?std.zig.BuildId = null,
     disable_c_depfile: bool = false,
     linker_z_nodelete: bool = false,
@@ -2298,7 +2308,15 @@ pub fn create(gpa: Allocator, arena: Allocator, diag: *CreateDiagnostic, options
             .framework_dirs = options.framework_dirs,
             .llvm_opt_bisect_limit = options.llvm_opt_bisect_limit,
             .llvm_codegen_threads = options.llvm_codegen_threads,
-            .no_link_obj = options.no_link_obj,
+            .llvm_shard_stats = options.llvm_shard_stats,
+            // Partitioned LLVM output produces N objects which must be merged
+            // by the linker for a single-.o result, so the no-link shortcut
+            // does not apply unless `--llvm-no-merge-shards` is also set, in
+            // which case the N shard `.o` files are emitted directly to the
+            // final location and the relocatable merge is skipped entirely.
+            .no_link_obj = options.no_link_obj and
+                (options.llvm_codegen_threads <= 1 or options.llvm_no_merge_shards),
+            .no_merge_shards = options.llvm_no_merge_shards and options.llvm_codegen_threads > 1,
             .skip_linker_dependencies = options.skip_linker_dependencies,
             .queued_jobs = .{},
             .function_sections = options.function_sections,
@@ -2506,7 +2524,16 @@ pub fn create(gpa: Allocator, arena: Allocator, diag: *CreateDiagnostic, options
 
         if (use_llvm) {
             if (opt_zcu) |zcu| {
-                zcu.llvm_object = try LlvmObject.create(arena, comp);
+                // Multi-shard emission only supports producing N object files
+                // for the linker; IR/BC/asm requests for a single output would
+                // silently drop shards 1..N. Clamp to 1 in that case.
+                const single_artifact_only = options.emit_bin == .no and
+                    (options.emit_llvm_ir != .no or options.emit_llvm_bc != .no or options.emit_asm != .no);
+                const n_shards: u32 = if (options.llvm_codegen_threads <= 1 or single_artifact_only)
+                    1
+                else
+                    options.llvm_codegen_threads;
+                zcu.llvm_object = try LlvmPartitionSet.create(arena, comp, n_shards);
             }
         }
 
@@ -3129,7 +3156,13 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
                 try pt.populateTestFunctions();
             }
 
+            comp.phaseTimingC("update.processExports.start");
             try pt.processExports();
+            comp.phaseTimingC("update.processExports.done");
+        }
+
+        if (comp.llvm_shard_stats or std.process.hasNonEmptyEnvVarConstant("ZIG_JOB_STATS")) {
+            comp.dumpLlvmShardStats(zcu);
         }
 
         if (build_options.enable_debug_extensions and comp.verbose_intern_pool) {
@@ -3267,6 +3300,65 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
     }
 }
 
+fn dumpLlvmShardStats(comp: *Compilation, zcu: *Zcu) void {
+    const ip = &zcu.intern_pool;
+    const n: u32 = if (comp.llvm_codegen_threads > 1) comp.llvm_codegen_threads else 16;
+    var counts = [_]u32{0} ** 256;
+    var top_file = [_]?*Zcu.File{null} ** 256;
+    var top_file_count = [_]u32{0} ** 256;
+
+    var per_file = std.AutoHashMap(*Zcu.File, u32).init(comp.gpa);
+    defer per_file.deinit();
+
+    const total_navs = ip.navCount();
+    var skipped: u32 = 0;
+    var i: u32 = 0;
+    while (i < total_navs) : (i += 1) {
+        const nav_index = ip.navIndexFromOrdinal(i);
+        const nav = ip.getNav(nav_index);
+        if (nav.status == .unresolved) {
+            skipped += 1;
+            continue;
+        }
+        const fqn = nav.fqn.toSlice(ip);
+        const shard: u8 = @intCast(std.hash.Wyhash.hash(0, fqn) % n);
+        counts[shard] += 1;
+        const file = zcu.fileByIndex(nav.srcInst(ip).resolveFile(ip));
+        const gop = per_file.getOrPut(file) catch continue;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+        if (gop.value_ptr.* > top_file_count[shard]) {
+            top_file_count[shard] = gop.value_ptr.*;
+            top_file[shard] = file;
+        }
+    }
+
+    var min: u32 = std.math.maxInt(u32);
+    var max: u32 = 0;
+    var nonempty: u32 = 0;
+    for (counts[0..n]) |c| {
+        if (c == 0) continue;
+        nonempty += 1;
+        min = @min(min, c);
+        max = @max(max, c);
+    }
+    std.debug.print("llvm-shard-stats for '{s}': n={d} navs={d} skipped={d} nonempty_shards={d}\n", .{
+        comp.root_name, n, total_navs - skipped, skipped, nonempty,
+    });
+    for (counts[0..n], 0..) |c, s| {
+        if (c == 0) continue;
+        var buf: [512]u8 = undefined;
+        const key = if (top_file[s]) |f| f.shardKey(&buf) else "";
+        std.debug.print("  shard {d:>3}: {d:>6} navs  (top file '{s}' = {d})\n", .{
+            s, c, key, top_file_count[s],
+        });
+    }
+    if (min != std.math.maxInt(u32)) {
+        const ratio = @as(f64, @floatFromInt(max)) / @as(f64, @floatFromInt(min));
+        std.debug.print("  max/min ratio: {d:.2} (max={d}, min={d})\n", .{ ratio, max, min });
+    }
+}
+
 pub fn appendFileSystemInput(comp: *Compilation, path: Compilation.Path) Allocator.Error!void {
     const gpa = comp.gpa;
     const fsi = comp.file_system_inputs orelse return;
@@ -3336,6 +3428,7 @@ fn flush(
     arena: Allocator,
     tid: Zcu.PerThread.Id,
 ) Allocator.Error!void {
+    comp.phaseTimingC("flush.start");
     if (comp.zcu) |zcu| {
         if (zcu.llvm_object) |llvm_object| {
             const pt: Zcu.PerThread = .activate(zcu, tid);
@@ -3364,8 +3457,8 @@ fn flush(
             };
 
             // Generate parallel codegen output filenames if enabled
-            const bin_path_list: ?[]const [*:0]const u8 = if (comp.llvm_codegen_threads > 1 and base_bin_path != null) blk: {
-                const num_threads = comp.llvm_codegen_threads;
+            const bin_path_list: ?[]const [*:0]const u8 = if (llvm_object.n > 1 and base_bin_path != null) blk: {
+                const num_threads = llvm_object.n;
                 const list = try arena.alloc([*:0]const u8, num_threads);
                 const base_path_slice = std.mem.sliceTo(base_bin_path.?, 0);
 
@@ -3414,6 +3507,7 @@ fn flush(
                 error.LinkFailure => {}, // Already reported.
                 error.OutOfMemory => return error.OutOfMemory,
             };
+            comp.phaseTimingC("flush.llvm_emit_done");
         }
     }
     if (comp.bin_file) |lf| {
@@ -3430,7 +3524,14 @@ fn flush(
                 error.LinkFailure => {}, // Already reported.
                 error.OutOfMemory => return error.OutOfMemory,
             };
+        } else if (comp.no_merge_shards) {
+            // Shard objects went to `{emit}.{i}.o`; the 0-byte stub the linker
+            // created at `{emit}` during open() will never be flushed. Remove
+            // it so downstream build systems globbing `{emit}.*.o` aren't
+            // confused by an empty object alongside the real shards.
+            lf.emit.root_dir.handle.deleteFile(lf.emit.sub_path) catch {};
         }
+        comp.phaseTimingC("flush.lf_flush_done");
     }
     if (comp.zcu) |zcu| {
         try link.File.C.flushEmitH(zcu);
@@ -4629,10 +4730,20 @@ pub fn unableToLoadZcuFile(
     });
 }
 
+pub fn phaseTiming(label: []const u8) void {
+    if (!std.process.hasNonEmptyEnvVarConstant("ZIG_PHASE_TIMING")) return;
+    std.debug.print("[PHASE] {d} - {s}\n", .{ std.time.milliTimestamp(), label });
+}
+fn phaseTimingC(comp: *const Compilation, label: []const u8) void {
+    if (!std.process.hasNonEmptyEnvVarConstant("ZIG_PHASE_TIMING")) return;
+    std.debug.print("[PHASE] {d} {s} {s}\n", .{ std.time.milliTimestamp(), comp.root_name, label });
+}
+
 fn performAllTheWork(
     comp: *Compilation,
     main_progress_node: std.Progress.Node,
 ) JobError!void {
+    comp.phaseTimingC("performAllTheWork.start");
     // Regardless of errors, `comp.zcu` needs to update its generation number.
     defer if (comp.zcu) |zcu| {
         zcu.generation += 1;
@@ -4657,8 +4768,10 @@ fn performAllTheWork(
     var work_queue_wait_group: WaitGroup = .{};
     defer work_queue_wait_group.wait();
 
+    defer comp.phaseTimingC("performAllTheWork.codegen_wait_done");
     comp.link_task_wait_group.reset();
     defer comp.link_task_wait_group.wait();
+    defer comp.phaseTimingC("performAllTheWork.work_loop_done");
 
     // Already-queued prelink tasks
     comp.link_prog_node.increaseEstimatedTotalItems(comp.link_task_queue.queued_prelink.items.len);
@@ -5059,13 +5172,62 @@ fn performAllTheWork(
         // Start the timer for the "decls" part of the pipeline (Sema, CodeGen, link).
         decl_work_timer = comp.startTimer();
     }
+    comp.phaseTimingC("performAllTheWork.work_loop_start");
 
+    if (comp.zcu) |zcu| {
+        // Sub-compilations (compiler_rt, ubsan_rt, etc.) and the build runner
+        // are small and gain nothing from parallel Sema. For `zig build`, the
+        // runner is `root_mod` (main_mod is the user's build.zig).
+        const is_build_runner = std.mem.endsWith(u8, zcu.root_mod.root_src_path, "build_runner.zig");
+        zcu.parallel_sema = comp.parent_whole_cache == null and
+            !is_build_runner and
+            std.process.hasNonEmptyEnvVarConstant("ZIG_PARALLEL_SEMA");
+    }
+
+    var job_ns: [@typeInfo(Job.Tag).@"enum".fields.len]u64 = @splat(0);
+    var job_ct: [@typeInfo(Job.Tag).@"enum".fields.len]u64 = @splat(0);
+    var export_func_pass: u8 = 0;
     work: while (true) {
-        for (&comp.work_queues) |*work_queue| if (work_queue.readItem()) |job| {
-            try processOneJob(@intFromEnum(Zcu.PerThread.Id.main), comp, job);
-            continue :work;
+        const maybe_job: ?Job = job: {
+            comp.work_queue_mutex.lock();
+            defer comp.work_queue_mutex.unlock();
+            for (&comp.work_queues) |*work_queue| if (work_queue.readItem()) |job| break :job job;
+            break :job null;
         };
+        if (maybe_job) |job| {
+            if (comp.zcu) |zcu| if (zcu.parallel_sema and job == .analyze_func) {
+                // Skip dispatch if a worker already holds this unit (or it has
+                // since been analyzed) — re-queues from the retry path can
+                // produce duplicate analyze_func jobs and N-1 workers then
+                // condvar-wait on the one analyzer.
+                const a = zcu.intern_pool.funcAnalysisUnordered(job.analyze_func);
+                if (a.is_analyzed) continue :work;
+                _ = zcu.sema_pending_jobs.rmw(.Add, 1, .acquire);
+                comp.thread_pool.spawnWgId(&comp.link_task_wait_group, workerAnalyzeFunc, .{ comp, job.analyze_func });
+                continue :work;
+            };
+            const t0 = if (comp.llvm_shard_stats or std.process.hasNonEmptyEnvVarConstant("ZIG_JOB_STATS")) std.time.nanoTimestamp() else 0;
+            try processOneJob(@intFromEnum(Zcu.PerThread.Id.main), comp, job);
+            if (comp.llvm_shard_stats or std.process.hasNonEmptyEnvVarConstant("ZIG_JOB_STATS")) {
+                job_ns[@intFromEnum(@as(Job.Tag, job))] += @intCast(std.time.nanoTimestamp() - t0);
+                job_ct[@intFromEnum(@as(Job.Tag, job))] += 1;
+            }
+            continue :work;
+        }
         if (comp.zcu) |zcu| {
+            if (zcu.sema_pending_jobs.load(.acquire) > 0) {
+                std.Thread.yield() catch {};
+                continue :work;
+            }
+            // A worker may have enqueued between our queue read and the
+            // counter dropping to zero; re-check the queues before exiting.
+            const drained = drained: {
+                comp.work_queue_mutex.lock();
+                defer comp.work_queue_mutex.unlock();
+                for (&comp.work_queues) |*q| if (q.count > 0) break :drained false;
+                break :drained true;
+            };
+            if (!drained) continue :work;
             // If there's no work queued, check if there's anything outdated
             // which we need to work on, and queue it if so.
             if (try zcu.findOutdatedToAnalyze()) |outdated| {
@@ -5080,16 +5242,43 @@ fn performAllTheWork(
                 });
                 continue;
             }
+            // Final pass under parallel Sema: any exported function whose body
+            // analysis was dropped by a post-commit retry will not be in
+            // `nav_map` at processExports time. Re-queue here so the work loop
+            // drains it before we exit.
+            if (zcu.parallel_sema and export_func_pass < 3) {
+                export_func_pass += 1;
+                var any_queued = false;
+                for (zcu.single_exports.values()) |idx| {
+                    any_queued = ensureExportFuncQueued(zcu, idx) or any_queued;
+                }
+                for (zcu.multi_exports.values()) |info| {
+                    for (info.index..info.index + info.len) |i| {
+                        any_queued = ensureExportFuncQueued(zcu, @enumFromInt(i)) or any_queued;
+                    }
+                }
+                if (any_queued) continue;
+            }
             zcu.sema_prog_node.end();
             zcu.sema_prog_node = .none;
         }
         break;
+    }
+    if (comp.zcu) |zcu| zcu.parallel_sema = false;
+    if (comp.llvm_shard_stats or std.process.hasNonEmptyEnvVarConstant("ZIG_JOB_STATS")) {
+        std.debug.print("=== work loop job timings (main thread) ===\n", .{});
+        inline for (@typeInfo(Job.Tag).@"enum".fields, 0..) |f, i| {
+            if (job_ct[i] != 0)
+                std.debug.print("  {s:>24}: {d:>6}ms ({d} jobs)\n", .{ f.name, job_ns[i] / 1_000_000, job_ct[i] });
+        }
     }
 }
 
 const JobError = Allocator.Error;
 
 pub fn queueJob(comp: *Compilation, job: Job) !void {
+    comp.work_queue_mutex.lock();
+    defer comp.work_queue_mutex.unlock();
     try comp.work_queues[Job.stage(job)].writeItem(job);
 }
 
@@ -5108,7 +5297,20 @@ fn processOneJob(tid: usize, comp: *Compilation, job: Job) JobError!void {
                 comp.link_prog_node.completeOne();
                 air.deinit(gpa);
             }
-            if (!air.typesFullyResolved(zcu)) {
+            // Under serial Sema, FIFO dispatch guarantees every
+            // `resolve_type_fully` queued before this body's analysis has
+            // completed, so `typesFullyResolved == false` means the type
+            // *failed*. Under parallel Sema both job kinds run concurrently —
+            // a struct or union may simply be mid-resolution. Dropping the
+            // body would leave a dangling cross-shard `__N<nav>` undef.
+            // Force-resolve via `resolveTypesFully`, which blocks on the
+            // claimOrWait-gated resolution; drop only if that errors.
+            const types_ok: bool = if (zcu.parallel_sema) ok: {
+                const pt: Zcu.PerThread = .activate(zcu, @enumFromInt(tid));
+                defer pt.deactivate();
+                break :ok air.resolveTypesFully(pt);
+            } else air.typesFullyResolved(zcu);
+            if (!types_ok) {
                 // Type resolution failed in a way which affects this function. This is a transitive
                 // failure, but it doesn't need recording, because this function semantically depends
                 // on the failed type, so when it is changed the function is updated.
@@ -5154,8 +5356,7 @@ fn processOneJob(tid: usize, comp: *Compilation, job: Job) JobError!void {
             const zcu = comp.zcu.?;
             const nav = zcu.intern_pool.getNav(nav_index);
             if (nav.analysis != null) {
-                const unit: InternPool.AnalUnit = .wrap(.{ .nav_val = nav_index });
-                if (zcu.failed_analysis.contains(unit) or zcu.transitive_failed_analysis.contains(unit)) {
+                if (zcu.anyAnalysisFailed(.wrap(.{ .nav_val = nav_index }))) {
                     comp.link_prog_node.completeOne();
                     return;
                 }
@@ -5192,9 +5393,16 @@ fn processOneJob(tid: usize, comp: *Compilation, job: Job) JobError!void {
             const pt: Zcu.PerThread = .activate(comp.zcu.?, @enumFromInt(tid));
             defer pt.deactivate();
 
+            Zcu.tls_retry_loop = null;
             pt.ensureFuncBodyUpToDate(func) catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
-                error.AnalysisFail => return,
+                error.AnalysisFail => {
+                    if (Zcu.tls_retry_loop != null) {
+                        Zcu.tls_retry_loop = null;
+                        try comp.queueJob(.{ .analyze_func = func });
+                    }
+                    return;
+                },
             };
         },
         .analyze_comptime_unit => |unit| {
@@ -5204,6 +5412,7 @@ fn processOneJob(tid: usize, comp: *Compilation, job: Job) JobError!void {
             const pt: Zcu.PerThread = .activate(comp.zcu.?, @enumFromInt(tid));
             defer pt.deactivate();
 
+            Zcu.tls_retry_loop = null;
             const maybe_err: Zcu.SemaError!void = switch (unit.unwrap()) {
                 .@"comptime" => |cu| pt.ensureComptimeUnitUpToDate(cu),
                 .nav_ty => |nav| pt.ensureNavTypeUpToDate(nav),
@@ -5214,7 +5423,13 @@ fn processOneJob(tid: usize, comp: *Compilation, job: Job) JobError!void {
             };
             maybe_err catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
-                error.AnalysisFail => return,
+                error.AnalysisFail => {
+                    if (Zcu.tls_retry_loop != null) {
+                        Zcu.tls_retry_loop = null;
+                        try comp.queueJob(.{ .analyze_comptime_unit = unit });
+                    }
+                    return;
+                },
             };
 
             queue_test_analysis: {
@@ -5242,9 +5457,16 @@ fn processOneJob(tid: usize, comp: *Compilation, job: Job) JobError!void {
 
             const pt: Zcu.PerThread = .activate(comp.zcu.?, @enumFromInt(tid));
             defer pt.deactivate();
+            Zcu.tls_retry_loop = null;
             Type.fromInterned(ty).resolveFully(pt) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.AnalysisFail => return,
+                error.AnalysisFail => {
+                    if (Zcu.tls_retry_loop != null) {
+                        Zcu.tls_retry_loop = null;
+                        try comp.queueJob(.{ .resolve_type_fully = ty });
+                    }
+                    return;
+                },
             };
         },
         .analyze_mod => |mod| {
@@ -5885,6 +6107,51 @@ pub const RtOptions = struct {
     checks_valgrind: bool = false,
     allow_lto: bool = true,
 };
+
+fn ensureExportFuncQueued(zcu: *Zcu, export_idx: Zcu.Export.Index) bool {
+    const ip = &zcu.intern_pool;
+    const exp = export_idx.ptr(zcu);
+    const nav = switch (exp.exported) {
+        .nav => |n| n,
+        .uav => return false,
+    };
+    const v = switch (ip.getNav(nav).status) {
+        .fully_resolved => |r| r.val,
+        else => return false,
+    };
+    if (!ip.isFuncBody(v)) return false;
+    const func = ip.unwrapCoercedFunc(v);
+    // Check the LLVM nav_map: if the body landed there, codegen ran.
+    if (zcu.llvm_object) |llvm| {
+        const shard = zcu.navShard(nav, llvm.n);
+        if (llvm.objects[shard].nav_map.contains(nav)) return false;
+    } else if (ip.funcAnalysisUnordered(func).is_analyzed) return false;
+    // Clear is_analyzed so the fast-path doesn't no-op and re-analysis
+    // re-queues codegen_func.
+    zcu.funcInfo(func).clearAnalyzed(ip);
+    zcu.comp.queueJob(.{ .analyze_func = func }) catch return false;
+    return true;
+}
+
+fn workerAnalyzeFunc(tid: usize, comp: *Compilation, func: InternPool.Index) void {
+    const zcu = comp.zcu.?;
+    const pt: Zcu.PerThread = .activate(zcu, @enumFromInt(tid));
+    defer pt.deactivate();
+    Zcu.tls_retry_loop = null;
+    pt.ensureFuncBodyUpToDate(func) catch |err| switch (err) {
+        error.OutOfMemory => comp.setAllocFailure(),
+        error.AnalysisFail => {
+            if (Zcu.tls_retry_loop != null) {
+                // Order-dependent dependency loop: re-queue this func so
+                // another thread (or a later attempt) can try after
+                // intermediates have been resolved independently.
+                Zcu.tls_retry_loop = null;
+                comp.queueJob(.{ .analyze_func = func }) catch comp.setAllocFailure();
+            }
+        },
+    };
+    _ = zcu.sema_pending_jobs.rmw(.Sub, 1, .release);
+}
 
 fn workerZcuCodegen(
     tid: usize,

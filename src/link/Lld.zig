@@ -230,6 +230,7 @@ pub fn createEmpty(
             .comp = comp,
             .emit = emit,
             .zcu_object_basename = try allocPrint(arena, "{s}_zcu.{s}", .{ fs.path.stem(emit.sub_path), obj_file_ext }),
+            .zcu_object_partition_count = @intCast(options.llvm_codegen_threads),
             .gc_sections = gc_sections,
             .print_gc_sections = options.print_gc_sections,
             .stack_size = stack_size,
@@ -289,11 +290,12 @@ fn linkAsArchive(lld: *Lld, arena: Allocator) !void {
     const full_out_path_z = try arena.dupeZ(u8, full_out_path);
     const opt_zcu = comp.zcu;
 
-    const zcu_obj_path: ?Cache.Path = if (opt_zcu != null) p: {
-        break :p try comp.resolveEmitPathFlush(arena, .temp, base.zcu_object_basename.?);
-    } else null;
+    const zcu_obj_paths: []const Cache.Path = if (opt_zcu != null)
+        try base.resolveZcuObjectPaths(arena)
+    else
+        &.{};
 
-    log.debug("zcu_obj_path={?f}", .{zcu_obj_path});
+    log.debug("zcu_obj_paths.len={d}", .{zcu_obj_paths.len});
 
     const compiler_rt_path: ?Cache.Path = if (comp.compiler_rt_strat == .obj)
         comp.compiler_rt_obj.?.full_object_path
@@ -327,7 +329,7 @@ fn linkAsArchive(lld: *Lld, arena: Allocator) !void {
     for (comp.win32_resource_table.keys()) |key| {
         object_files.appendAssumeCapacity(try arena.dupeZ(u8, key.status.success.res_path));
     }
-    if (zcu_obj_path) |p| object_files.appendAssumeCapacity(try p.toStringZ(arena));
+    for (zcu_obj_paths) |p| try object_files.append(arena, try p.toStringZ(arena));
     if (compiler_rt_path) |p| object_files.appendAssumeCapacity(try p.toStringZ(arena));
     if (ubsan_rt_path) |p| object_files.appendAssumeCapacity(try p.toStringZ(arena));
 
@@ -365,9 +367,10 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
     const directory = base.emit.root_dir; // Just an alias to make it shorter to type.
     const full_out_path = try directory.join(arena, &[_][]const u8{base.emit.sub_path});
 
-    const zcu_obj_path: ?Cache.Path = if (comp.zcu != null) p: {
-        break :p try comp.resolveEmitPathFlush(arena, .temp, base.zcu_object_basename.?);
-    } else null;
+    const zcu_obj_paths: []const Cache.Path = if (comp.zcu != null)
+        try base.resolveZcuObjectPaths(arena)
+    else
+        &.{};
 
     const is_lib = comp.config.output_mode == .Lib;
     const is_dyn_lib = comp.config.link_mode == .dynamic and is_lib;
@@ -393,8 +396,8 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
             if (comp.c_object_table.count() != 0)
                 break :blk comp.c_object_table.keys()[0].status.success.object_path;
 
-            if (zcu_obj_path) |p|
-                break :blk p;
+            if (zcu_obj_paths.len > 0)
+                break :blk zcu_obj_paths[0];
 
             // TODO I think this is unreachable. Audit this situation when solving the above TODO
             // regarding eliding redundant object -> object transformations.
@@ -547,7 +550,7 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
             try argv.append(key.status.success.res_path);
         }
 
-        if (zcu_obj_path) |p| {
+        for (zcu_obj_paths) |p| {
             try argv.append(try p.toString(arena));
         }
 
@@ -799,9 +802,10 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
     const directory = base.emit.root_dir; // Just an alias to make it shorter to type.
     const full_out_path = try directory.join(arena, &[_][]const u8{base.emit.sub_path});
 
-    const zcu_obj_path: ?Cache.Path = if (comp.zcu != null) p: {
-        break :p try comp.resolveEmitPathFlush(arena, .temp, base.zcu_object_basename.?);
-    } else null;
+    const zcu_obj_paths: []const Cache.Path = if (comp.zcu != null)
+        try base.resolveZcuObjectPaths(arena)
+    else
+        &.{};
 
     const output_mode = comp.config.output_mode;
     const is_obj = output_mode == .Obj;
@@ -847,8 +851,8 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
             if (comp.c_object_table.count() != 0)
                 break :blk comp.c_object_table.keys()[0].status.success.object_path;
 
-            if (zcu_obj_path) |p|
-                break :blk p;
+            if (zcu_obj_paths.len == 1)
+                break :blk zcu_obj_paths[0];
 
             // TODO I think this is unreachable. Audit this situation when solving the above TODO
             // regarding eliding redundant object -> object transformations.
@@ -1134,7 +1138,7 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
             try argv.append(try key.status.success.object_path.toString(arena));
         }
 
-        if (zcu_obj_path) |p| {
+        for (zcu_obj_paths) |p| {
             try argv.append(try p.toString(arena));
         }
 
@@ -1370,9 +1374,10 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
     const directory = base.emit.root_dir; // Just an alias to make it shorter to type.
     const full_out_path = try directory.join(arena, &[_][]const u8{base.emit.sub_path});
 
-    const zcu_obj_path: ?Cache.Path = if (comp.zcu != null) p: {
-        break :p try comp.resolveEmitPathFlush(arena, .temp, base.zcu_object_basename.?);
-    } else null;
+    const zcu_obj_paths: []const Cache.Path = if (comp.zcu != null)
+        try base.resolveZcuObjectPaths(arena)
+    else
+        &.{};
 
     const is_obj = comp.config.output_mode == .Obj;
     const compiler_rt_path: ?Cache.Path = blk: {
@@ -1396,8 +1401,8 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
             if (comp.c_object_table.count() != 0)
                 break :blk comp.c_object_table.keys()[0].status.success.object_path;
 
-            if (zcu_obj_path) |p|
-                break :blk p;
+            if (zcu_obj_paths.len > 0)
+                break :blk zcu_obj_paths[0];
 
             // TODO I think this is unreachable. Audit this situation when solving the above TODO
             // regarding eliding redundant object -> object transformations.
@@ -1578,7 +1583,7 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
         for (comp.c_object_table.keys()) |key| {
             try argv.append(try key.status.success.object_path.toString(arena));
         }
-        if (zcu_obj_path) |p| {
+        for (zcu_obj_paths) |p| {
             try argv.append(try p.toString(arena));
         }
 

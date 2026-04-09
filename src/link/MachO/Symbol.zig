@@ -243,8 +243,8 @@ pub fn setOutputSym(symbol: Symbol, macho_file: *MachO, out: *macho.nlist_64) vo
             else => {},
         }
     } else if (symbol.flags.@"export") {
-        assert(symbol.visibility == .global);
         out.n_type = macho.N_EXT;
+        if (symbol.visibility == .hidden) out.n_type |= macho.N_PEXT;
         out.n_type |= if (symbol.flags.abs) macho.N_ABS else macho.N_SECT;
         out.n_sect = if (symbol.flags.abs) 0 else @intCast(symbol.getOutputSectionIndex(macho_file) + 1);
         out.n_value = symbol.getAddress(.{ .stubs = false }, macho_file);

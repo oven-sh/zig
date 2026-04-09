@@ -237,6 +237,125 @@ static AddressSanitizerOptions getAsanOptions(void) {
     return o;
 }
 
+// Builds and runs the full middle-end optimization pipeline on `llvm_module`.
+// Self-contained so it can be invoked once on the whole module (serial path) or
+// per split partition on worker threads (parallel path). All analysis managers
+// and the PassBuilder are local, so concurrent calls on distinct modules with
+// distinct LLVMContexts and TargetMachines are safe.
+static void runOptimizationPipeline(Module &llvm_module, TargetMachine &target_machine,
+    const ZigLLVMEmitOptions *options)
+{
+    PipelineTuningOptions pipeline_opts;
+    pipeline_opts.LoopUnrolling = !options->is_debug;
+    pipeline_opts.SLPVectorization = !options->is_debug;
+    pipeline_opts.LoopVectorization = !options->is_debug;
+    pipeline_opts.LoopInterleaving = !options->is_debug;
+    pipeline_opts.MergeFunctions = !options->is_debug;
+
+    PassInstrumentationCallbacks instr_callbacks;
+    StandardInstrumentations std_instrumentations(llvm_module.getContext(), false);
+    std_instrumentations.registerCallbacks(instr_callbacks);
+
+    std::optional<PGOOptions> opt_pgo_options = {};
+    PassBuilder pass_builder(&target_machine, pipeline_opts,
+                             opt_pgo_options, &instr_callbacks);
+
+    LoopAnalysisManager loop_am;
+    FunctionAnalysisManager function_am;
+    CGSCCAnalysisManager cgscc_am;
+    ModuleAnalysisManager module_am;
+
+    function_am.registerPass([&] {
+      return pass_builder.buildDefaultAAPipeline();
+    });
+
+    Triple target_triple(llvm_module.getTargetTriple());
+    auto tlii = std::make_unique<TargetLibraryInfoImpl>(target_triple);
+    function_am.registerPass([&] { return TargetLibraryAnalysis(*tlii); });
+
+    pass_builder.registerModuleAnalyses(module_am);
+    pass_builder.registerCGSCCAnalyses(cgscc_am);
+    pass_builder.registerFunctionAnalyses(function_am);
+    pass_builder.registerLoopAnalyses(loop_am);
+    pass_builder.crossRegisterProxies(loop_am, function_am, cgscc_am, module_am);
+
+    pass_builder.registerPipelineStartEPCallback([options](ModulePassManager &module_pm, OptimizationLevel level) {
+        if (assertions_on) {
+            module_pm.addPass(VerifierPass());
+        }
+
+        if (!options->is_debug) {
+            module_pm.addPass(createModuleToFunctionPassAdaptor(AddDiscriminatorsPass()));
+        }
+
+        if (options->gcov_profiling) {
+            GCOVOptions gcov_opts = GCOVOptions::getDefault();
+            module_pm.addPass(GCOVProfilerPass(gcov_opts));
+        }
+    });
+
+    const bool early_san = options->is_debug;
+
+    pass_builder.registerOptimizerEarlyEPCallback([options, early_san](ModulePassManager &module_pm, OptimizationLevel level, ThinOrFullLTOPhase lto_phase) {
+        if (early_san) {
+            if (options->sancov) {
+                module_pm.addPass(SanitizerCoveragePass(getSanCovOptions(options->coverage)));
+            }
+
+            if (options->tsan) {
+                module_pm.addPass(ModuleThreadSanitizerPass());
+                module_pm.addPass(createModuleToFunctionPassAdaptor(ThreadSanitizerPass()));
+            }
+        }
+    });
+
+    pass_builder.registerOptimizerLastEPCallback([options, early_san](ModulePassManager &module_pm, OptimizationLevel level, ThinOrFullLTOPhase lto_phase) {
+        if (!early_san) {
+            if (options->sancov) {
+                module_pm.addPass(SanitizerCoveragePass(getSanCovOptions(options->coverage)));
+            }
+
+            if (options->tsan) {
+                module_pm.addPass(ModuleThreadSanitizerPass());
+                module_pm.addPass(createModuleToFunctionPassAdaptor(ThreadSanitizerPass()));
+            }
+        }
+
+        if (options->asan) {
+            bool UseOdrIndicator = false;
+            AddressSanitizerOptions Opts;
+            Opts.CompileKernel = false;
+            Opts.Recover = false;
+            Opts.UseAfterScope = false;
+            Opts.UseAfterReturn = AsanDetectStackUseAfterReturnMode::Runtime;
+            module_pm.addPass(AddressSanitizerPass(Opts, true, UseOdrIndicator, AsanDtorKind::Global, AsanCtorKind::Global));
+        }
+
+        if (assertions_on) {
+            module_pm.addPass(VerifierPass());
+        }
+    });
+
+    ModulePassManager module_pm;
+    OptimizationLevel opt_level;
+    if (options->is_debug)
+      opt_level = OptimizationLevel::O0;
+    else if (options->is_small)
+      opt_level = OptimizationLevel::Oz;
+    else
+      opt_level = OptimizationLevel::O3;
+
+    if (opt_level == OptimizationLevel::O0) {
+      module_pm = pass_builder.buildO0DefaultPipeline(opt_level, static_cast<ThinOrFullLTOPhase>(options->lto));
+    } else if (options->lto) {
+      module_pm = pass_builder.buildLTOPreLinkDefaultPipeline(opt_level);
+    } else {
+      module_pm = pass_builder.buildPerModuleDefaultPipeline(opt_level);
+    }
+
+    module_pm.run(llvm_module, module_am);
+}
+
 ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machine_ref, LLVMModuleRef module_ref,
     char **error_message, const ZigLLVMEmitOptions *options)
 {
@@ -254,9 +373,19 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machi
             return true;
         }
     }
-    // Open single bin file if not using parallel codegen
-    // Check early if parallel will actually be used
-    bool will_use_parallel = options->bin_filename_list != nullptr &&
+    // Decide up front whether to use the parallel split path. The split path
+    // optimizes and emits each partition independently, so it is disabled when
+    // an output requires the whole post-optimization module (LTO, asm) or when
+    // fewer than two partitions were requested. The caller must keep this in
+    // sync with the linker's expected object count; the Zig side never sets
+    // bin_filename_list together with asm or LTO.
+    unsigned NumThreads = 0;
+    if (options->bin_filename_list != nullptr) {
+        while (options->bin_filename_list[NumThreads] != nullptr) {
+            NumThreads++;
+        }
+    }
+    bool will_use_parallel = NumThreads > 1 &&
                              !options->lto &&
                              !options->asm_filename;
 
@@ -302,160 +431,13 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machi
 
     Module &llvm_module = *unwrap(module_ref);
 
-    // Pipeline configurations
-    PipelineTuningOptions pipeline_opts;
-    pipeline_opts.LoopUnrolling = !options->is_debug;
-    pipeline_opts.SLPVectorization = !options->is_debug;
-    pipeline_opts.LoopVectorization = !options->is_debug;
-    pipeline_opts.LoopInterleaving = !options->is_debug;
-    pipeline_opts.MergeFunctions = !options->is_debug;
-
-    // Instrumentations
-    PassInstrumentationCallbacks instr_callbacks;
-    StandardInstrumentations std_instrumentations(llvm_module.getContext(), false);
-    std_instrumentations.registerCallbacks(instr_callbacks);
-
-    std::optional<PGOOptions> opt_pgo_options = {};
-    PassBuilder pass_builder(&target_machine, pipeline_opts,
-                             opt_pgo_options, &instr_callbacks);
-
-    LoopAnalysisManager loop_am;
-    FunctionAnalysisManager function_am;
-    CGSCCAnalysisManager cgscc_am;
-    ModuleAnalysisManager module_am;
-
-    // Register the AA manager first so that our version is the one used
-    function_am.registerPass([&] {
-      return pass_builder.buildDefaultAAPipeline();
-    });
-
-    Triple target_triple(llvm_module.getTargetTriple());
-    auto tlii = std::make_unique<TargetLibraryInfoImpl>(target_triple);
-    function_am.registerPass([&] { return TargetLibraryAnalysis(*tlii); });
-
-    // Initialize the AnalysisManagers
-    pass_builder.registerModuleAnalyses(module_am);
-    pass_builder.registerCGSCCAnalyses(cgscc_am);
-    pass_builder.registerFunctionAnalyses(function_am);
-    pass_builder.registerLoopAnalyses(loop_am);
-    pass_builder.crossRegisterProxies(loop_am, function_am, cgscc_am, module_am);
-
-    pass_builder.registerPipelineStartEPCallback([&](ModulePassManager &module_pm, OptimizationLevel level) {
-        // Verify the input
-        if (assertions_on) {
-            module_pm.addPass(VerifierPass());
-        }
-
-        if (!options->is_debug) {
-            module_pm.addPass(createModuleToFunctionPassAdaptor(AddDiscriminatorsPass()));
-        }
-
-        // GCOV profiling instrumentation
-        if (options->gcov_profiling) {
-            GCOVOptions gcov_opts = GCOVOptions::getDefault();
-            module_pm.addPass(GCOVProfilerPass(gcov_opts));
-        }
-    });
-
-    const bool early_san = options->is_debug;
-
-    pass_builder.registerOptimizerEarlyEPCallback([&](ModulePassManager &module_pm, OptimizationLevel level, ThinOrFullLTOPhase lto_phase) {
-        if (early_san) {
-            // Code coverage instrumentation.
-            if (options->sancov) {
-                module_pm.addPass(SanitizerCoveragePass(getSanCovOptions(options->coverage)));
-            }
-
-            // Thread sanitizer
-            if (options->tsan) {
-                module_pm.addPass(ModuleThreadSanitizerPass());
-                module_pm.addPass(createModuleToFunctionPassAdaptor(ThreadSanitizerPass()));
-            }
-        }
-    });
-
-    pass_builder.registerOptimizerLastEPCallback([&](ModulePassManager &module_pm, OptimizationLevel level, ThinOrFullLTOPhase lto_phase) {
-        if (!early_san) {
-            // Code coverage instrumentation.
-            if (options->sancov) {
-                module_pm.addPass(SanitizerCoveragePass(getSanCovOptions(options->coverage)));
-            }
-
-            // Thread sanitizer
-            if (options->tsan) {
-                module_pm.addPass(ModuleThreadSanitizerPass());
-                module_pm.addPass(createModuleToFunctionPassAdaptor(ThreadSanitizerPass()));
-            }
-        }
-
-        // Address sanitizer
-        if (options->asan) {
-            bool UseOdrIndicator = false;
-            AddressSanitizerOptions Opts;
-            Opts.CompileKernel = false;
-            Opts.Recover = false;
-            Opts.UseAfterScope = false;
-            Opts.UseAfterReturn = AsanDetectStackUseAfterReturnMode::Runtime;
-            module_pm.addPass(AddressSanitizerPass(Opts, true, UseOdrIndicator, AsanDtorKind::Global, AsanCtorKind::Global));
-        }
-
-        // Verify the output
-        if (assertions_on) {
-            module_pm.addPass(VerifierPass());
-        }
-    });
-
-    ModulePassManager module_pm;
-    OptimizationLevel opt_level;
-    // Setting up the optimization level
-    if (options->is_debug)
-      opt_level = OptimizationLevel::O0;
-    else if (options->is_small)
-      opt_level = OptimizationLevel::Oz;
-    else
-      opt_level = OptimizationLevel::O3;
-
-    // Initialize the PassManager
-    if (opt_level == OptimizationLevel::O0) {
-      module_pm = pass_builder.buildO0DefaultPipeline(opt_level, static_cast<ThinOrFullLTOPhase>(options->lto));
-    } else if (options->lto) {
-      module_pm = pass_builder.buildLTOPreLinkDefaultPipeline(opt_level);
-    } else {
-      module_pm = pass_builder.buildPerModuleDefaultPipeline(opt_level);
-    }
-
-    // Optimization phase
-    module_pm.run(llvm_module, module_am);
-
-    // Code generation phase
-    // Check if we should use parallel codegen (same condition as will_use_parallel above)
-    bool use_parallel_codegen = options->bin_filename_list != nullptr &&
-                                !options->lto &&
-                                !options->asm_filename;
-
-    if (use_parallel_codegen) {
-        // Count number of output files (NULL-terminated array)
-        unsigned NumThreads = 0;
-        while (options->bin_filename_list[NumThreads] != nullptr) {
-            NumThreads++;
-        }
-
-        if (NumThreads <= 1) {
-            use_parallel_codegen = false;
-        }
-    }
-
-    if (use_parallel_codegen) {
-        // Parallel code generation path
-        unsigned NumThreads = 0;
-        while (options->bin_filename_list[NumThreads] != nullptr) {
-            NumThreads++;
-        }
-
+    if (will_use_parallel) {
+        // Parallel path: split the unoptimized module into N partitions, then run
+        // the full optimization pipeline and object emission on each partition
+        // concurrently. Each worker owns its own LLVMContext and TargetMachine.
         std::vector<std::unique_ptr<raw_fd_ostream>> temp_streams;
         std::vector<raw_pwrite_stream *> stream_ptrs;
 
-        // Create N output streams using the provided filenames
         for (unsigned i = 0; i < NumThreads; ++i) {
             std::error_code EC;
             auto stream = std::make_unique<raw_fd_ostream>(options->bin_filename_list[i], EC, sys::fs::OF_None);
@@ -467,10 +449,9 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machi
             temp_streams.push_back(std::move(stream));
         }
 
-        // TargetMachine factory - creates a new TM for each thread
         Target *TheTarget = reinterpret_cast<Target*>(const_cast<void*>(
             reinterpret_cast<const void*>(&target_machine.getTarget())));
-        std::string Triple = std::string(target_machine.getTargetTriple().str());
+        std::string TripleStr = std::string(target_machine.getTargetTriple().str());
         std::string CPU = std::string(target_machine.getTargetCPU());
         std::string Features = std::string(target_machine.getTargetFeatureString());
         CodeGenOptLevel CGOptLevel = target_machine.getOptLevel();
@@ -480,16 +461,18 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machi
 
         auto TMFactory = [=]() -> std::unique_ptr<TargetMachine> {
             std::unique_ptr<TargetMachine> TM(TheTarget->createTargetMachine(
-                Triple, CPU, Features, Opts, RM, CM, CGOptLevel, false));
+                TripleStr, CPU, Features, Opts, RM, CM, CGOptLevel, false));
             if (options->allow_fast_isel) {
                 TM->setO0WantsFastISel(true);
             } else {
                 TM->setFastISel(false);
             }
+            if (!options->allow_machine_outliner) {
+                TM->setMachineOutliner(false);
+            }
             return TM;
         };
 
-        // Manual parallel code generation (same as llvm::splitCodeGen)
         {
             llvm::StdThreadPool CodegenThreadPool(llvm::hardware_concurrency(NumThreads));
             std::atomic<unsigned> ThreadCount(0);
@@ -504,7 +487,7 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machi
                     llvm::raw_pwrite_stream *ThreadOS = stream_ptrs[ThreadCount++];
 
                     CodegenThreadPool.async(
-                        [TMFactory, ThreadOS](const SmallString<0> &BC) {
+                        [TMFactory, ThreadOS, options](const SmallString<0> &BC) {
                             LLVMContext Ctx;
                             auto BufferRef = MemoryBufferRef(StringRef(BC.data(), BC.size()), "<split-module>");
                             Expected<std::unique_ptr<Module>> MOrErr = parseBitcodeFile(BufferRef, Ctx);
@@ -518,6 +501,9 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machi
                             std::unique_ptr<Module> MPartInCtx = std::move(*MOrErr);
 
                             std::unique_ptr<TargetMachine> TM = TMFactory();
+
+                            runOptimizationPipeline(*MPartInCtx, *TM, options);
+
                             legacy::PassManager CodeGenPasses;
                             if (TM->addPassesToEmitFile(CodeGenPasses, *ThreadOS, nullptr, CodeGenFileType::ObjectFile))
                                 report_fatal_error("Failed to setup codegen");
@@ -525,19 +511,17 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machi
                         },
                         std::move(BC));
                 },
-                true);  // avoid symbol globalization overhead
+                false);
         }
 
-        // Flush and close streams
         for (auto &stream : temp_streams) {
             stream->flush();
         }
         temp_streams.clear();
-
-        // Output files are now: bin_filename.0.o, bin_filename.1.o, ..., bin_filename.(N-1).o
-        // The linker will automatically pick up all of them
     } else {
-        // Single-threaded code generation path (original)
+        // Serial path: optimize the whole module, then emit.
+        runOptimizationPipeline(llvm_module, target_machine, options);
+
         legacy::PassManager codegen_pm;
         codegen_pm.add(
           createTargetTransformInfoWrapperPass(target_machine.getTargetIRAnalysis()));
