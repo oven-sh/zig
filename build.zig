@@ -123,6 +123,11 @@ pub fn build(b: *std.Build) !void {
         "llvm-has-xtensa",
         "Whether LLVM has the experimental target xtensa enabled",
     ) orelse false;
+    const llvm_has_polly = b.option(
+        bool,
+        "llvm-has-polly",
+        "Whether LLVM was built with Polly and requires linking it",
+    ) orelse false;
     const enable_ios_sdk = b.option(bool, "enable-ios-sdk", "Run tests requiring presence of iOS SDK and frameworks") orelse false;
     const enable_macos_sdk = b.option(bool, "enable-macos-sdk", "Run tests requiring presence of macOS SDK and frameworks") orelse enable_ios_sdk;
     const enable_symlinks_windows = b.option(bool, "enable-symlinks-windows", "Run tests requiring presence of symlinks on Windows") orelse false;
@@ -332,6 +337,7 @@ pub fn build(b: *std.Build) !void {
                 .llvm_has_csky = llvm_has_csky,
                 .llvm_has_arc = llvm_has_arc,
                 .llvm_has_xtensa = llvm_has_xtensa,
+                .llvm_has_polly = llvm_has_polly,
             });
         }
         if (target.result.os.tag == .windows) {
@@ -739,7 +745,7 @@ fn addCompilerMod(b: *std.Build, options: AddCompilerModOptions) *std.Build.Modu
 fn addCompilerStep(b: *std.Build, options: AddCompilerModOptions) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = "zig",
-        .max_rss = 10_000_000_000,
+        .max_rss = 11_000_000_000,
         .root_module = addCompilerMod(b, options),
     });
     exe.stack_size = stack_size;
@@ -858,6 +864,7 @@ fn addStaticLlvmOptionsToModule(mod: *std.Build.Module, options: struct {
     llvm_has_csky: bool,
     llvm_has_arc: bool,
     llvm_has_xtensa: bool,
+    llvm_has_polly: bool,
 }) !void {
     // Adds the Zig C++ sources which both stage1 and stage2 need.
     //
@@ -895,6 +902,10 @@ fn addStaticLlvmOptionsToModule(mod: *std.Build.Module, options: struct {
     };
 
     if (options.llvm_has_xtensa) for (llvm_libs_xtensa) |lib_name| {
+        mod.linkSystemLibrary(lib_name, .{});
+    };
+
+    if (options.llvm_has_polly) for (llvm_libs_polly) |lib_name| {
         mod.linkSystemLibrary(lib_name, .{});
     };
 
@@ -1418,6 +1429,10 @@ const llvm_libs_xtensa = [_][]const u8{
     "LLVMXtensaCodeGen",
     "LLVMXtensaDesc",
     "LLVMXtensaInfo",
+};
+const llvm_libs_polly = [_][]const u8{
+    "Polly",
+    "PollyISL",
 };
 
 fn generateLangRef(b: *std.Build) std.Build.LazyPath {
