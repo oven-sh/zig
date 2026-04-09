@@ -885,10 +885,8 @@ pub inline fn backendSupportsFeature(backend: std.builtin.CompilerBackend, compt
             else => false,
         },
         .separate_thread => switch (backend) {
-            // Supports a separate thread but does not support N separate
-            // threads because they would all just be locking the same mutex to
-            // protect Builder.
-            .stage2_llvm => false,
+            // PartitionSet shards Builder state so contention is 1/N.
+            .stage2_llvm => true,
             // Same problem. Frontend needs to allow this backend to run in the
             // linker thread.
             .stage2_spirv => false,

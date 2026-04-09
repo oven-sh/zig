@@ -38,6 +38,7 @@ const Alignment = InternPool.Alignment;
 const AnalUnit = InternPool.AnalUnit;
 const BuiltinFn = std.zig.BuiltinFn;
 const LlvmObject = @import("codegen/llvm.zig").Object;
+const LlvmPartitionSet = @import("codegen/llvm.zig").PartitionSet;
 const dev = @import("dev.zig");
 const Zoir = std.zig.Zoir;
 const ZonGen = std.zig.ZonGen;
@@ -57,9 +58,9 @@ comptime {
 /// General-purpose allocator. Used for both temporary and long-term storage.
 gpa: Allocator,
 comp: *Compilation,
-/// If the ZCU is emitting an LLVM object (i.e. we are using the LLVM backend), then this is the
-/// `LlvmObject` we are emitting to.
-llvm_object: ?LlvmObject.Ptr,
+/// If the ZCU is emitting via the LLVM backend, this is the set of partitioned LLVM `Object`
+/// builders we are emitting to. Phase 1: always a single-element set.
+llvm_object: ?LlvmPartitionSet.Ptr,
 
 /// Pointer to externally managed resource.
 root_mod: *Package.Module,
@@ -69,6 +70,61 @@ main_mod: *Package.Module,
 std_mod: *Package.Module,
 sema_prog_node: std.Progress.Node = .none,
 codegen_prog_node: std.Progress.Node = .none,
+/// Protects all non-InternPool Zcu maps that Sema reads/writes (failed_analysis,
+/// analysis_in_progress, exports, outdated, etc.) when analyze_func runs on
+/// worker threads. Recursive so an ensure* call can lock at entry, recurse into
+/// other ensure* calls (no-op re-lock), and unlock at exit; the only carve-out
+/// is the heavy AIR generation in `analyzeFnBody`, around which the owning
+/// worker explicitly fully releases via `semaRelease`/`semaReacquire`.
+sema_lock: std.Thread.Mutex = .{},
+sema_lock_owner: std.atomic.Value(std.Thread.Id) = .init(no_sema_owner),
+sema_lock_depth: u32 = 0,
+/// Signalled whenever a claim in `unit_claims` is released.
+sema_claim_cond: std.Thread.Condition = .{},
+/// AnalUnits currently being analysed by some worker; value is the owning tid.
+/// Guarded by `sema_lock`. A worker that finds an entry here for a unit it
+/// needs waits on `sema_claim_cond` until the entry is removed.
+unit_claims: std.AutoHashMapUnmanaged(AnalUnit, std.Thread.Id) = .empty,
+/// Tracks which unit each thread is currently waiting on, for deadlock
+/// detection in `claimOrWait`. Guarded by `sema_lock`.
+claim_waits: std.AutoHashMapUnmanaged(std.Thread.Id, AnalUnit) = .empty,
+/// Per-unit retry count for order-dependent dependency loops, to avoid
+/// livelock on a true source-level cycle. Guarded by `sema_lock`.
+sema_retry_counts: std.AutoHashMapUnmanaged(AnalUnit, u8) = .empty,
+sema_pending_jobs: std.atomic.Value(u32) = .init(0),
+/// Guards `inline_reference_frames` / `free_inline_reference_frames` so that
+/// the very hot `Inlining.refFrame` path does not contend on `sema_lock`.
+inline_ref_mutex: std.Thread.Mutex = .{},
+/// Guards `unit_claims` / `claim_waits` so `claimOrWait` does not contend on
+/// `sema_lock` (the entry-lock at ensureFuncBodyUpToDate was the hottest
+/// contention site at 12.4 s × 15 684 stalls).
+unit_claims_mutex: std.Thread.Mutex = .{},
+/// Guards `failed_analysis` + `transitive_failed_analysis`.
+failed_analysis_mutex: std.Thread.Mutex = .{},
+/// Guards `reference_table` / `all_references` / `free_references` and the
+/// `type_reference_table` / `all_type_references` / `free_type_references`.
+references_mutex: std.Thread.Mutex = .{},
+/// Guards `single_exports` / `multi_exports` / `all_exports` / `free_exports`
+/// / `failed_exports`.
+exports_mutex: std.Thread.Mutex = .{},
+/// Guards `nav_val_analysis_queued` so `ensureNavValAnalysisQueued` does not
+/// contend on `sema_lock`.
+nav_queued_mutex: std.Thread.Mutex = .{},
+/// Guards `outdated` / `potentially_outdated` / `outdated_ready`. Under
+/// non-incremental these are only touched for comptime units (scanDecl marks
+/// fresh ones, ensureComptimeUnitUpToDate consumes), so this mutex is rarely
+/// contended.
+outdated_mutex: std.Thread.Mutex = .{},
+/// Guards `test_functions`.
+test_functions_mutex: std.Thread.Mutex = .{},
+/// Guards `cimport_errors`.
+cimport_errors_mutex: std.Thread.Mutex = .{},
+/// Guards `sema_retry_counts`.
+sema_retry_mutex: std.Thread.Mutex = .{},
+/// Guards `compile_logs` + `compile_log_lines` + `free_compile_log_lines`.
+compile_log_mutex: std.Thread.Mutex = .{},
+/// True while parallel Sema is enabled for this update.
+parallel_sema: bool = false,
 /// The number of codegen jobs which are pending or in-progress. Whichever thread drops this value
 /// to 0 is responsible for ending `codegen_prog_node`. While semantic analysis is happening, this
 /// value bottoms out at 1 instead of 0, to ensure that it can only drop to 0 after analysis is
@@ -1111,6 +1167,34 @@ pub const File = struct {
             '/', '\\' => try writer.writeByte('/'),
             else => try writer.writeByte(byte),
         };
+    }
+
+    /// Returns a stable key string used to assign this file to an LLVM codegen
+    /// shard. The key is the owning module's fully-qualified name plus the full
+    /// normalised sub_file_path, so identical source layouts hash identically
+    /// regardless of host path separator.
+    pub fn shardKey(file: File, buf: []u8) []const u8 {
+        const mod = file.mod orelse return buf[0..0];
+        const mod_name = mod.fully_qualified_name;
+        var w: usize = @min(mod_name.len, buf.len);
+        @memcpy(buf[0..w], mod_name[0..w]);
+        if (w < buf.len) {
+            buf[w] = '/';
+            w += 1;
+        }
+        for (file.sub_file_path) |c| {
+            if (w >= buf.len) break;
+            buf[w] = if (c == '\\') '/' else c;
+            w += 1;
+        }
+        return buf[0..w];
+    }
+
+    pub fn computeShard(file: File, n: u32) u8 {
+        if (n <= 1) return 0;
+        var buf: [512]u8 = undefined;
+        const key = file.shardKey(&buf);
+        return @intCast(std.hash.Wyhash.hash(0, key) % n);
     }
 
     pub fn internFullyQualifiedName(file: File, pt: Zcu.PerThread) !InternPool.NullTerminatedString {
@@ -2775,6 +2859,9 @@ pub fn deinit(zcu: *Zcu) void {
         for (zcu.failed_codegen.values()) |value| value.destroy(gpa);
         for (zcu.failed_types.values()) |value| value.destroy(gpa);
         zcu.analysis_in_progress.deinit(gpa);
+        zcu.unit_claims.deinit(gpa);
+        zcu.claim_waits.deinit(gpa);
+        zcu.sema_retry_counts.deinit(gpa);
         zcu.failed_analysis.deinit(gpa);
         zcu.transitive_failed_analysis.deinit(gpa);
         zcu.failed_codegen.deinit(gpa);
@@ -3456,6 +3543,19 @@ pub fn ensureFuncBodyAnalysisQueued(zcu: *Zcu, func_index: InternPool.Index) !vo
 
     assert(func.ty == func.uncoerced_ty); // analyze the body of the original function, not a coerced one
 
+    if (zcu.parallel_sema and !zcu.comp.incremental) {
+        // Lock-free dedup via the per-func atomic `is_queued` bit instead of
+        // contending on `sema_lock` for the global `func_body_analysis_queued`
+        // set (this site is hit ~40k× and was the second-hottest contention
+        // point in the profile).
+        if (!func.trySetQueued(ip)) return;
+        try zcu.comp.queueJob(.{ .analyze_func = func_index });
+        return;
+    }
+
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+
     if (zcu.func_body_analysis_queued.contains(func_index)) return;
 
     if (func.analysisUnordered(ip).is_analyzed) {
@@ -3474,6 +3574,20 @@ pub fn ensureFuncBodyAnalysisQueued(zcu: *Zcu, func_index: InternPool.Index) !vo
 
 pub fn ensureNavValAnalysisQueued(zcu: *Zcu, nav_id: InternPool.Nav.Index) !void {
     const ip = &zcu.intern_pool;
+
+    if (zcu.parallel_sema and !zcu.comp.incremental) {
+        if (ip.getNav(nav_id).status == .fully_resolved) return;
+        zcu.nav_queued_mutex.lock();
+        defer zcu.nav_queued_mutex.unlock();
+        if (zcu.nav_val_analysis_queued.contains(nav_id)) return;
+        try zcu.nav_val_analysis_queued.ensureUnusedCapacity(zcu.gpa, 1);
+        try zcu.comp.queueJob(.{ .analyze_comptime_unit = .wrap(.{ .nav_val = nav_id }) });
+        zcu.nav_val_analysis_queued.putAssumeCapacityNoClobber(nav_id, {});
+        return;
+    }
+
+    zcu.semaLock();
+    defer zcu.semaUnlock();
 
     if (zcu.nav_val_analysis_queued.contains(nav_id)) return;
 
@@ -3507,9 +3621,173 @@ pub const ImportResult = struct {
     module: ?*Package.Module,
 };
 
+pub const no_sema_owner: std.Thread.Id = std.math.maxInt(std.Thread.Id);
+
+/// Recursive acquire of `sema_lock` if parallel Sema is active. No-op otherwise.
+pub fn semaLock(zcu: *Zcu) void {
+    if (!zcu.parallel_sema) return;
+    const me = std.Thread.getCurrentId();
+    if (zcu.sema_lock_owner.load(.acquire) == me) {
+        zcu.sema_lock_depth += 1;
+        return;
+    }
+    zcu.sema_lock.lock();
+    zcu.sema_lock_owner.store(me, .release);
+    zcu.sema_lock_depth = 1;
+}
+pub fn semaUnlock(zcu: *Zcu) void {
+    if (!zcu.parallel_sema) return;
+    zcu.sema_lock_depth -= 1;
+    if (zcu.sema_lock_depth == 0) {
+        zcu.sema_lock_owner.store(no_sema_owner, .release);
+        zcu.sema_lock.unlock();
+    }
+}
+/// Fully release the recursive lock (returning the saved depth) so other
+/// workers can proceed during long unlocked sections. Returns 0 if not held.
+pub fn semaRelease(zcu: *Zcu) u32 {
+    if (!zcu.parallel_sema) return 0;
+    const me = std.Thread.getCurrentId();
+    if (zcu.sema_lock_owner.load(.acquire) != me) return 0;
+    const d = zcu.sema_lock_depth;
+    zcu.sema_lock_depth = 0;
+    zcu.sema_lock_owner.store(no_sema_owner, .release);
+    zcu.sema_lock.unlock();
+    return d;
+}
+pub fn semaReacquire(zcu: *Zcu, depth: u32) void {
+    if (!zcu.parallel_sema or depth == 0) return;
+    const me = std.Thread.getCurrentId();
+    zcu.sema_lock.lock();
+    zcu.sema_lock_owner.store(me, .release);
+    zcu.sema_lock_depth = depth;
+}
+
+/// Types this thread is currently in the wip-populate phase for. The
+/// namespace sentinel for these is intentionally still set; same-thread
+/// recursion (e.g. an enum field value referencing an earlier field) must
+/// not spin on it.
+threadlocal var tls_wip_types: std.AutoArrayHashMapUnmanaged(InternPool.Index, void) = .empty;
+
+pub fn wipTypeEnter(zcu: *Zcu, ty: InternPool.Index) Allocator.Error!void {
+    if (!zcu.parallel_sema) return;
+    try tls_wip_types.put(zcu.gpa, ty, {});
+}
+pub fn wipTypeExit(zcu: *Zcu, ty: InternPool.Index) void {
+    if (!zcu.parallel_sema) return;
+    _ = tls_wip_types.swapRemove(ty);
+}
+
+pub fn awaitNamespaceTypeFinished(zcu: *Zcu, ty: InternPool.Index) void {
+    awaitNamespaceTypeFinishedConst(zcu, ty);
+}
+pub fn awaitNamespaceTypeFinishedConst(zcu: *const Zcu, ty: InternPool.Index) void {
+    if (!zcu.parallel_sema) return;
+    if (tls_wip_types.contains(ty)) return;
+    zcu.intern_pool.awaitNamespaceTypeFinished(ty);
+}
+
+/// Try to claim `unit` for analysis on behalf of `tid`. Returns:
+///  - `.claimed` if the caller now owns analysis of this unit and must call
+///    `releaseClaim` when done.
+///  - `.recursed` if this thread already owns it (dependency-loop detection
+///    handled by caller as before via `analysis_in_progress`).
+///  - `.done` if another thread finished analysing it while we waited; caller
+///    should re-read the unit's resolved status and return.
+/// Uses its own `unit_claims_mutex`; may temporarily release any held
+/// `sema_lock` while waiting on the per-unit condvar.
+pub fn claimOrWait(zcu: *Zcu, unit: AnalUnit) Allocator.Error!enum { claimed, recursed, done } {
+    if (!zcu.parallel_sema) return .claimed;
+    const me = std.Thread.getCurrentId();
+    zcu.unit_claims_mutex.lock();
+    defer zcu.unit_claims_mutex.unlock();
+    while (true) {
+        const gop = try zcu.unit_claims.getOrPut(zcu.gpa, unit);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = me;
+            return .claimed;
+        }
+        if (gop.value_ptr.* == me) return .recursed;
+        var chain_unit = unit;
+        var hops: u32 = 0;
+        while (hops < 64) : (hops += 1) {
+            const holder = zcu.unit_claims.get(chain_unit) orelse break;
+            if (holder == me) return .recursed;
+            chain_unit = zcu.claim_waits.get(holder) orelse break;
+        }
+        // Another thread holds the claim; record our wait, fully release any
+        // held sema_lock, then sleep on the dedicated claims condvar.
+        try zcu.claim_waits.put(zcu.gpa, me, unit);
+        zcu.unit_claims_mutex.unlock();
+        const d = zcu.semaRelease();
+        zcu.unit_claims_mutex.lock();
+        // Lost-wakeup guard: holder may have released between our two locks.
+        if (zcu.unit_claims.contains(unit))
+            zcu.sema_claim_cond.wait(&zcu.unit_claims_mutex);
+        _ = zcu.claim_waits.remove(me);
+        zcu.unit_claims_mutex.unlock();
+        zcu.semaReacquire(d);
+        zcu.unit_claims_mutex.lock();
+        // After wake, check whether the unit is now resolved; if the claim is
+        // gone, another thread finished it.
+        if (!zcu.unit_claims.contains(unit)) return .done;
+    }
+}
+
+pub fn releaseClaim(zcu: *Zcu, unit: AnalUnit) void {
+    if (!zcu.parallel_sema) return;
+    zcu.unit_claims_mutex.lock();
+    _ = zcu.unit_claims.remove(unit);
+    zcu.unit_claims_mutex.unlock();
+    zcu.sema_claim_cond.broadcast();
+}
+
+
+/// Under parallel Sema, `analysis_in_progress` is per-OS-thread (lock-free).
+threadlocal var tls_aip: std.AutoArrayHashMapUnmanaged(AnalUnit, void) = .empty;
+/// Set by `ensureNavResolved` when a dependency loop is detected under
+/// parallel Sema that may be order-dependent (the looped-on unit might be
+/// resolvable by another thread). Consumed by the outer `ensure*UpToDate`
+/// to release-and-requeue instead of marking the unit failed.
+pub threadlocal var tls_retry_loop: ?AnalUnit = null;
+
+pub fn semaAipContains(zcu: *Zcu, unit: AnalUnit) bool {
+    if (!zcu.parallel_sema) return zcu.analysis_in_progress.contains(unit);
+    return tls_aip.contains(unit);
+}
+
+pub fn dumpTlsAip(zcu: *Zcu) void {
+    std.debug.print("tls_aip ({d} entries):\n", .{tls_aip.count()});
+    for (tls_aip.keys()) |k| std.debug.print("  {f}\n", .{zcu.fmtAnalUnit(k)});
+}
+
+pub fn aipPut(zcu: *Zcu, gpa: Allocator, unit: AnalUnit) Allocator.Error!void {
+    if (zcu.parallel_sema) {
+        try tls_aip.put(gpa, unit, {});
+        return;
+    }
+    try zcu.analysis_in_progress.putNoClobber(gpa, unit, {});
+}
+pub fn aipRemove(zcu: *Zcu, unit: AnalUnit) void {
+    if (zcu.parallel_sema) {
+        _ = tls_aip.swapRemove(unit);
+        return;
+    }
+    // Idempotent: success-path removes happen earlier than the matching
+    // `errdefer` in some callers (e.g. `analyzeNavVal`), so a second call here
+    // is benign. Asserting on it regressed serial-mode behaviour.
+    _ = zcu.analysis_in_progress.swapRemove(unit);
+}
+
 /// Delete all the Export objects that are caused by this `AnalUnit`. Re-analysis of
 /// this `AnalUnit` will cause them to be re-created (or not).
 pub fn deleteUnitExports(zcu: *Zcu, anal_unit: AnalUnit) void {
+    zcu.exports_mutex.lock();
+    defer zcu.exports_mutex.unlock();
+    zcu.deleteUnitExportsAssumeLocked(anal_unit);
+}
+
+pub fn deleteUnitExportsAssumeLocked(zcu: *Zcu, anal_unit: AnalUnit) void {
     const gpa = zcu.gpa;
 
     const exports_base, const exports_len = if (zcu.single_exports.fetchSwapRemove(anal_unit)) |kv|
@@ -3529,9 +3807,9 @@ pub fn deleteUnitExports(zcu: *Zcu, anal_unit: AnalUnit) void {
     if (dev.env.supports(.incremental)) {
         for (exports, exports_base..) |exp, export_index_usize| {
             const export_idx: Export.Index = @enumFromInt(export_index_usize);
-            if (zcu.comp.bin_file) |lf| {
+            if (zcu.llvm_object == null) if (zcu.comp.bin_file) |lf| {
                 lf.deleteExport(exp.exported, exp.opts.name);
-            }
+            };
             if (zcu.failed_exports.fetchSwapRemove(export_idx)) |failed_kv| {
                 failed_kv.value.destroy(gpa);
             }
@@ -3552,6 +3830,9 @@ pub fn deleteUnitExports(zcu: *Zcu, anal_unit: AnalUnit) void {
 /// Re-analysis of the `AnalUnit` will cause appropriate references to be recreated.
 pub fn deleteUnitReferences(zcu: *Zcu, anal_unit: AnalUnit) void {
     const gpa = zcu.gpa;
+
+    zcu.references_mutex.lock();
+    defer zcu.references_mutex.unlock();
 
     zcu.clearCachedResolvedReferences();
 
@@ -3574,11 +3855,15 @@ pub fn deleteUnitReferences(zcu: *Zcu, anal_unit: AnalUnit) void {
                 // detect this case to avoid adding it to `free_inline_reference_frames` more
                 // than once. We do that by setting `parent` to itself as a marker.
                 if (inline_frame.ptr(zcu).parent == inline_frame.toOptional()) break;
-                zcu.free_inline_reference_frames.append(gpa, inline_frame) catch {
-                    // This space will be reused eventually, so we need not propagate this error.
-                    // Just leak it for now, and let GC reclaim it later on.
-                    break :unit_refs;
-                };
+                {
+                    zcu.inline_ref_mutex.lock();
+                    defer zcu.inline_ref_mutex.unlock();
+                    zcu.free_inline_reference_frames.append(gpa, inline_frame) catch {
+                        // This space will be reused eventually, so we need not propagate this error.
+                        // Just leak it for now, and let GC reclaim it later on.
+                        break :unit_refs;
+                    };
+                }
                 opt_inline_frame = inline_frame.ptr(zcu).parent;
                 inline_frame.ptr(zcu).parent = inline_frame.toOptional(); // signal to code above
             }
@@ -3603,6 +3888,8 @@ pub fn deleteUnitReferences(zcu: *Zcu, anal_unit: AnalUnit) void {
 /// Delete all compile logs performed by this `AnalUnit`.
 /// Re-analysis of the `AnalUnit` will cause logs to be rediscovered.
 pub fn deleteUnitCompileLogs(zcu: *Zcu, anal_unit: AnalUnit) void {
+    zcu.compile_log_mutex.lock();
+    defer zcu.compile_log_mutex.unlock();
     const kv = zcu.compile_logs.fetchSwapRemove(anal_unit) orelse return;
     const gpa = zcu.gpa;
     var opt_line_idx = kv.value.first_line.toOptional();
@@ -3617,6 +3904,8 @@ pub fn deleteUnitCompileLogs(zcu: *Zcu, anal_unit: AnalUnit) void {
 }
 
 pub fn addInlineReferenceFrame(zcu: *Zcu, frame: InlineReferenceFrame) Allocator.Error!Zcu.InlineReferenceFrame.Index {
+    zcu.inline_ref_mutex.lock();
+    defer zcu.inline_ref_mutex.unlock();
     const frame_idx: InlineReferenceFrame.Index = zcu.free_inline_reference_frames.pop() orelse idx: {
         _ = try zcu.inline_reference_frames.addOne(zcu.gpa);
         break :idx @enumFromInt(zcu.inline_reference_frames.items.len - 1);
@@ -3633,6 +3922,9 @@ pub fn addUnitReference(
     inline_frame: InlineReferenceFrame.Index.Optional,
 ) Allocator.Error!void {
     const gpa = zcu.gpa;
+
+    zcu.references_mutex.lock();
+    defer zcu.references_mutex.unlock();
 
     zcu.clearCachedResolvedReferences();
 
@@ -3659,6 +3951,9 @@ pub fn addUnitReference(
 
 pub fn addTypeReference(zcu: *Zcu, src_unit: AnalUnit, referenced_type: InternPool.Index, ref_src: LazySrcLoc) Allocator.Error!void {
     const gpa = zcu.gpa;
+
+    zcu.references_mutex.lock();
+    defer zcu.references_mutex.unlock();
 
     zcu.clearCachedResolvedReferences();
 
@@ -3749,8 +4044,52 @@ pub fn handleUpdateExports(
     };
 }
 
+/// Locked check whether `unit` has a (transitive) analysis failure.
+/// `failed_analysis` writers hold `failed_analysis_mutex`; under parallel Sema
+/// a concurrent rehash during `.contains` is unsafe.
+pub fn anyAnalysisFailed(zcu: *Zcu, unit: AnalUnit) bool {
+    zcu.failed_analysis_mutex.lock();
+    defer zcu.failed_analysis_mutex.unlock();
+    return zcu.failed_analysis.contains(unit) or zcu.transitive_failed_analysis.contains(unit);
+}
+
+/// Locked accessors so writers and `anyAnalysisFailed` readers agree on the
+/// same mutex (otherwise `.contains` can observe a mid-rehash map).
+pub fn putTransitiveFailed(zcu: *Zcu, unit: AnalUnit) Allocator.Error!void {
+    zcu.failed_analysis_mutex.lock();
+    defer zcu.failed_analysis_mutex.unlock();
+    try zcu.transitive_failed_analysis.put(zcu.gpa, unit, {});
+}
+
+/// Locked: mark `unit` as transitively-failed only if it has no direct
+/// `failed_analysis` entry (the common post-AnalysisFail bookkeeping).
+pub fn markTransitiveFailed(zcu: *Zcu, unit: AnalUnit) Allocator.Error!void {
+    zcu.failed_analysis_mutex.lock();
+    defer zcu.failed_analysis_mutex.unlock();
+    if (zcu.failed_analysis.contains(unit)) return;
+    try zcu.transitive_failed_analysis.put(zcu.gpa, unit, {});
+}
+
+pub fn clearAnalysisFailures(zcu: *Zcu, unit: AnalUnit) ?*ErrorMsg {
+    zcu.failed_analysis_mutex.lock();
+    defer zcu.failed_analysis_mutex.unlock();
+    const msg: ?*ErrorMsg = if (zcu.failed_analysis.fetchSwapRemove(unit)) |kv| kv.value else null;
+    _ = zcu.transitive_failed_analysis.swapRemove(unit);
+    return msg;
+}
+
+pub fn failedAnalysisGetOrPut(zcu: *Zcu, unit: AnalUnit, msg: *ErrorMsg) Allocator.Error!bool {
+    zcu.failed_analysis_mutex.lock();
+    defer zcu.failed_analysis_mutex.unlock();
+    const gop = try zcu.failed_analysis.getOrPut(zcu.gpa, unit);
+    if (!gop.found_existing) gop.value_ptr.* = msg;
+    return gop.found_existing;
+}
+
 pub fn addGlobalAssembly(zcu: *Zcu, unit: AnalUnit, source: []const u8) !void {
     const gpa = zcu.gpa;
+    zcu.semaLock();
+    defer zcu.semaUnlock();
     const gop = try zcu.global_assembly.getOrPut(gpa, unit);
     if (gop.found_existing) {
         const new_value = try std.fmt.allocPrint(gpa, "{s}\n{s}", .{ gop.value_ptr.*, source });
@@ -4307,6 +4646,13 @@ pub fn navFileScope(zcu: *Zcu, nav: InternPool.Nav.Index) *File {
     return zcu.fileByIndex(zcu.navFileScopeIndex(nav));
 }
 
+pub fn navShard(zcu: *Zcu, nav: InternPool.Nav.Index, n: u32) u32 {
+    if (n <= 1) return 0;
+    const ip = &zcu.intern_pool;
+    const fqn = ip.getNav(nav).fqn.toSlice(ip);
+    return @intCast(std.hash.Wyhash.hash(0, fqn) % n);
+}
+
 pub fn fmtAnalUnit(zcu: *Zcu, unit: AnalUnit) std.fmt.Formatter(FormatAnalUnit, formatAnalUnit) {
     return .{ .data = .{ .unit = unit, .zcu = zcu } };
 }
@@ -4743,7 +5089,9 @@ const TrackedUnitSema = struct {
     old_name: ?[std.Progress.Node.max_name_len]u8,
     old_analysis_timer: ?Compilation.Timer,
     analysis_timer_decl: ?InternPool.TrackedInst.Index,
+    is_noop: bool = false,
     pub fn end(tus: TrackedUnitSema, zcu: *Zcu) void {
+        if (tus.is_noop) return;
         const comp = zcu.comp;
         if (tus.old_name) |old_name| {
             zcu.sema_prog_node.completeOne(); // we're just renaming, but it's effectively completion
@@ -4773,6 +5121,12 @@ const TrackedUnitSema = struct {
     }
 };
 pub fn trackUnitSema(zcu: *Zcu, name: []const u8, zir_inst: ?InternPool.TrackedInst.Index) TrackedUnitSema {
+    if (zcu.parallel_sema) return .{
+        .old_name = null,
+        .old_analysis_timer = null,
+        .analysis_timer_decl = zir_inst,
+        .is_noop = true,
+    };
     if (zcu.cur_analysis_timer) |*t| t.pause();
     const old_analysis_timer = zcu.cur_analysis_timer;
     zcu.cur_analysis_timer = zcu.comp.startTimer();

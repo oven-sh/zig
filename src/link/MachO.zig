@@ -357,13 +357,13 @@ pub fn flush(
     if (comp.verbose_link) try self.dumpArgv(comp);
 
     if (self.getZigObject()) |zo| try zo.flush(self, tid);
-    if (self.base.isStaticLib()) return relocatable.flushStaticLib(self, comp, zcu_obj_path);
+    if (self.base.isStaticLib()) return relocatable.flushStaticLib(self, arena, comp, zcu_obj_path);
     if (self.base.isObject()) {
         // Skip linker if --no-link flag is set
         if (comp.no_link_obj) {
             return;
         }
-        return relocatable.flushObject(self, comp, zcu_obj_path);
+        return relocatable.flushObject(self, arena, comp, zcu_obj_path);
     }
 
     var positionals = std.array_list.Managed(link.Input).init(gpa);
@@ -386,27 +386,7 @@ pub fn flush(
         positionals.appendAssumeCapacity(try link.openObjectInput(diags, key.status.success.object_path));
     }
 
-    // Parse LLVM-generated object file(s) - handle parallel codegen partitions
-    if (zcu_obj_path) |path| {
-        const partition_count = self.base.zcu_object_partition_count;
-        if (partition_count > 1) {
-            const base_path = path.sub_path;
-            const base_name = if (std.mem.endsWith(u8, base_path, ".o"))
-                base_path[0 .. base_path.len - 2]
-            else
-                base_path;
-
-            for (0..partition_count) |i| {
-                const partition_path: Path = .{
-                    .root_dir = path.root_dir,
-                    .sub_path = try std.fmt.allocPrint(arena, "{s}.{d}.o", .{ base_name, i }),
-                };
-                try positionals.append(try link.openObjectInput(diags, partition_path));
-            }
-        } else {
-            try positionals.append(try link.openObjectInput(diags, path));
-        }
-    }
+    try self.appendZcuObjectInputs(arena, &positionals, zcu_obj_path);
 
     if (comp.config.any_sanitize_thread) {
         try positionals.append(try link.openObjectInput(diags, comp.tsan_lib.?.full_object_path));
@@ -642,6 +622,36 @@ pub fn flush(
         invalidateKernelCache(emit.root_dir.handle, emit.sub_path) catch |err| switch (err) {
             else => |e| return diags.fail("failed to invalidate kernel cache: {s}", .{@errorName(e)}),
         };
+    }
+}
+
+/// Append the LLVM-generated ZCU object(s) to the positionals list, expanding
+/// to N partition paths when parallel codegen produced multiple object files.
+pub fn appendZcuObjectInputs(
+    self: *MachO,
+    arena: Allocator,
+    positionals: *std.array_list.Managed(link.Input),
+    zcu_obj_path: ?Path,
+) !void {
+    const diags = &self.base.comp.link_diags;
+    const path = zcu_obj_path orelse return;
+    const partition_count = self.base.zcu_object_partition_count;
+    if (partition_count > 1) {
+        const base_path = path.sub_path;
+        const base_name = if (std.mem.endsWith(u8, base_path, ".o"))
+            base_path[0 .. base_path.len - 2]
+        else
+            base_path;
+
+        for (0..partition_count) |i| {
+            const partition_path: Path = .{
+                .root_dir = path.root_dir,
+                .sub_path = try std.fmt.allocPrint(arena, "{s}.{d}.o", .{ base_name, i }),
+            };
+            try positionals.append(try link.openObjectInput(diags, partition_path));
+        }
+    } else {
+        try positionals.append(try link.openObjectInput(diags, path));
     }
 }
 

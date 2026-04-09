@@ -737,7 +737,11 @@ pub const Nav = struct {
             @"addrspace": std.builtin.AddressSpace,
             /// Populated only if `bits.status == .type_resolved`.
             is_threadlocal: bool,
-            _: u1 = 0,
+            /// Seqlock write-in-progress flag. `resolveNavType`/`resolveNavValue`
+            /// set this before mutating `type_or_val` and clear it on the final
+            /// `bits` store; `getNav` spins while it is set so it never returns
+            /// the transient prelude state.
+            writing: bool = false,
         };
 
         fn unpack(repr: Repr) Nav {
@@ -1313,6 +1317,12 @@ const Local = struct {
                     var new_list: ListSelf = .{ .bytes = @ptrCast(buf[bytes_offset..].ptr) };
                     new_list.header().* = .{ .capacity = capacity };
                     const len = mutable.mutate.len;
+                    // Hold the per-list mutex across the copy and release so a
+                    // cross-tid writer that locked this mutex and acquired the
+                    // shared view cannot have its write land in the old buffer
+                    // after this copy has already snapshotted it.
+                    mutable.mutate.mutex.lock();
+                    defer mutable.mutate.mutex.unlock();
                     // this cold, quickly predictable, condition enables
                     // the `MultiArrayList` optimization in `view`
                     if (len > 0) {
@@ -1320,8 +1330,6 @@ const Local = struct {
                         const new_slice = new_list.view().slice();
                         inline for (fields) |field| @memcpy(new_slice.items(field)[0..len], old_slice.items(field)[0..len]);
                     }
-                    mutable.mutate.mutex.lock();
-                    defer mutable.mutate.mutex.unlock();
                     mutable.list.release(new_list);
                 }
 
@@ -1961,24 +1969,43 @@ pub const OptionalNullTerminatedString = enum(u32) {
 /// * comptime-known value (where we store the value)
 /// * `Nav` val (so that we can analyze the value lazily)
 /// * `Nav` ref (so that we can analyze the reference lazily)
+/// Re-encode a tid_shift_32 index (e.g. `Index`, `Nav.Index`) into 30 bits
+/// using `tid_shift_30`, so it fits inside `CaptureValue.idx`. Safe because
+/// per-tid local arrays stay well below 2^(30 - tid_width) entries.
+fn repack32To30(ip: *const InternPool, raw32: u32) u30 {
+    if (single_threaded) return @intCast(raw32);
+    const tid = raw32 >> ip.tid_shift_32 & ip.getTidMask();
+    const idx = raw32 & ip.getIndexMask(u32);
+    return @intCast(@shlExact(tid, ip.tid_shift_30) | idx);
+}
+fn repack30To32(ip: *const InternPool, raw30: u30) u32 {
+    if (single_threaded) return raw30;
+    const tid = raw30 >> ip.tid_shift_30 & ip.getTidMask();
+    const idx = raw30 & ((@as(u32, 1) << ip.tid_shift_30) - 1);
+    return @shlExact(tid, ip.tid_shift_32) | idx;
+}
+
 pub const CaptureValue = packed struct(u32) {
     tag: enum(u2) { @"comptime", runtime, nav_val, nav_ref },
     idx: u30,
 
-    pub fn wrap(val: Unwrapped) CaptureValue {
+    pub fn wrap(ip: *const InternPool, val: Unwrapped) CaptureValue {
         return switch (val) {
+            // `Index` is already encoded with `tid_shift_30`, so it fits u30 directly.
             .@"comptime" => |i| .{ .tag = .@"comptime", .idx = @intCast(@intFromEnum(i)) },
             .runtime => |i| .{ .tag = .runtime, .idx = @intCast(@intFromEnum(i)) },
-            .nav_val => |i| .{ .tag = .nav_val, .idx = @intCast(@intFromEnum(i)) },
-            .nav_ref => |i| .{ .tag = .nav_ref, .idx = @intCast(@intFromEnum(i)) },
+            // `Nav.Index` is encoded with `tid_shift_32`; repack so the tid bits
+            // land inside u30.
+            .nav_val => |i| .{ .tag = .nav_val, .idx = repack32To30(ip, @intFromEnum(i)) },
+            .nav_ref => |i| .{ .tag = .nav_ref, .idx = repack32To30(ip, @intFromEnum(i)) },
         };
     }
-    pub fn unwrap(val: CaptureValue) Unwrapped {
+    pub fn unwrap(val: CaptureValue, ip: *const InternPool) Unwrapped {
         return switch (val.tag) {
             .@"comptime" => .{ .@"comptime" = @enumFromInt(val.idx) },
             .runtime => .{ .runtime = @enumFromInt(val.idx) },
-            .nav_val => .{ .nav_val = @enumFromInt(val.idx) },
-            .nav_ref => .{ .nav_ref = @enumFromInt(val.idx) },
+            .nav_val => .{ .nav_val = @enumFromInt(repack30To32(ip, val.idx)) },
+            .nav_ref => .{ .nav_ref = @enumFromInt(repack30To32(ip, val.idx)) },
         };
     }
 
@@ -2298,8 +2325,14 @@ pub const Key = union(enum) {
         /// Used for mutating that data.
         analysis_extra_index: u32,
         /// Index into extra array of the `zir_body_inst` corresponding to this function.
-        /// Used for mutating that data.
+        /// Used for mutating that data. For generic instances this index refers
+        /// to the generic owner's extra array, so it may live on a different
+        /// thread's local than `tid`.
         zir_body_inst_extra_index: u32,
+        /// Thread whose extra array `zir_body_inst_extra_index` refers to.
+        /// Equals `tid` for `func_decl`; equals the generic owner's tid for
+        /// `func_instance`.
+        zir_body_inst_tid: Zcu.PerThread.Id,
         /// Index into extra array of the resolved inferred error set for this function.
         /// Used for mutating that data.
         /// 0 when the function does not have an inferred error set.
@@ -2368,9 +2401,35 @@ pub const Key = union(enum) {
             @atomicStore(FuncAnalysis, analysis_ptr, analysis, .release);
         }
 
+        pub fn clearAnalyzed(func: Func, ip: *InternPool) void {
+            const extra_mutex = &ip.getLocal(func.tid).mutate.extra.mutex;
+            extra_mutex.lock();
+            defer extra_mutex.unlock();
+
+            const analysis_ptr = func.analysisPtr(ip);
+            var analysis = analysis_ptr.*;
+            analysis.is_analyzed = false;
+            @atomicStore(FuncAnalysis, analysis_ptr, analysis, .release);
+        }
+
+        /// Atomically set `is_queued`; returns true if WE set it (i.e. the
+        /// caller should enqueue the analyze_func job), false if already set.
+        pub fn trySetQueued(func: Func, ip: *InternPool) bool {
+            const extra_mutex = &ip.getLocal(func.tid).mutate.extra.mutex;
+            extra_mutex.lock();
+            defer extra_mutex.unlock();
+
+            const analysis_ptr = func.analysisPtr(ip);
+            var analysis = analysis_ptr.*;
+            if (analysis.is_queued or analysis.is_analyzed) return false;
+            analysis.is_queued = true;
+            @atomicStore(FuncAnalysis, analysis_ptr, analysis, .release);
+            return true;
+        }
+
         /// Returns a pointer that becomes invalid after any additions to the `InternPool`.
         fn zirBodyInstPtr(func: Func, ip: *const InternPool) *TrackedInst.Index {
-            const extra = ip.getLocalShared(func.tid).extra.acquire();
+            const extra = ip.getLocalShared(func.zir_body_inst_tid).extra.acquire();
             return @ptrCast(&extra.view().items(.@"0")[func.zir_body_inst_extra_index]);
         }
 
@@ -3388,7 +3447,9 @@ pub const LoadedUnionType = struct {
     }
 
     pub fn flagsUnordered(u: LoadedUnionType, ip: *const InternPool) Tag.TypeUnion.Flags {
-        return @atomicLoad(Tag.TypeUnion.Flags, u.flagsPtr(ip), .unordered);
+        // Despite the name, use .acquire so a true status-done flag synchronises
+        // with the prior release-store and makes preceding field writes visible.
+        return @atomicLoad(Tag.TypeUnion.Flags, u.flagsPtr(ip), .acquire);
     }
 
     pub fn setStatus(u: LoadedUnionType, ip: *InternPool, status: Status) void {
@@ -3546,14 +3607,34 @@ pub const LoadedUnionType = struct {
         ptr.* = new_zir_index;
     }
 
-    pub fn setFieldTypes(self: LoadedUnionType, ip: *const InternPool, types: []const Index) void {
+    pub fn setFieldTypes(self: LoadedUnionType, ip: *InternPool, types: []const Index) void {
+        const extra_mutex = &ip.getLocal(self.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
         @memcpy(self.field_types.get(ip), types);
     }
 
-    pub fn setFieldAligns(self: LoadedUnionType, ip: *const InternPool, aligns: []const Alignment) void {
+    pub fn setFieldAligns(self: LoadedUnionType, ip: *InternPool, aligns: []const Alignment) void {
         if (aligns.len == 0) return;
         assert(self.flagsUnordered(ip).any_aligned_fields);
+        const extra_mutex = &ip.getLocal(self.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
         @memcpy(self.field_aligns.get(ip), aligns);
+    }
+
+    pub fn setFieldType(self: LoadedUnionType, ip: *InternPool, i: usize, ty: Index) void {
+        const extra_mutex = &ip.getLocal(self.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        self.field_types.get(ip)[i] = ty;
+    }
+
+    pub fn setFieldAlign(self: LoadedUnionType, ip: *InternPool, i: usize, a: Alignment) void {
+        const extra_mutex = &ip.getLocal(self.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        self.field_aligns.get(ip)[i] = a;
     }
 };
 
@@ -3654,11 +3735,17 @@ pub const LoadedStructType = struct {
             return @as(u1, @truncate(this.get(ip)[i / 32] >> @intCast(i % 32))) != 0;
         }
 
-        pub fn setBit(this: ComptimeBits, ip: *const InternPool, i: usize) void {
+        pub fn setBit(this: ComptimeBits, ip: *InternPool, i: usize) void {
+            const extra_mutex = &ip.getLocal(this.tid).mutate.extra.mutex;
+            extra_mutex.lock();
+            defer extra_mutex.unlock();
             this.get(ip)[i / 32] |= @as(u32, 1) << @intCast(i % 32);
         }
 
-        pub fn clearBit(this: ComptimeBits, ip: *const InternPool, i: usize) void {
+        pub fn clearBit(this: ComptimeBits, ip: *InternPool, i: usize) void {
+            const extra_mutex = &ip.getLocal(this.tid).mutate.extra.mutex;
+            extra_mutex.lock();
+            defer extra_mutex.unlock();
             this.get(ip)[i / 32] &= ~(@as(u32, 1) << @intCast(i % 32));
         }
     };
@@ -3724,8 +3811,92 @@ pub const LoadedStructType = struct {
         ip: *InternPool,
         name: NullTerminatedString,
     ) ?u32 {
-        const extra = ip.getLocalShared(s.tid).extra.acquire();
+        const local = ip.getLocal(s.tid);
+        local.mutate.extra.mutex.lock();
+        defer local.mutate.extra.mutex.unlock();
+        local.mutate.maps.mutex.lock();
+        defer local.mutate.maps.mutex.unlock();
+        const extra = local.shared.extra.acquire();
         return ip.addFieldName(extra, s.names_map.unwrap().?, s.field_names.start, name);
+    }
+
+    pub fn setFieldType(s: LoadedStructType, ip: *InternPool, i: usize, ty: Index) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        s.field_types.get(ip)[i] = ty;
+    }
+
+    pub fn setFieldInit(s: LoadedStructType, ip: *InternPool, i: usize, init_val: Index) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        s.field_inits.get(ip)[i] = init_val;
+    }
+
+    pub fn setFieldAlign(s: LoadedStructType, ip: *InternPool, i: usize, a: Alignment) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        s.field_aligns.get(ip)[i] = a;
+    }
+
+    pub fn setFieldTypesAll(s: LoadedStructType, ip: *InternPool, types: []const Index) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        @memcpy(s.field_types.get(ip), types);
+    }
+
+    pub fn setOffset(s: LoadedStructType, ip: *InternPool, i: usize, off: u32) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        s.offsets.get(ip)[i] = off;
+    }
+
+    pub fn setOffsetsAll(s: LoadedStructType, ip: *InternPool, offs: []const u32) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        @memcpy(s.offsets.get(ip), offs);
+    }
+
+    pub fn setRuntimeOrderAll(s: LoadedStructType, ip: *InternPool, ro: []const RuntimeOrder) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        @memcpy(s.runtime_order.get(ip), ro);
+    }
+
+    pub fn setFieldInitsAll(s: LoadedStructType, ip: *InternPool, inits: []const Index) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        @memcpy(s.field_inits.get(ip), inits);
+    }
+
+    pub fn setFieldAlignsAll(s: LoadedStructType, ip: *InternPool, aligns: []const Alignment) void {
+        if (s.field_aligns.len == 0) return;
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        @memcpy(s.field_aligns.get(ip), aligns);
+    }
+
+    /// Publish field types and (optionally) aligns under one `extra.mutex`
+    /// hold so the per-field setters' lock churn is avoided.
+    pub fn setFieldTypesAlignsAll(
+        s: LoadedStructType,
+        ip: *InternPool,
+        types: []const Index,
+        aligns: ?[]const Alignment,
+    ) void {
+        const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
+        extra_mutex.lock();
+        defer extra_mutex.unlock();
+        @memcpy(s.field_types.get(ip), types);
+        if (aligns) |a| if (s.field_aligns.len != 0) @memcpy(s.field_aligns.get(ip), a);
     }
 
     pub fn fieldAlign(s: LoadedStructType, ip: *const InternPool, i: usize) Alignment {
@@ -3742,7 +3913,8 @@ pub const LoadedStructType = struct {
     /// Returns `none` in the case the struct is a tuple.
     pub fn fieldName(s: LoadedStructType, ip: *const InternPool, i: usize) OptionalNullTerminatedString {
         if (s.field_names.len == 0) return .none;
-        return s.field_names.get(ip)[i].toOptional();
+        const names = s.field_names.get(ip);
+        return @atomicLoad(NullTerminatedString, &names[i], .acquire).toOptional();
     }
 
     pub fn fieldIsComptime(s: LoadedStructType, ip: *const InternPool, i: usize) bool {
@@ -3763,7 +3935,9 @@ pub const LoadedStructType = struct {
     }
 
     pub fn flagsUnordered(s: LoadedStructType, ip: *const InternPool) Tag.TypeStruct.Flags {
-        return @atomicLoad(Tag.TypeStruct.Flags, s.flagsPtr(ip), .unordered);
+        // Despite the name, use .acquire so a true status-done flag synchronises
+        // with the prior release-store and makes preceding field writes visible.
+        return @atomicLoad(Tag.TypeStruct.Flags, s.flagsPtr(ip), .acquire);
     }
 
     /// The returned pointer expires with any addition to the `InternPool`.
@@ -3776,7 +3950,7 @@ pub const LoadedStructType = struct {
     }
 
     pub fn packedFlagsUnordered(s: LoadedStructType, ip: *const InternPool) Tag.TypeStructPacked.Flags {
-        return @atomicLoad(Tag.TypeStructPacked.Flags, s.packedFlagsPtr(ip), .unordered);
+        return @atomicLoad(Tag.TypeStructPacked.Flags, s.packedFlagsPtr(ip), .acquire);
     }
 
     /// Reads the non-opv flag calculated during AstGen. Used to short-circuit more
@@ -4069,7 +4243,10 @@ pub const LoadedStructType = struct {
 
     pub fn haveFieldTypes(s: LoadedStructType, ip: *const InternPool) bool {
         const types = s.field_types.get(ip);
-        return types.len == 0 or types[types.len - 1] != .none;
+        if (types.len == 0) return true;
+        // Paired with release-store at the end of `structFields` so a true
+        // result here makes the preceding name/type slot writes visible.
+        return @atomicLoad(Index, &types[types.len - 1], .acquire) != .none;
     }
 
     pub fn haveFieldInits(s: LoadedStructType, ip: *const InternPool) bool {
@@ -6232,8 +6409,11 @@ pub const FuncAnalysis = packed struct(u32) {
     inferred_error_set: bool,
     disable_instrumentation: bool,
     disable_intrinsics: bool,
+    /// Under parallel Sema, set atomically by `ensureFuncBodyAnalysisQueued`
+    /// to dedupe work-queue dispatch without taking the global lock.
+    is_queued: bool = false,
 
-    _: u23 = 0,
+    _: u22 = 0,
 };
 
 pub const Bytes = struct {
@@ -6839,7 +7019,8 @@ pub fn init(ip: *InternPool, gpa: Allocator, available_threads: usize) !void {
     ip.tid_shift_30 = if (single_threaded) 0 else 30 - ip.tid_width;
     ip.tid_shift_31 = if (single_threaded) 0 else 31 - ip.tid_width;
     ip.tid_shift_32 = if (single_threaded) 0 else ip.tid_shift_31 +| 1;
-    ip.shards = try gpa.alloc(Shard, @as(usize, 1) << ip.tid_width);
+    const shard_count: usize = @max(@as(usize, 1) << ip.tid_width, 256);
+    ip.shards = try gpa.alloc(Shard, shard_count);
     @memset(ip.shards, .{
         .shared = .{
             .map = Shard.Map(Index).empty,
@@ -7534,6 +7715,7 @@ fn extraFuncDecl(tid: Zcu.PerThread.Id, extra: Local.Extra, extra_index: u32) Ke
         .uncoerced_ty = func_decl.data.ty,
         .analysis_extra_index = extra_index + std.meta.fieldIndex(P, "analysis").?,
         .zir_body_inst_extra_index = extra_index + std.meta.fieldIndex(P, "zir_body_inst").?,
+        .zir_body_inst_tid = tid,
         .resolved_error_set_extra_index = if (func_decl.data.analysis.inferred_error_set) func_decl.end else 0,
         .branch_quota_extra_index = 0,
         .owner_nav = func_decl.data.owner_nav,
@@ -7562,6 +7744,7 @@ fn extraFuncInstance(ip: *const InternPool, tid: Zcu.PerThread.Id, extra: Local.
         .uncoerced_ty = ty,
         .analysis_extra_index = analysis_extra_index,
         .zir_body_inst_extra_index = func_decl.zir_body_inst_extra_index,
+        .zir_body_inst_tid = func_decl.tid,
         .resolved_error_set_extra_index = if (analysis.inferred_error_set) end_extra_index else 0,
         .branch_quota_extra_index = extra_index + std.meta.fieldIndex(Tag.FuncInstance, "branch_quota").?,
         .owner_nav = owner_nav,
@@ -7618,6 +7801,9 @@ const GetOrPutKey = union(enum) {
         tid: Zcu.PerThread.Id,
         shard: *Shard,
         map_index: u32,
+        /// When true, the caller already holds `shard.mutate.map.mutex`
+        /// (via `lockShardsSorted`) and `putFinal`/`cancel` must not unlock.
+        prelocked: bool = false,
     },
 
     fn put(gop: *GetOrPutKey) Index {
@@ -7650,7 +7836,7 @@ const GetOrPutKey = union(enum) {
             .new => |info| {
                 assert(info.shard.shared.map.entries[info.map_index].value == index);
                 info.shard.mutate.map.len += 1;
-                info.shard.mutate.map.mutex.unlock();
+                if (!info.prelocked) info.shard.mutate.map.mutex.unlock();
                 gop.* = .{ .existing = index };
             },
         }
@@ -7659,7 +7845,7 @@ const GetOrPutKey = union(enum) {
     fn cancel(gop: *GetOrPutKey) void {
         switch (gop.*) {
             .existing => {},
-            .new => |info| info.shard.mutate.map.mutex.unlock(),
+            .new => |info| if (!info.prelocked) info.shard.mutate.map.mutex.unlock(),
         }
         gop.* = .{ .existing = undefined };
     }
@@ -7673,13 +7859,53 @@ const GetOrPutKey = union(enum) {
         gop.* = undefined;
     }
 };
+
+/// Sentinel stored in a namespace-type's `namespace` extra slot between
+/// `getStructType`/`getUnionType`/etc. publishing the index and the caller
+/// invoking `WipNamespaceType.finish`. Single-threaded Sema never observes
+/// it; with parallel Sema another thread that dedups to `.existing` may, and
+/// must spin via `awaitNamespaceTypeFinished` before reading namespace/name.
+pub const wip_namespace_sentinel: u32 = std.math.maxInt(u32);
+/// Written by `WipNamespaceType.cancel`/`WipEnumType.cancel` so a thread spinning
+/// in `awaitNamespaceTypeFinished` exits without mistaking the slot for a real
+/// `NamespaceIndex` (0 is a valid index).
+pub const cancelled_namespace_sentinel: u32 = std.math.maxInt(u32) - 1;
+
+/// Spin until `ty`'s namespace slot is no longer the wip sentinel.
+pub fn awaitNamespaceTypeFinished(ip: *const InternPool, ty: Index) void {
+    const ns_idx = ip.namespaceTypeNamespaceExtraIndex(ty) orelse return;
+    const unwrapped = ty.unwrap(ip);
+    while (true) {
+        // Re-acquire the shared view each iteration: the owning tid may
+        // realloc its extra array between `getStructType` and `finish`, which
+        // would leave a cached slot pointer dangling at the old buffer.
+        const extra = ip.getLocalShared(unwrapped.tid).extra.acquire();
+        const slot: *const u32 = &extra.view().items(.@"0")[ns_idx];
+        if (@atomicLoad(u32, slot, .acquire) != wip_namespace_sentinel) return;
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn namespaceTypeNamespaceExtraIndex(ip: *const InternPool, ty: Index) ?u32 {
+    const unwrapped = ty.unwrap(ip);
+    const item = unwrapped.getItem(ip);
+    return switch (item.tag) {
+        .type_struct => item.data + std.meta.fieldIndex(Tag.TypeStruct, "namespace").?,
+        .type_struct_packed, .type_struct_packed_inits => item.data + std.meta.fieldIndex(Tag.TypeStructPacked, "namespace").?,
+        .type_union => item.data + std.meta.fieldIndex(Tag.TypeUnion, "namespace").?,
+        .type_opaque => item.data + std.meta.fieldIndex(Tag.TypeOpaque, "namespace").?,
+        .type_enum_auto => item.data + std.meta.fieldIndex(EnumAuto, "namespace").?,
+        .type_enum_explicit, .type_enum_nonexhaustive => item.data + std.meta.fieldIndex(EnumExplicit, "namespace").?,
+        else => null,
+    };
+}
 fn getOrPutKey(
     ip: *InternPool,
     gpa: Allocator,
     tid: Zcu.PerThread.Id,
     key: Key,
 ) Allocator.Error!GetOrPutKey {
-    return ip.getOrPutKeyEnsuringAdditionalCapacity(gpa, tid, key, 0);
+    return ip.getOrPutKeyInner(gpa, tid, key, 0, false);
 }
 fn getOrPutKeyEnsuringAdditionalCapacity(
     ip: *InternPool,
@@ -7688,6 +7914,28 @@ fn getOrPutKeyEnsuringAdditionalCapacity(
     key: Key,
     additional_capacity: u32,
 ) Allocator.Error!GetOrPutKey {
+    return ip.getOrPutKeyInner(gpa, tid, key, additional_capacity, false);
+}
+/// Like `getOrPutKeyEnsuringAdditionalCapacity` but assumes the caller already
+/// holds `shard.mutate.map.mutex` for this key's shard (via `lockShardsSorted`).
+/// The returned `.new` will not unlock on `putFinal`/`cancel`/`deinit`.
+fn getOrPutKeyPrelocked(
+    ip: *InternPool,
+    gpa: Allocator,
+    tid: Zcu.PerThread.Id,
+    key: Key,
+    additional_capacity: u32,
+) Allocator.Error!GetOrPutKey {
+    return ip.getOrPutKeyInner(gpa, tid, key, additional_capacity, true);
+}
+fn getOrPutKeyInner(
+    ip: *InternPool,
+    gpa: Allocator,
+    tid: Zcu.PerThread.Id,
+    key: Key,
+    additional_capacity: u32,
+    prelocked: bool,
+) Allocator.Error!GetOrPutKey {
     const full_hash = key.hash64(ip);
     const hash: u32 = @truncate(full_hash >> 32);
     const shard = &ip.shards[@intCast(full_hash & (ip.shards.len - 1))];
@@ -7695,17 +7943,19 @@ fn getOrPutKeyEnsuringAdditionalCapacity(
     const Map = @TypeOf(map);
     var map_mask = map.header().mask();
     var map_index = hash;
-    while (true) : (map_index += 1) {
-        map_index &= map_mask;
-        const entry = &map.entries[map_index];
-        const index = entry.acquire();
-        if (index == .none) break;
-        if (entry.hash != hash) continue;
-        if (index.unwrap(ip).getTag(ip) == .removed) continue;
-        if (ip.indexToKey(index).eql(key, ip)) return .{ .existing = index };
+    if (!prelocked) {
+        while (true) : (map_index += 1) {
+            map_index &= map_mask;
+            const entry = &map.entries[map_index];
+            const index = entry.acquire();
+            if (index == .none) break;
+            if (entry.hash != hash) continue;
+            if (index.unwrap(ip).getTag(ip) == .removed) continue;
+            if (ip.indexToKey(index).eql(key, ip)) return .{ .existing = index };
+        }
+        shard.mutate.map.mutex.lock();
     }
-    shard.mutate.map.mutex.lock();
-    errdefer shard.mutate.map.mutex.unlock();
+    errdefer if (!prelocked) shard.mutate.map.mutex.unlock();
     if (map.entries != shard.shared.map.entries) {
         map = shard.shared.map;
         map_mask = map.header().mask();
@@ -7718,7 +7968,7 @@ fn getOrPutKeyEnsuringAdditionalCapacity(
         if (index == .none) break;
         if (entry.hash != hash) continue;
         if (ip.indexToKey(index).eql(key, ip)) {
-            defer shard.mutate.map.mutex.unlock();
+            if (!prelocked) shard.mutate.map.mutex.unlock();
             return .{ .existing = index };
         }
     }
@@ -7774,7 +8024,39 @@ fn getOrPutKeyEnsuringAdditionalCapacity(
         .tid = tid,
         .shard = shard,
         .map_index = map_index,
+        .prelocked = prelocked,
     } };
+}
+
+/// Compute the shard index for `key` (matches `getOrPutKeyInner`).
+fn keyShardIndex(ip: *const InternPool, key: Key) u32 {
+    return @intCast(key.hash64(ip) & (ip.shards.len - 1));
+}
+
+/// Lock the shard mutexes for the given keys in ascending shard-index order
+/// so concurrent multi-key inserters cannot ABBA-deadlock. Returns the count
+/// of distinct shards locked, written to `out`. Caller must unlock each via
+/// `ip.shards[out[i]].mutate.map.mutex.unlock()` in any order.
+fn lockShardsSorted(
+    ip: *InternPool,
+    keys: []const Key,
+    out: []u32,
+) usize {
+    assert(out.len >= keys.len);
+    var n: usize = 0;
+    for (keys) |k| {
+        const s = ip.keyShardIndex(k);
+        // dedupe: skip if already present
+        for (out[0..n]) |existing| {
+            if (existing == s) break;
+        } else {
+            out[n] = s;
+            n += 1;
+        }
+    }
+    std.mem.sort(u32, out[0..n], {}, std.sort.asc(u32));
+    for (out[0..n]) |s| ip.shards[s].mutate.map.mutex.lock();
+    return n;
 }
 /// Like `getOrPutKey`, but asserts that the key already exists, and prepares to replace
 /// its shard entry with a new `Index` anyway. After finalizing this, the old index remains
@@ -7843,6 +8125,7 @@ pub fn get(ip: *InternPool, gpa: Allocator, tid: Zcu.PerThread.Id, key: Key) All
                 new_key.ptr_type.flags.size = .many;
                 const ptr_type_index = try ip.get(gpa, tid, new_key);
                 gop = try ip.getOrPutKey(gpa, tid, key);
+                if (gop == .existing) return gop.existing;
 
                 try items.ensureUnusedCapacity(1);
                 items.appendAssumeCapacity(.{
@@ -8099,6 +8382,7 @@ pub fn get(ip: *InternPool, gpa: Allocator, tid: Zcu.PerThread.Id, key: Key) All
                         .storage = .{ .u64 = base_index.index },
                     } });
                     gop = try ip.getOrPutKey(gpa, tid, key);
+                    if (gop == .existing) return gop.existing;
                     try items.ensureUnusedCapacity(1);
                     items.appendAssumeCapacity(.{
                         .tag = switch (ptr.base_addr) {
@@ -8522,6 +8806,7 @@ pub fn get(ip: *InternPool, gpa: Allocator, tid: Zcu.PerThread.Id, key: Key) All
                             .storage = .{ .u64 = bytes.at(0, ip) },
                         } });
                         gop = try ip.getOrPutKey(gpa, tid, key);
+                        if (gop == .existing) return gop.existing;
                         try items.ensureUnusedCapacity(1);
                         break :elem elem;
                     },
@@ -8746,7 +9031,7 @@ pub fn getUnionType(
         .padding = std.math.maxInt(u32),
         .name = undefined, // set by `finish`
         .name_nav = undefined, // set by `finish`
-        .namespace = undefined, // set by `finish`
+        .namespace = @enumFromInt(wip_namespace_sentinel), // set by `finish`
         .tag_ty = ini.enum_tag_ty,
         .zir_index = switch (ini.key) {
             inline else => |x| x.zir_index,
@@ -8831,13 +9116,27 @@ pub const WipNamespaceType = struct {
         const extra = ip.getLocalShared(wip.tid).extra.acquire();
         const extra_items = extra.view().items(.@"0");
 
-        extra_items[wip.namespace_extra_index] = @intFromEnum(namespace);
+        // Release-store so a concurrent reader spinning in
+        // `awaitNamespaceTypeFinished` sees this and the prior `setName`
+        // writes once the sentinel is replaced.
+        @atomicStore(u32, &extra_items[wip.namespace_extra_index], @intFromEnum(namespace), .release);
 
         return wip.index;
     }
 
     pub fn cancel(wip: WipNamespaceType, ip: *InternPool, tid: Zcu.PerThread.Id) void {
+        const extra = ip.getLocalShared(wip.tid).extra.acquire();
+        const extra_items = extra.view().items(.@"0");
+        // If `finish` was already called the index is published; another
+        // thread may be using it, so removal is unsafe. Leave it.
+        if (@atomicLoad(u32, &extra_items[wip.namespace_extra_index], .acquire) != wip_namespace_sentinel) return;
+        // Tombstone the item first so a concurrent thread that already holds
+        // `.existing` and is about to read this index sees `.removed` instead
+        // of a half-dead entry, then publish `cancelled_namespace_sentinel`
+        // (NOT 0, which is a real `NamespaceIndex`) so spinners in
+        // `awaitNamespaceTypeFinished` exit without dereferencing namespace 0.
         ip.remove(tid, wip.index);
+        @atomicStore(u32, &extra_items[wip.namespace_extra_index], cancelled_namespace_sentinel, .release);
     }
 
     pub const Result = union(enum) {
@@ -8932,7 +9231,7 @@ pub fn getStructType(
                 .name_nav = undefined, // set by `finish`
                 .zir_index = zir_index,
                 .fields_len = ini.fields_len,
-                .namespace = undefined, // set by `finish`
+                .namespace = @enumFromInt(wip_namespace_sentinel), // set by `finish`
                 .backing_int_ty = .none,
                 .names_map = names_map,
                 .flags = .{
@@ -8999,7 +9298,7 @@ pub fn getStructType(
         .name = undefined, // set by `finish`
         .name_nav = undefined, // set by `finish`
         .zir_index = zir_index,
-        .namespace = undefined, // set by `finish`
+        .namespace = @enumFromInt(wip_namespace_sentinel), // set by `finish`
         .fields_len = ini.fields_len,
         .size = std.math.maxInt(u32),
         .flags = .{
@@ -9459,9 +9758,19 @@ pub fn getFuncDeclIes(
         extra.mutate.len = prev_extra_len;
     }
 
-    var func_gop = try ip.getOrPutKeyEnsuringAdditionalCapacity(gpa, tid, .{
-        .func = extraFuncDecl(tid, extra.list.*, func_decl_extra_index),
-    }, 3);
+    const func_key: Key = .{ .func = extraFuncDecl(tid, extra.list.*, func_decl_extra_index) };
+    const eu_key: Key = .{ .error_union_type = .{
+        .error_set_type = error_set_type,
+        .payload_type = key.bare_return_type,
+    } };
+    const es_key: Key = .{ .inferred_error_set_type = func_index };
+    const fty_key: Key = .{ .func_type = extraFuncType(tid, extra.list.*, func_type_extra_index) };
+
+    var locked_shards: [4]u32 = undefined;
+    const n_locked = ip.lockShardsSorted(&.{ func_key, eu_key, es_key, fty_key }, &locked_shards);
+    defer for (locked_shards[0..n_locked]) |s| ip.shards[s].mutate.map.mutex.unlock();
+
+    var func_gop = try ip.getOrPutKeyPrelocked(gpa, tid, func_key, 3);
     defer func_gop.deinit();
     if (func_gop == .existing) {
         // An existing function type was found; undo the additions to our two arrays.
@@ -9480,20 +9789,13 @@ pub fn getFuncDeclIes(
         return func_gop.existing;
     }
     func_gop.putTentative(func_index);
-    var error_union_type_gop = try ip.getOrPutKeyEnsuringAdditionalCapacity(gpa, tid, .{ .error_union_type = .{
-        .error_set_type = error_set_type,
-        .payload_type = key.bare_return_type,
-    } }, 2);
+    var error_union_type_gop = try ip.getOrPutKeyPrelocked(gpa, tid, eu_key, 2);
     defer error_union_type_gop.deinit();
     error_union_type_gop.putTentative(error_union_type);
-    var error_set_type_gop = try ip.getOrPutKeyEnsuringAdditionalCapacity(gpa, tid, .{
-        .inferred_error_set_type = func_index,
-    }, 1);
+    var error_set_type_gop = try ip.getOrPutKeyPrelocked(gpa, tid, es_key, 1);
     defer error_set_type_gop.deinit();
     error_set_type_gop.putTentative(error_set_type);
-    var func_ty_gop = try ip.getOrPutKey(gpa, tid, .{
-        .func_type = extraFuncType(tid, extra.list.*, func_type_extra_index),
-    });
+    var func_ty_gop = try ip.getOrPutKeyPrelocked(gpa, tid, fty_key, 0);
     defer func_ty_gop.deinit();
     func_ty_gop.putTentative(func_ty);
 
@@ -9755,9 +10057,21 @@ pub fn getFuncInstanceIes(
         extra.mutate.len = prev_extra_len;
     }
 
-    var func_gop = try ip.getOrPutKeyEnsuringAdditionalCapacity(gpa, tid, .{
-        .func = ip.extraFuncInstance(tid, extra.list.*, func_extra_index),
-    }, 3);
+    const func_key: Key = .{ .func = ip.extraFuncInstance(tid, extra.list.*, func_extra_index) };
+    const eu_key: Key = .{ .error_union_type = .{
+        .error_set_type = error_set_type,
+        .payload_type = arg.bare_return_type,
+    } };
+    const es_key: Key = .{ .inferred_error_set_type = func_index };
+    const fty_key: Key = .{ .func_type = extraFuncType(tid, extra.list.*, func_type_extra_index) };
+
+    // Four shard mutexes are held simultaneously below; lock in sorted order
+    // so concurrent callers cannot ABBA-deadlock.
+    var locked_shards: [4]u32 = undefined;
+    const n_locked = ip.lockShardsSorted(&.{ func_key, eu_key, es_key, fty_key }, &locked_shards);
+    defer for (locked_shards[0..n_locked]) |s| ip.shards[s].mutate.map.mutex.unlock();
+
+    var func_gop = try ip.getOrPutKeyPrelocked(gpa, tid, func_key, 3);
     defer func_gop.deinit();
     if (func_gop == .existing) {
         // Hot path: undo the additions to our two arrays.
@@ -9766,20 +10080,13 @@ pub fn getFuncInstanceIes(
         return func_gop.existing;
     }
     func_gop.putTentative(func_index);
-    var error_union_type_gop = try ip.getOrPutKeyEnsuringAdditionalCapacity(gpa, tid, .{ .error_union_type = .{
-        .error_set_type = error_set_type,
-        .payload_type = arg.bare_return_type,
-    } }, 2);
+    var error_union_type_gop = try ip.getOrPutKeyPrelocked(gpa, tid, eu_key, 2);
     defer error_union_type_gop.deinit();
     error_union_type_gop.putTentative(error_union_type);
-    var error_set_type_gop = try ip.getOrPutKeyEnsuringAdditionalCapacity(gpa, tid, .{
-        .inferred_error_set_type = func_index,
-    }, 1);
+    var error_set_type_gop = try ip.getOrPutKeyPrelocked(gpa, tid, es_key, 1);
     defer error_set_type_gop.deinit();
     error_set_type_gop.putTentative(error_set_type);
-    var func_ty_gop = try ip.getOrPutKey(gpa, tid, .{
-        .func_type = extraFuncType(tid, extra.list.*, func_type_extra_index),
-    });
+    var func_ty_gop = try ip.getOrPutKeyPrelocked(gpa, tid, fty_key, 0);
     defer func_ty_gop.deinit();
     func_ty_gop.putTentative(func_ty);
     try finishFuncInstance(
@@ -9815,14 +10122,26 @@ fn finishFuncInstance(
     const nav_name = try ip.getOrPutStringFmt(gpa, tid, "{f}__anon_{d}", .{
         fn_owner_nav.name.fmt(ip), @intFromEnum(func_index),
     }, .no_embedded_nulls);
+    // The generic owner's nav is normally `.fully_resolved` by the time we
+    // reach instantiation, but under parallel Sema another thread may hold the
+    // generic's func index (via an alias nav) before the owner nav itself
+    // commits. The modifiers we need are present from `.type_resolved`
+    // onward; switch instead of unconditionally accessing `.fully_resolved`.
+    const owner_mods = switch (fn_owner_nav.status) {
+        .fully_resolved => |r| .{ r.is_const, r.alignment, r.@"linksection", r.@"addrspace" },
+        .type_resolved => |r| .{ r.is_const, r.alignment, r.@"linksection", r.@"addrspace" },
+        // The `getNav` seqlock guarantees we never see the transient prelude
+        // state; a genuine `.unresolved` cannot reach instantiation.
+        .unresolved => unreachable,
+    };
     const nav_index = try ip.createNav(gpa, tid, .{
         .name = nav_name,
         .fqn = try ip.namespacePtr(fn_namespace).internFullyQualifiedName(ip, gpa, tid, nav_name),
         .val = func_index,
-        .is_const = fn_owner_nav.status.fully_resolved.is_const,
-        .alignment = fn_owner_nav.status.fully_resolved.alignment,
-        .@"linksection" = fn_owner_nav.status.fully_resolved.@"linksection",
-        .@"addrspace" = fn_owner_nav.status.fully_resolved.@"addrspace",
+        .is_const = owner_mods[0],
+        .alignment = owner_mods[1],
+        .@"linksection" = owner_mods[2],
+        .@"addrspace" = owner_mods[3],
     });
 
     // Populate the owner_nav field which was left undefined until now.
@@ -9884,7 +10203,7 @@ pub const WipEnumType = struct {
         const extra = ip.getLocalShared(wip.tid).extra.acquire();
         const extra_items = extra.view().items(.@"0");
 
-        extra_items[wip.namespace_extra_index] = @intFromEnum(namespace);
+        @atomicStore(u32, &extra_items[wip.namespace_extra_index], @intFromEnum(namespace), .release);
     }
 
     pub fn setTagTy(wip: WipEnumType, ip: *InternPool, tag_ty: Index) void {
@@ -9926,7 +10245,12 @@ pub const WipEnumType = struct {
     }
 
     pub fn cancel(wip: WipEnumType, ip: *InternPool, tid: Zcu.PerThread.Id) void {
+        const extra = ip.getLocalShared(wip.tid).extra.acquire();
+        const extra_items = extra.view().items(.@"0");
+        if (@atomicLoad(u32, &extra_items[wip.namespace_extra_index], .acquire) != wip_namespace_sentinel) return;
+        // See `WipNamespaceType.cancel`.
         ip.remove(tid, wip.index);
+        @atomicStore(u32, &extra_items[wip.namespace_extra_index], cancelled_namespace_sentinel, .release);
     }
 
     pub const Result = union(enum) {
@@ -9993,7 +10317,7 @@ pub fn getEnumType(
                     inline .declared, .declared_owned_captures => |d| @intCast(d.captures.len),
                     .reified => std.math.maxInt(u32),
                 },
-                .namespace = undefined, // set by `prepare`
+                .namespace = @enumFromInt(wip_namespace_sentinel), // set by `prepare`
                 .int_tag_type = .none, // set by `prepare`
                 .fields_len = ini.fields_len,
                 .names_map = names_map,
@@ -10052,7 +10376,7 @@ pub fn getEnumType(
                     inline .declared, .declared_owned_captures => |d| @intCast(d.captures.len),
                     .reified => std.math.maxInt(u32),
                 },
-                .namespace = undefined, // set by `prepare`
+                .namespace = @enumFromInt(wip_namespace_sentinel), // set by `prepare`
                 .int_tag_type = .none, // set by `prepare`
                 .fields_len = ini.fields_len,
                 .names_map = names_map,
@@ -10263,7 +10587,7 @@ pub fn getOpaqueType(
     const extra_index = addExtraAssumeCapacity(extra, Tag.TypeOpaque{
         .name = undefined, // set by `finish`
         .name_nav = undefined, // set by `finish`
-        .namespace = undefined, // set by `finish`
+        .namespace = @enumFromInt(wip_namespace_sentinel), // set by `finish`
         .zir_index = switch (ini.key) {
             inline else => |x| x.zir_index,
         },
@@ -10353,7 +10677,11 @@ pub fn remove(ip: *InternPool, tid: Zcu.PerThread.Id, index: Index) void {
     if (unwrapped_index.tid == tid) {
         const items_len = &ip.getLocal(unwrapped_index.tid).mutate.items.len;
         if (unwrapped_index.index == items_len.* - 1) {
-            // Happy case - we can just drop the item without affecting any other indices.
+            // Tombstone first so a stale shard-map entry that still points
+            // here is skipped by the `.removed` check in the lockless probe
+            // even after this slot is reused by the next append.
+            const items = ip.getLocalShared(unwrapped_index.tid).items.acquire().view();
+            @atomicStore(Tag, &items.items(.tag)[unwrapped_index.index], .removed, .release);
             items_len.* -= 1;
             return;
         }
@@ -11488,7 +11816,49 @@ pub fn dumpGenericInstancesFallible(ip: *const InternPool, allocator: Allocator)
 pub fn getNav(ip: *const InternPool, index: Nav.Index) Nav {
     const unwrapped = index.unwrap(ip);
     const navs = ip.getLocalShared(unwrapped.tid).navs.acquire();
-    return navs.view().get(unwrapped.index).unpack();
+    const view = navs.view();
+    const bits_ptr = &view.items(.bits)[unwrapped.index];
+    const tov_ptr = &view.items(.type_or_val)[unwrapped.index];
+    const ls_ptr = &view.items(.@"linksection")[unwrapped.index];
+    var repr = view.get(unwrapped.index);
+    // Seqlock-style read: bits is release-stored last by both
+    // `resolveNavType` and `resolveNavValue`. The .type_resolved →
+    // .fully_resolved transition rewrites `type_or_val` from a type to a
+    // value, so a single acquire is not enough — re-read bits after
+    // type_or_val and retry until stable so we never pair an old status
+    // with a new payload (or vice versa).
+    while (true) {
+        const b1 = @atomicLoad(Nav.Repr.Bits, bits_ptr, .acquire);
+        repr.type_or_val = @atomicLoad(InternPool.Index, tov_ptr, .unordered);
+        repr.@"linksection" = @atomicLoad(OptionalNullTerminatedString, ls_ptr, .unordered);
+        const b2 = @atomicLoad(Nav.Repr.Bits, bits_ptr, .acquire);
+        if (!b1.writing and @as(u16, @bitCast(b1)) == @as(u16, @bitCast(b2))) {
+            repr.bits = b2;
+            return repr.unpack();
+        }
+        std.atomic.spinLoopHint();
+    }
+}
+
+/// Total number of Navs across all per-thread locals. Intended for diagnostics.
+pub fn navCount(ip: *const InternPool) u32 {
+    var total: u32 = 0;
+    for (ip.locals) |*local| total += local.mutate.navs.len;
+    return total;
+}
+
+/// Construct a Nav.Index from a flat ordinal in [0, navCount()). Intended for
+/// diagnostics that need to enumerate every Nav; not stable across updates.
+pub fn navIndexFromOrdinal(ip: *const InternPool, ordinal: u32) Nav.Index {
+    var rem = ordinal;
+    for (ip.locals, 0..) |*local, tid| {
+        const len = local.mutate.navs.len;
+        if (rem < len) {
+            return @enumFromInt(@shlExact(@as(u32, @intCast(tid)), ip.tid_shift_32) | rem);
+        }
+        rem -= len;
+    }
+    unreachable;
 }
 
 pub fn namespacePtr(ip: *InternPool, namespace_index: NamespaceIndex) *Zcu.Namespace {
@@ -11611,10 +11981,10 @@ pub fn resolveNavType(
     const unwrapped = nav.unwrap(ip);
 
     const local = ip.getLocal(unwrapped.tid);
-    local.mutate.extra.mutex.lock();
-    defer local.mutate.extra.mutex.unlock();
+    local.mutate.navs.mutex.lock();
+    defer local.mutate.navs.mutex.unlock();
 
-    const navs = local.shared.navs.view();
+    const navs = local.shared.navs.acquire().view();
 
     const nav_analysis_namespace = navs.items(.analysis_namespace);
     const nav_analysis_zir_index = navs.items(.analysis_zir_index);
@@ -11653,10 +12023,10 @@ pub fn resolveNavValue(
     const unwrapped = nav.unwrap(ip);
 
     const local = ip.getLocal(unwrapped.tid);
-    local.mutate.extra.mutex.lock();
-    defer local.mutate.extra.mutex.unlock();
+    local.mutate.navs.mutex.lock();
+    defer local.mutate.navs.mutex.unlock();
 
-    const navs = local.shared.navs.view();
+    const navs = local.shared.navs.acquire().view();
 
     const nav_analysis_namespace = navs.items(.analysis_namespace);
     const nav_analysis_zir_index = navs.items(.analysis_zir_index);
@@ -11667,10 +12037,18 @@ pub fn resolveNavValue(
     assert(nav_analysis_namespace[unwrapped.index] != .none);
     assert(nav_analysis_zir_index[unwrapped.index] != .none);
 
+    // Seqlock-style write paired with the loop in `getNav`: invalidate `bits`
+    // before mutating `type_or_val` so a concurrent reader cannot pair the old
+    // `.type_resolved` status with the new value (it will see b1 != b2 and
+    // retry). The other `bits` fields are unchanged by this prelude store.
+    var bits = nav_bits[unwrapped.index];
+    bits.writing = true;
+    @atomicStore(Nav.Repr.Bits, &nav_bits[unwrapped.index], bits, .release);
+
     @atomicStore(InternPool.Index, &nav_vals[unwrapped.index], resolved.val, .release);
     @atomicStore(OptionalNullTerminatedString, &nav_linksections[unwrapped.index], resolved.@"linksection", .release);
 
-    var bits = nav_bits[unwrapped.index];
+    bits.writing = false;
     bits.status = .fully_resolved;
     bits.is_const = resolved.is_const;
     bits.alignment = resolved.alignment;
@@ -12740,8 +13118,16 @@ pub fn addFieldName(
     const strings = extra_items[names_start..][0..field_index];
     const adapter: NullTerminatedString.Adapter = .{ .strings = @ptrCast(strings) };
     const gop = map.getOrPutAssumeCapacityAdapted(name, adapter);
-    if (gop.found_existing) return @intCast(gop.index);
-    extra_items[names_start + field_index] = @intFromEnum(name);
+    if (gop.found_existing) {
+        // Re-store the slot so a re-run of `structFields` after a retry has
+        // its own happens-before edge to this slot via the subsequent
+        // flags release-store; otherwise a reader synchronising on the
+        // re-run's flags may not transitively see the original writer's
+        // slot write under weak memory.
+        @atomicStore(u32, &extra_items[names_start + gop.index], @intFromEnum(name), .release);
+        return @intCast(gop.index);
+    }
+    @atomicStore(u32, &extra_items[names_start + field_index], @intFromEnum(name), .release);
     return null;
 }
 

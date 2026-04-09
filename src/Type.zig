@@ -443,7 +443,10 @@ pub fn hasRuntimeBits(ty: Type, zcu: *const Zcu) bool {
 
 pub fn hasRuntimeBitsSema(ty: Type, pt: Zcu.PerThread) SemaError!bool {
     return hasRuntimeBitsInner(ty, false, .sema, pt.zcu, pt.tid) catch |err| switch (err) {
-        error.NeedLazy => unreachable, // this would require a resolve strat of lazy
+        // .sema strat cannot return NeedLazy, but under parallel-Sema races a
+        // partially-populated field type can confuse the inner switches. Treat
+        // it as AnalysisFail so the retry mechanism handles it instead of UB.
+        error.NeedLazy => if (pt.zcu.parallel_sema) error.AnalysisFail else unreachable,
         else => |e| return e,
     };
 }
@@ -454,7 +457,7 @@ pub fn hasRuntimeBitsIgnoreComptime(ty: Type, zcu: *const Zcu) bool {
 
 pub fn hasRuntimeBitsIgnoreComptimeSema(ty: Type, pt: Zcu.PerThread) SemaError!bool {
     return hasRuntimeBitsInner(ty, true, .sema, pt.zcu, pt.tid) catch |err| switch (err) {
-        error.NeedLazy => unreachable, // this would require a resolve strat of lazy
+        error.NeedLazy => if (pt.zcu.parallel_sema) error.AnalysisFail else unreachable,
         else => |e| return e,
     };
 }
@@ -1188,7 +1191,7 @@ fn abiAlignmentInnerErrorUnion(
                         .ty = .comptime_int_type,
                         .storage = .{ .lazy_align = ty.toIntern() },
                     } })) };
-                } else unreachable,
+                } else return error.AnalysisFail,
                 else => |e| return e,
             })) {
                 return .{ .scalar = code_align };
@@ -1236,7 +1239,7 @@ fn abiAlignmentInnerOptional(
                         .ty = .comptime_int_type,
                         .storage = .{ .lazy_align = ty.toIntern() },
                     } })) };
-                } else unreachable,
+                } else return error.AnalysisFail,
                 else => |e| return e,
             })) {
                 return .{ .scalar = .@"1" };
@@ -1789,6 +1792,37 @@ pub fn layoutIsResolved(ty: Type, zcu: *const Zcu) bool {
         },
         .opt_type => |child| Type.fromInterned(child).layoutIsResolved(zcu),
         .error_union_type => |k| Type.fromInterned(k.payload_type).layoutIsResolved(zcu),
+        else => true,
+    };
+}
+
+/// True iff the `.normal`-strategy queries (`abiSize`, `comptimeOnly`,
+/// `hasRuntimeBits`) can be answered without hitting `unreachable`.
+/// Stronger than `layoutIsResolved`: also requires `requires_comptime` to
+/// have been decided. Recurses through optional/array/error-union/vector.
+pub fn eagerResolved(ty: Type, zcu: *const Zcu) bool {
+    const ip = &zcu.intern_pool;
+    return switch (ip.indexToKey(ty.toIntern())) {
+        .struct_type => b: {
+            const s = ip.loadStructType(ty.toIntern());
+            if (!s.haveLayout(ip)) break :b false;
+            if (s.layout == .@"packed") break :b true;
+            break :b switch (s.requiresComptime(ip)) {
+                .unknown, .wip => false,
+                .yes, .no => true,
+            };
+        },
+        .union_type => b: {
+            const u = ip.loadUnionType(ty.toIntern());
+            break :b u.haveLayout(ip) and switch (u.requiresComptime(ip)) {
+                .unknown, .wip => false,
+                .yes, .no => true,
+            };
+        },
+        .array_type => |a| if (a.lenIncludingSentinel() == 0) true else Type.fromInterned(a.child).eagerResolved(zcu),
+        .vector_type => |v| Type.fromInterned(v.child).eagerResolved(zcu),
+        .opt_type => |c| Type.fromInterned(c).eagerResolved(zcu),
+        .error_union_type => |k| Type.fromInterned(k.payload_type).eagerResolved(zcu),
         else => true,
     };
 }
@@ -2679,6 +2713,18 @@ pub fn onePossibleValue(starting_type: Type, pt: Zcu.PerThread) !?Value {
 
 /// During semantic analysis, instead call `ty.comptimeOnlySema` which
 /// resolves field types rather than asserting they are already resolved.
+/// Recurse `comptimeOnlyInner` without tripping `fromInterned`/`toIntern`
+/// asserts when `child` is an unpublished `.none` slot under parallel Sema.
+fn childComptimeOnly(
+    child: InternPool.Index,
+    comptime strat: ResolveStrat,
+    zcu: strat.ZcuPtr(),
+    tid: strat.Tid(),
+) SemaError!bool {
+    if (child == .none) return false;
+    return (Type{ .ip_index = child }).comptimeOnlyInner(strat, zcu, tid);
+}
+
 pub fn comptimeOnly(ty: Type, zcu: *const Zcu) bool {
     return ty.comptimeOnlyInner(.normal, zcu, {}) catch unreachable;
 }
@@ -2696,12 +2742,18 @@ pub fn comptimeOnlyInner(
     tid: strat.Tid(),
 ) SemaError!bool {
     const ip = &zcu.intern_pool;
+    // Under parallel Sema an unpublished struct/union field-type slot can
+    // surface here (often via tail-recursion through .opt_type/.ptr_type
+    // child); the documented contract above allows a false negative.
+    // Checked on `ip_index` directly because `toIntern()` asserts != .none.
+    if (ty.ip_index == .none) return false;
     return switch (ty.toIntern()) {
         .empty_tuple_type => false,
 
         else => switch (ip.indexToKey(ty.toIntern())) {
             .int_type => false,
             .ptr_type => |ptr_type| {
+                if (ptr_type.child == .none) return false;
                 const child_ty = Type.fromInterned(ptr_type.child);
                 switch (child_ty.zigTypeTag(zcu)) {
                     .@"fn" => return !try child_ty.fnHasRuntimeBitsInner(strat, zcu, tid),
@@ -2713,10 +2765,10 @@ pub fn comptimeOnlyInner(
                 if (child == .none) return false;
                 return Type.fromInterned(child).comptimeOnlyInner(strat, zcu, tid);
             },
-            .array_type => |array_type| return Type.fromInterned(array_type.child).comptimeOnlyInner(strat, zcu, tid),
-            .vector_type => |vector_type| return Type.fromInterned(vector_type.child).comptimeOnlyInner(strat, zcu, tid),
-            .opt_type => |child| return Type.fromInterned(child).comptimeOnlyInner(strat, zcu, tid),
-            .error_union_type => |error_union_type| return Type.fromInterned(error_union_type.payload_type).comptimeOnlyInner(strat, zcu, tid),
+            .array_type => |array_type| return childComptimeOnly(array_type.child, strat, zcu, tid),
+            .vector_type => |vector_type| return childComptimeOnly(vector_type.child, strat, zcu, tid),
+            .opt_type => |child| return childComptimeOnly(child, strat, zcu, tid),
+            .error_union_type => |error_union_type| return childComptimeOnly(error_union_type.payload_type, strat, zcu, tid),
 
             .error_set_type,
             .inferred_error_set_type,
@@ -2792,7 +2844,16 @@ pub fn comptimeOnlyInner(
                                 const i: u32 = @intCast(i_usize);
                                 if (struct_type.fieldIsComptime(ip, i)) continue;
                                 const field_ty = struct_type.field_types.get(ip)[i];
-                                if (try Type.fromInterned(field_ty).comptimeOnlyInner(strat, zcu, tid)) {
+                                // Under parallel Sema, `resolveFields` may have
+                                // returned before every slot is published; an
+                                // unpublished slot is still being resolved and
+                                // we treat the answer as unknown (false-neg ok
+                                // per the contract above).
+                                if (zcu.parallel_sema and field_ty == .none) {
+                                    struct_type.setRequiresComptime(ip, .unknown);
+                                    return false;
+                                }
+                                if (try childComptimeOnly(field_ty, strat, zcu, tid)) {
                                     // Note that this does not cause the layout to
                                     // be considered resolved. Comptime-only types
                                     // still maintain a layout of their
@@ -2812,7 +2873,7 @@ pub fn comptimeOnlyInner(
             .tuple_type => |tuple| {
                 for (tuple.types.get(ip), tuple.values.get(ip)) |field_ty, val| {
                     const have_comptime_val = val != .none;
-                    if (!have_comptime_val and try Type.fromInterned(field_ty).comptimeOnlyInner(strat, zcu, tid)) return true;
+                    if (!have_comptime_val and try childComptimeOnly(field_ty, strat, zcu, tid)) return true;
                 }
                 return false;
             },
@@ -2842,7 +2903,11 @@ pub fn comptimeOnlyInner(
 
                             for (0..union_type.field_types.len) |field_idx| {
                                 const field_ty = union_type.field_types.get(ip)[field_idx];
-                                if (try Type.fromInterned(field_ty).comptimeOnlyInner(strat, zcu, tid)) {
+                                if (zcu.parallel_sema and field_ty == .none) {
+                                    union_type.setRequiresComptime(ip, .unknown);
+                                    return false;
+                                }
+                                if (try childComptimeOnly(field_ty, strat, zcu, tid)) {
                                     union_type.setRequiresComptime(ip, .yes);
                                     return true;
                                 }
@@ -2857,7 +2922,7 @@ pub fn comptimeOnlyInner(
 
             .opaque_type => false,
 
-            .enum_type => return Type.fromInterned(ip.loadEnumType(ty.toIntern()).tag_ty).comptimeOnlyInner(strat, zcu, tid),
+            .enum_type => return childComptimeOnly(ip.loadEnumType(ty.toIntern()).tag_ty, strat, zcu, tid),
 
             // values, not types
             .undef,
@@ -2943,6 +3008,7 @@ pub fn getNamespaceIndex(ty: Type, zcu: *Zcu) InternPool.NamespaceIndex {
 /// Returns null if the type has no namespace.
 pub fn getNamespace(ty: Type, zcu: *Zcu) InternPool.OptionalNamespaceIndex {
     const ip = &zcu.intern_pool;
+    zcu.awaitNamespaceTypeFinished(ty.toIntern());
     return switch (ip.indexToKey(ty.toIntern())) {
         .opaque_type => ip.loadOpaqueType(ty.toIntern()).namespace.toOptional(),
         .struct_type => ip.loadStructType(ty.toIntern()).namespace.toOptional(),
@@ -3074,6 +3140,9 @@ pub fn enumFieldName(ty: Type, field_index: usize, zcu: *const Zcu) InternPool.N
 
 pub fn enumFieldIndex(ty: Type, field_name: InternPool.NullTerminatedString, zcu: *const Zcu) ?u32 {
     const ip = &zcu.intern_pool;
+    // The `.existing` dedup may return an enum whose `WipEnumType` owner is
+    // still populating names; spin until prepare() so the lookup sees them.
+    Zcu.awaitNamespaceTypeFinishedConst(zcu, ty.toIntern());
     const enum_type = ip.loadEnumType(ty.toIntern());
     return enum_type.nameIndex(ip, field_name);
 }
@@ -3083,6 +3152,7 @@ pub fn enumFieldIndex(ty: Type, field_name: InternPool.NullTerminatedString, zcu
 /// declaration order, or `null` if `enum_tag` does not match any field.
 pub fn enumTagFieldIndex(ty: Type, enum_tag: Value, zcu: *const Zcu) ?u32 {
     const ip = &zcu.intern_pool;
+    Zcu.awaitNamespaceTypeFinishedConst(zcu, ty.toIntern());
     const enum_type = ip.loadEnumType(ty.toIntern());
     const int_tag = switch (ip.indexToKey(enum_tag.toIntern())) {
         .int => enum_tag.toIntern(),
@@ -3585,10 +3655,16 @@ pub fn resolveLayout(ty: Type, pt: Zcu.PerThread) SemaError!void {
                 const field_ty = Type.fromInterned(tuple_type.types.get(ip)[i]);
                 try field_ty.resolveLayout(pt);
             },
-            .struct_type => return ty.resolveStructInner(pt, .layout),
+            .struct_type => {
+                if (ip.loadStructType(ty.toIntern()).haveLayout(ip)) return;
+                return ty.resolveStructInner(pt, .layout);
+            },
             else => unreachable,
         },
-        .@"union" => return ty.resolveUnionInner(pt, .layout),
+        .@"union" => {
+            if (ip.loadUnionType(ty.toIntern()).haveLayout(ip)) return;
+            return ty.resolveUnionInner(pt, .layout);
+        },
         .array => {
             if (ty.arrayLenIncludingSentinel(zcu) == 0) return;
             const elem_ty = ty.childType(zcu);
@@ -3706,9 +3782,15 @@ pub fn resolveFields(ty: Type, pt: Zcu.PerThread) SemaError!void {
             .type_struct,
             .type_struct_packed,
             .type_struct_packed_inits,
-            => return ty.resolveStructInner(pt, .fields),
+            => {
+                if (ip.loadStructType(ty_ip).haveFieldTypes(ip)) return;
+                return ty.resolveStructInner(pt, .fields);
+            },
 
-            .type_union => return ty.resolveUnionInner(pt, .fields),
+            .type_union => {
+                if (ip.loadUnionType(ty_ip).haveFieldTypes(ip)) return;
+                return ty.resolveUnionInner(pt, .fields);
+            },
 
             else => {},
         },
@@ -3758,24 +3840,38 @@ pub fn resolveFully(ty: Type, pt: Zcu.PerThread) SemaError!void {
                 const field_ty = Type.fromInterned(tuple_type.types.get(ip)[i]);
                 try field_ty.resolveFully(pt);
             },
-            .struct_type => return ty.resolveStructInner(pt, .full),
+            .struct_type => {
+                const s = ip.loadStructType(ty.toIntern());
+                if (s.layout != .@"packed" and s.flagsUnordered(ip).fully_resolved) return;
+                if (s.layout == .@"packed" and s.haveLayout(ip)) return;
+                return ty.resolveStructInner(pt, .full);
+            },
             else => unreachable,
         },
-        .@"union" => return ty.resolveUnionInner(pt, .full),
+        .@"union" => {
+            if (ip.loadUnionType(ty.toIntern()).flagsUnordered(ip).status == .fully_resolved) return;
+            return ty.resolveUnionInner(pt, .full);
+        },
     }
 }
 
 pub fn resolveStructFieldInits(ty: Type, pt: Zcu.PerThread) SemaError!void {
-    // TODO: stop calling this for tuples!
-    _ = pt.zcu.typeToStruct(ty) orelse return;
+    const ip = &pt.zcu.intern_pool;
+    const s = pt.zcu.typeToStruct(ty) orelse return;
+    if (s.haveFieldInits(ip)) return;
     return ty.resolveStructInner(pt, .inits);
 }
 
 pub fn resolveStructAlignment(ty: Type, pt: Zcu.PerThread) SemaError!void {
+    const ip = &pt.zcu.intern_pool;
+    const s = ip.loadStructType(ty.toIntern());
+    if (s.layout != .@"packed" and s.flagsUnordered(ip).alignment != .none) return;
     return ty.resolveStructInner(pt, .alignment);
 }
 
 pub fn resolveUnionAlignment(ty: Type, pt: Zcu.PerThread) SemaError!void {
+    const ip = &pt.zcu.intern_pool;
+    if (ip.loadUnionType(ty.toIntern()).flagsUnordered(ip).alignment != .none) return;
     return ty.resolveUnionInner(pt, .alignment);
 }
 
@@ -3788,13 +3884,46 @@ fn resolveStructInner(
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
+    zcu.awaitNamespaceTypeFinished(ty.toIntern());
+
+    const ip = &zcu.intern_pool;
     const struct_obj = zcu.typeToStruct(ty).?;
     const owner: InternPool.AnalUnit = .wrap(.{ .type = ty.toIntern() });
 
-    if (zcu.failed_analysis.contains(owner) or zcu.transitive_failed_analysis.contains(owner)) {
-        return error.AnalysisFail;
+    // Under parallel Sema, gate per-type so only one thread runs this body for
+    // a given type at a time. Cross-thread waits use the claimOrWait condvar
+    // (not retry-requeue), and the wip-flags inside `Sema.resolveStruct*`
+    // revert to their original role of detecting same-thread recursion.
+    var owns_claim = false;
+    claim: while (true) {
+        // Fast-path before locking: most calls hit an already-resolved stage.
+        if (switch (resolution) {
+            .fields => struct_obj.haveFieldTypes(ip),
+            .inits => struct_obj.haveFieldInits(ip),
+            .alignment => struct_obj.layout != .@"packed" and struct_obj.flagsUnordered(ip).alignment != .none,
+            .layout => struct_obj.haveLayout(ip),
+            .full => switch (struct_obj.layout) {
+                .@"packed" => struct_obj.haveLayout(ip),
+                .auto, .@"extern" => struct_obj.flagsUnordered(ip).fully_resolved,
+            },
+        }) return;
+        switch (try zcu.claimOrWait(owner)) {
+            .claimed => {
+                owns_claim = true;
+                break :claim;
+            },
+            .recursed => break :claim,
+            .done => {
+                if (zcu.anyAnalysisFailed(owner)) return error.AnalysisFail;
+                continue :claim;
+            },
+        }
     }
+    defer if (owns_claim) zcu.releaseClaim(owner);
 
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+    if (zcu.anyAnalysisFailed(owner)) return error.AnalysisFail;
     if (zcu.comp.debugIncremental()) {
         const info = try zcu.incremental_debug_state.getUnitInfo(gpa, owner);
         info.last_update_gen = zcu.generation;
@@ -3829,6 +3958,9 @@ fn resolveStructInner(
         .full => sema.resolveStructFully(ty),
     }) catch |err| switch (err) {
         error.AnalysisFail => {
+            if (Zcu.tls_retry_loop != null) return error.AnalysisFail;
+            zcu.failed_analysis_mutex.lock();
+            defer zcu.failed_analysis_mutex.unlock();
             if (!zcu.failed_analysis.contains(owner)) {
                 try zcu.transitive_failed_analysis.put(gpa, owner, {});
             }
@@ -3847,13 +3979,38 @@ fn resolveUnionInner(
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
+    zcu.awaitNamespaceTypeFinished(ty.toIntern());
+
+    const ip = &zcu.intern_pool;
     const union_obj = zcu.typeToUnion(ty).?;
     const owner: InternPool.AnalUnit = .wrap(.{ .type = ty.toIntern() });
 
-    if (zcu.failed_analysis.contains(owner) or zcu.transitive_failed_analysis.contains(owner)) {
-        return error.AnalysisFail;
+    var owns_claim = false;
+    claim: while (true) {
+        const flags = union_obj.flagsUnordered(ip);
+        if (switch (resolution) {
+            .fields => flags.status.haveFieldTypes(),
+            .alignment => flags.alignment != .none,
+            .layout => flags.status.haveLayout(),
+            .full => flags.status == .fully_resolved,
+        }) return;
+        switch (try zcu.claimOrWait(owner)) {
+            .claimed => {
+                owns_claim = true;
+                break :claim;
+            },
+            .recursed => break :claim,
+            .done => {
+                if (zcu.anyAnalysisFailed(owner)) return error.AnalysisFail;
+                continue :claim;
+            },
+        }
     }
+    defer if (owns_claim) zcu.releaseClaim(owner);
 
+    zcu.semaLock();
+    defer zcu.semaUnlock();
+    if (zcu.anyAnalysisFailed(owner)) return error.AnalysisFail;
     if (zcu.comp.debugIncremental()) {
         const info = try zcu.incremental_debug_state.getUnitInfo(gpa, owner);
         info.last_update_gen = zcu.generation;
@@ -3887,6 +4044,9 @@ fn resolveUnionInner(
         .full => sema.resolveUnionFully(ty),
     }) catch |err| switch (err) {
         error.AnalysisFail => {
+            if (Zcu.tls_retry_loop != null) return error.AnalysisFail;
+            zcu.failed_analysis_mutex.lock();
+            defer zcu.failed_analysis_mutex.unlock();
             if (!zcu.failed_analysis.contains(owner)) {
                 try zcu.transitive_failed_analysis.put(gpa, owner, {});
             }

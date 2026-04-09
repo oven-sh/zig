@@ -2154,6 +2154,7 @@ pub fn unwrapShuffleTwo(air: *const Air, zcu: *const Zcu, inst_index: Inst.Index
 }
 
 pub const typesFullyResolved = types_resolved.typesFullyResolved;
+pub const resolveTypesFully = types_resolved.resolveTypesFully;
 pub const typeFullyResolved = types_resolved.checkType;
 pub const valFullyResolved = types_resolved.checkVal;
 pub const legalize = Legalize.legalize;
