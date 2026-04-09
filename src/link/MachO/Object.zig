@@ -1736,10 +1736,15 @@ pub fn calcSymtabSize(self: *Object, macho_file: *MachO) void {
             !is_obj)
             continue;
         sym.flags.output_symtab = true;
-        if (sym.isLocal()) {
+        // In `-r` mode, hidden defined symbols (e.g. cross-shard `external
+        // hidden` LLVM globals) keep `r_extern=1` relocations targeting them.
+        // Apple `ld_new` requires such targets to have N_EXT (i.e. live in the
+        // extdef partition), so emit them as private-extern instead of local.
+        const local_as_pext = is_obj and sym.isLocal() and sym.visibility == .hidden;
+        if (sym.isLocal() and !local_as_pext) {
             sym.addExtra(.{ .symtab = self.output_symtab_ctx.nlocals }, macho_file);
             self.output_symtab_ctx.nlocals += 1;
-        } else if (sym.flags.@"export") {
+        } else if (sym.flags.@"export" or local_as_pext) {
             sym.addExtra(.{ .symtab = self.output_symtab_ctx.nexports }, macho_file);
             self.output_symtab_ctx.nexports += 1;
         } else {

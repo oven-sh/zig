@@ -187,10 +187,11 @@ pub fn getOutputSymtabIndex(symbol: Symbol, macho_file: *MachO) ?u32 {
     const symtab_ctx = switch (file) {
         inline else => |x| x.output_symtab_ctx,
     };
+    const local_as_pext = macho_file.base.isObject() and symbol.isLocal() and symbol.visibility == .hidden;
     var idx = symbol.getExtra(macho_file).symtab;
-    if (symbol.isLocal()) {
+    if (symbol.isLocal() and !local_as_pext) {
         idx += symtab_ctx.ilocal;
-    } else if (symbol.flags.@"export") {
+    } else if (symbol.flags.@"export" or local_as_pext) {
         idx += symtab_ctx.iexport;
     } else {
         assert(symbol.flags.import);
@@ -232,7 +233,11 @@ pub inline fn setExtra(symbol: Symbol, extra: Extra, macho_file: *MachO) void {
 }
 
 pub fn setOutputSym(symbol: Symbol, macho_file: *MachO, out: *macho.nlist_64) void {
-    if (symbol.isLocal()) {
+    // Mirrors `Object.calcSymtabSize`: in `-r` output, hidden locals are
+    // emitted as private-extern (N_PEXT|N_EXT) so `r_extern=1` relocations
+    // remain valid for Apple `ld_new`.
+    const local_as_pext = macho_file.base.isObject() and symbol.isLocal() and symbol.visibility == .hidden;
+    if (symbol.isLocal() and !local_as_pext) {
         out.n_type = if (symbol.flags.abs) macho.N_ABS else macho.N_SECT;
         out.n_sect = if (symbol.flags.abs) 0 else @intCast(symbol.getOutputSectionIndex(macho_file) + 1);
         out.n_desc = 0;
@@ -242,9 +247,10 @@ pub fn setOutputSym(symbol: Symbol, macho_file: *MachO, out: *macho.nlist_64) vo
             .hidden => out.n_type |= macho.N_PEXT,
             else => {},
         }
-    } else if (symbol.flags.@"export") {
-        assert(symbol.visibility == .global);
+    } else if (symbol.flags.@"export" or local_as_pext) {
+        assert(symbol.visibility == .global or local_as_pext);
         out.n_type = macho.N_EXT;
+        if (local_as_pext) out.n_type |= macho.N_PEXT;
         out.n_type |= if (symbol.flags.abs) macho.N_ABS else macho.N_SECT;
         out.n_sect = if (symbol.flags.abs) 0 else @intCast(symbol.getOutputSectionIndex(macho_file) + 1);
         out.n_value = symbol.getAddress(.{ .stubs = false }, macho_file);

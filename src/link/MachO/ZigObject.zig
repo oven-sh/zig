@@ -504,10 +504,11 @@ pub fn calcSymtabSize(self: *ZigObject, macho_file: *MachO) void {
         const name = sym.getName(macho_file);
         assert(name.len > 0);
         sym.flags.output_symtab = true;
-        if (sym.isLocal()) {
+        const local_as_pext = macho_file.base.isObject() and sym.isLocal() and sym.visibility == .hidden;
+        if (sym.isLocal() and !local_as_pext) {
             sym.addExtra(.{ .symtab = self.output_symtab_ctx.nlocals }, macho_file);
             self.output_symtab_ctx.nlocals += 1;
-        } else if (sym.flags.@"export") {
+        } else if (sym.flags.@"export" or local_as_pext) {
             sym.addExtra(.{ .symtab = self.output_symtab_ctx.nexports }, macho_file);
             self.output_symtab_ctx.nexports += 1;
         } else {
