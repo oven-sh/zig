@@ -42,6 +42,7 @@ next_unique_global_id: std.AutoHashMapUnmanaged(StrtabString, u32),
 aliases: std.ArrayListUnmanaged(Alias),
 variables: std.ArrayListUnmanaged(Variable),
 functions: std.ArrayListUnmanaged(Function),
+comdats: std.ArrayListUnmanaged(Comdat),
 
 strtab_string_map: std.AutoArrayHashMapUnmanaged(void, void),
 strtab_string_indices: std.ArrayListUnmanaged(u32),
@@ -2513,12 +2514,37 @@ pub const Alias = struct {
     };
 };
 
+pub const Comdat = struct {
+    name: StrtabString,
+    kind: SelectionKind,
+
+    /// Matches LLVM's bitc::ComdatSelectionKindCodes.
+    pub const SelectionKind = enum(u3) {
+        any = 1,
+        exactmatch = 2,
+        largest = 3,
+        nodeduplicate = 4,
+        samesize = 5,
+    };
+
+    pub const Index = enum(u32) {
+        /// Stored 1-based to match the bitcode encoding (0 = no comdat).
+        none = 0,
+        _,
+
+        pub fn ptrConst(self: Index, builder: *const Builder) *const Comdat {
+            return &builder.comdats.items[@intFromEnum(self) - 1];
+        }
+    };
+};
+
 pub const Variable = struct {
     global: Global.Index,
     thread_local: ThreadLocal = .default,
     mutability: Mutability = .global,
     init: Constant = .no_init,
     section: String = .none,
+    comdat: Comdat.Index = .none,
     alignment: Alignment = .default,
 
     pub const Index = enum(u32) {
@@ -2593,6 +2619,10 @@ pub const Variable = struct {
 
         pub fn setSection(self: Index, section: String, builder: *Builder) void {
             self.ptr(builder).section = section;
+        }
+
+        pub fn setComdat(self: Index, comdat: Comdat.Index, builder: *Builder) void {
+            self.ptr(builder).comdat = comdat;
         }
 
         pub fn setAlignment(self: Index, alignment: Alignment, builder: *Builder) void {
@@ -8603,6 +8633,7 @@ pub fn init(options: Options) Allocator.Error!Builder {
         .aliases = .{},
         .variables = .{},
         .functions = .{},
+        .comdats = .{},
 
         .strtab_string_map = .{},
         .strtab_string_indices = .{},
@@ -8752,6 +8783,7 @@ pub fn deinit(self: *Builder) void {
     self.variables.deinit(self.gpa);
     for (self.functions.items) |*function| function.deinit(self.gpa);
     self.functions.deinit(self.gpa);
+    self.comdats.deinit(self.gpa);
 
     self.strtab_string_map.deinit(self.gpa);
     self.strtab_string_indices.deinit(self.gpa);
@@ -9005,6 +9037,16 @@ pub fn addAliasAssumeCapacity(
         .kind = .{ .alias = alias_index },
     }), .aliasee = aliasee });
     return alias_index;
+}
+
+pub fn addComdat(
+    self: *Builder,
+    name: StrtabString,
+    kind: Comdat.SelectionKind,
+) Allocator.Error!Comdat.Index {
+    assert(!name.isAnon());
+    try self.comdats.append(self.gpa, .{ .name = name, .kind = kind });
+    return @enumFromInt(self.comdats.items.len);
 }
 
 pub fn addVariable(
@@ -9564,6 +9606,14 @@ pub fn print(self: *Builder, w: *Writer) (Writer.Error || Allocator.Error)!void 
         , .{ id.fmt(self), ty.fmt(self, .default) });
     }
 
+    if (self.comdats.items.len > 0) {
+        if (need_newline) try w.writeByte('\n') else need_newline = true;
+        for (self.comdats.items) |comdat| try w.print(
+            \\${f} = comdat {s}
+            \\
+        , .{ comdat.name.fmt(self, .quote_unless_valid_identifier), @tagName(comdat.kind) });
+    }
+
     if (self.variables.items.len > 0) {
         if (need_newline) try w.writeByte('\n') else need_newline = true;
         for (self.variables.items) |variable| {
@@ -9572,7 +9622,7 @@ pub fn print(self: *Builder, w: *Writer) (Writer.Error || Allocator.Error)!void 
             metadata_formatter.need_comma = true;
             defer metadata_formatter.need_comma = undefined;
             try w.print(
-                \\{f} ={f}{f}{f}{f}{f}{f}{f}{f} {s} {f}{f}{f}{f}
+                \\{f} ={f}{f}{f}{f}{f}{f}{f}{f} {s} {f}{f}{s}{f}{f}
                 \\
             , .{
                 variable.global.fmt(self),
@@ -9589,6 +9639,7 @@ pub fn print(self: *Builder, w: *Writer) (Writer.Error || Allocator.Error)!void 
                 @tagName(variable.mutability),
                 global.type.fmt(self, .percent),
                 variable.init.fmt(self, .{ .space = true }),
+                if (variable.comdat != .none) ", comdat" else "",
                 variable.alignment.fmt(", "),
                 try metadata_formatter.fmt("!dbg ", global.dbg, null),
             });
@@ -13663,6 +13714,18 @@ pub fn toBitcode(self: *Builder, allocator: Allocator, producer: Producer) bitco
             defer section_map.deinit(self.gpa);
             try section_map.ensureUnusedCapacity(self.gpa, globals.count());
 
+            // COMDAT records must precede any global that references them by index.
+            for (self.comdats.items) |comdat| {
+                const name_index = comdat.name.toIndex().?;
+                const offset = self.strtab_string_indices.items[name_index];
+                const size = self.strtab_string_indices.items[name_index + 1] - offset;
+                try module_block.writeAbbrev(Module.Comdat{
+                    .strtab_offset = offset,
+                    .strtab_size = size,
+                    .selection_kind = comdat.kind,
+                });
+            }
+
             for (self.variables.items) |variable| {
                 if (variable.global.getReplacement(self) != .none) continue;
 
@@ -13706,6 +13769,7 @@ pub fn toBitcode(self: *Builder, allocator: Allocator, producer: Producer) bitco
                     .unnamed_addr = global.unnamed_addr,
                     .externally_initialized = global.externally_initialized,
                     .dllstorageclass = global.dll_storage_class,
+                    .comdat = @intFromEnum(variable.comdat),
                     .preemption = global.preemption,
                 });
             }
