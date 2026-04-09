@@ -396,8 +396,14 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
             if (comp.c_object_table.count() != 0)
                 break :blk comp.c_object_table.keys()[0].status.success.object_path;
 
-            if (zcu_obj_paths.len > 0)
+            if (zcu_obj_paths.len == 1)
                 break :blk zcu_obj_paths[0];
+
+            if (zcu_obj_paths.len > 1)
+                return comp.link_diags.fail(
+                    "sharded codegen with build-obj is not supported for COFF; pass --llvm-no-merge-shards or --llvm-codegen-threads=1",
+                    .{},
+                );
 
             // TODO I think this is unreachable. Audit this situation when solving the above TODO
             // regarding eliding redundant object -> object transformations.
@@ -1401,8 +1407,14 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
             if (comp.c_object_table.count() != 0)
                 break :blk comp.c_object_table.keys()[0].status.success.object_path;
 
-            if (zcu_obj_paths.len > 0)
+            if (zcu_obj_paths.len == 1)
                 break :blk zcu_obj_paths[0];
+
+            if (zcu_obj_paths.len > 1)
+                return comp.link_diags.fail(
+                    "sharded codegen with build-obj is not supported for WebAssembly; pass --llvm-no-merge-shards or --llvm-codegen-threads=1",
+                    .{},
+                );
 
             // TODO I think this is unreachable. Audit this situation when solving the above TODO
             // regarding eliding redundant object -> object transformations.

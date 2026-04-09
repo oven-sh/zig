@@ -2999,9 +2999,15 @@ fn zirStructDecl(
             .captures = captures,
         } },
     };
-    const wip_ty = switch (try ip.getStructType(gpa, pt.tid, struct_init, false)) {
+    const wip_ty = gop: while (true) switch (try ip.getStructType(gpa, pt.tid, struct_init, false)) {
         .existing => |ty| {
-            zcu.awaitNamespaceTypeFinished(ty);
+            switch (zcu.awaitNamespaceTypeFinished(ty)) {
+                // The wip owner cancelled; `ty`'s map slot is now `.removed`.
+                // Re-run getStructType so we either dedup to a newer entry or
+                // claim a fresh wip ourselves.
+                .cancelled => continue :gop,
+                .finished => {},
+            }
             const new_ty = try pt.ensureTypeUpToDate(ty);
 
             // Make sure we update the namespace if the declaration is re-analyzed, to pick
@@ -3012,7 +3018,7 @@ fn zirStructDecl(
             try sema.addTypeReferenceEntry(src, new_ty);
             return Air.internedToRef(new_ty);
         },
-        .wip => |wip| wip,
+        .wip => |wip| break :gop wip,
     };
     var published = false;
     errdefer if (!published) wip_ty.cancel(ip, pt.tid);
@@ -3244,9 +3250,12 @@ fn zirEnumDecl(
             .captures = captures,
         } },
     };
-    const wip_ty = switch (try ip.getEnumType(gpa, pt.tid, enum_init, false)) {
+    const wip_ty = gop: while (true) switch (try ip.getEnumType(gpa, pt.tid, enum_init, false)) {
         .existing => |ty| {
-            zcu.awaitNamespaceTypeFinished(ty);
+            switch (zcu.awaitNamespaceTypeFinished(ty)) {
+                .cancelled => continue :gop,
+                .finished => {},
+            }
             const new_ty = try pt.ensureTypeUpToDate(ty);
 
             // Make sure we update the namespace if the declaration is re-analyzed, to pick
@@ -3266,7 +3275,7 @@ fn zirEnumDecl(
 
             return Air.internedToRef(new_ty);
         },
-        .wip => |wip| wip,
+        .wip => |wip| break :gop wip,
     };
 
     // Once this is `true`, we will not delete the decl or type even upon failure, since we
@@ -3410,9 +3419,12 @@ fn zirUnionDecl(
             .captures = captures,
         } },
     };
-    const wip_ty = switch (try ip.getUnionType(gpa, pt.tid, union_init, false)) {
+    const wip_ty = gop: while (true) switch (try ip.getUnionType(gpa, pt.tid, union_init, false)) {
         .existing => |ty| {
-            zcu.awaitNamespaceTypeFinished(ty);
+            switch (zcu.awaitNamespaceTypeFinished(ty)) {
+                .cancelled => continue :gop,
+                .finished => {},
+            }
             const new_ty = try pt.ensureTypeUpToDate(ty);
 
             // Make sure we update the namespace if the declaration is re-analyzed, to pick
@@ -3423,7 +3435,7 @@ fn zirUnionDecl(
             try sema.addTypeReferenceEntry(src, new_ty);
             return Air.internedToRef(new_ty);
         },
-        .wip => |wip| wip,
+        .wip => |wip| break :gop wip,
     };
     var published = false;
     errdefer if (!published) wip_ty.cancel(ip, pt.tid);
@@ -3510,9 +3522,12 @@ fn zirOpaqueDecl(
             .captures = captures,
         } },
     };
-    const wip_ty = switch (try ip.getOpaqueType(gpa, pt.tid, opaque_init)) {
+    const wip_ty = gop: while (true) switch (try ip.getOpaqueType(gpa, pt.tid, opaque_init)) {
         .existing => |ty| {
-            zcu.awaitNamespaceTypeFinished(ty);
+            switch (zcu.awaitNamespaceTypeFinished(ty)) {
+                .cancelled => continue :gop,
+                .finished => {},
+            }
             // Make sure we update the namespace if the declaration is re-analyzed, to pick
             // up on e.g. changed comptime decls.
             try pt.ensureNamespaceUpToDate(Type.fromInterned(ty).getNamespaceIndex(zcu));
@@ -3521,7 +3536,7 @@ fn zirOpaqueDecl(
             try sema.addTypeReferenceEntry(src, ty);
             return Air.internedToRef(ty);
         },
-        .wip => |wip| wip,
+        .wip => |wip| break :gop wip,
     };
     var published = false;
     errdefer if (!published) wip_ty.cancel(ip, pt.tid);
@@ -19845,7 +19860,7 @@ fn structInitAnon(
         break :hash hasher.final();
     };
     const tracked_inst = try block.trackZir(inst);
-    const struct_ty = switch (try ip.getStructType(gpa, pt.tid, .{
+    const struct_ty = gop: while (true) switch (try ip.getStructType(gpa, pt.tid, .{
         .layout = .auto,
         .fields_len = extra_data.fields_len,
         .known_non_opv = false,
@@ -19859,7 +19874,7 @@ fn structInitAnon(
             .type_hash = type_hash,
         } },
     }, false)) {
-        .wip => |wip| ty: {
+        .wip => |wip| {
             errdefer wip.cancel(ip, pt.tid);
             const type_name = try sema.createTypeName(block, .anon, "struct", inst, wip.index);
             wip.setName(ip, type_name.name, type_name.nav);
@@ -19891,14 +19906,17 @@ fn structInitAnon(
                 try zcu.comp.queueJob(.{ .link_type = wip.index });
             }
             if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip.index);
-            break :ty wip.index;
+            break :gop wip.index;
         },
-        .existing => |ty| ty,
+        // Under parallel Sema, `.existing` may dedup to a type whose `.wip` owner
+        // has not yet run `setFieldTypesAll`/`finish`; spin so `aggregateValue`'s
+        // canonicalization sees populated field_types. If the owner cancelled,
+        // retry getStructType — the tombstoned slot is skipped.
+        .existing => |ty| switch (zcu.awaitNamespaceTypeFinished(ty)) {
+            .cancelled => continue :gop,
+            .finished => break :gop ty,
+        },
     };
-    // Under parallel Sema, `.existing` may dedup to a type whose `.wip` owner
-    // has not yet run `setFieldTypesAll`/`finish`; spin so `aggregateValue`'s
-    // canonicalization sees populated field_types.
-    zcu.awaitNamespaceTypeFinished(struct_ty);
     try sema.declareDependency(.{ .interned = struct_ty });
     try sema.addTypeReferenceEntry(src, struct_ty);
 
@@ -20886,16 +20904,20 @@ fn zirReify(
                 return sema.fail(block, src, "reified opaque must have no decls", .{});
             }
 
-            const wip_ty = switch (try ip.getOpaqueType(gpa, pt.tid, .{
+            const wip_ty = gop: while (true) switch (try ip.getOpaqueType(gpa, pt.tid, .{
                 .key = .{ .reified = .{
-                    .zir_index = try block.trackZir(inst),
+                    .zir_index = tracked_inst,
                 } },
             })) {
                 .existing => |ty| {
+                    switch (zcu.awaitNamespaceTypeFinished(ty)) {
+                        .cancelled => continue :gop,
+                        .finished => {},
+                    }
                     try sema.addTypeReferenceEntry(src, ty);
                     return Air.internedToRef(ty);
                 },
-                .wip => |wip| wip,
+                .wip => |wip| break :gop wip,
             };
             var published = false;
             errdefer if (!published) wip_ty.cancel(ip, pt.tid);
@@ -21094,18 +21116,23 @@ fn reifyEnum(
     }
 
     const tracked_inst = try block.trackZir(inst);
+    const type_hash = hasher.final();
 
-    const wip_ty = switch (try ip.getEnumType(gpa, pt.tid, .{
+    const wip_ty = gop: while (true) switch (try ip.getEnumType(gpa, pt.tid, .{
         .has_values = true,
         .tag_mode = if (is_exhaustive) .explicit else .nonexhaustive,
         .fields_len = fields_len,
         .key = .{ .reified = .{
             .zir_index = tracked_inst,
-            .type_hash = hasher.final(),
+            .type_hash = type_hash,
         } },
     }, false)) {
-        .wip => |wip| wip,
+        .wip => |wip| break :gop wip,
         .existing => |ty| {
+            switch (zcu.awaitNamespaceTypeFinished(ty)) {
+                .cancelled => continue :gop,
+                .finished => {},
+            }
             try sema.declareDependency(.{ .interned = ty });
             try sema.addTypeReferenceEntry(src, ty);
             return Air.internedToRef(ty);
@@ -21243,8 +21270,9 @@ fn reifyUnion(
     }
 
     const tracked_inst = try block.trackZir(inst);
+    const type_hash = hasher.final();
 
-    const wip_ty = switch (try ip.getUnionType(gpa, pt.tid, .{
+    const wip_ty = gop: while (true) switch (try ip.getUnionType(gpa, pt.tid, .{
         .flags = .{
             .layout = layout,
             .status = .none,
@@ -21268,11 +21296,15 @@ fn reifyUnion(
         .field_aligns = &.{}, // set later
         .key = .{ .reified = .{
             .zir_index = tracked_inst,
-            .type_hash = hasher.final(),
+            .type_hash = type_hash,
         } },
     }, false)) {
-        .wip => |wip| wip,
+        .wip => |wip| break :gop wip,
         .existing => |ty| {
+            switch (zcu.awaitNamespaceTypeFinished(ty)) {
+                .cancelled => continue :gop,
+                .finished => {},
+            }
             try sema.declareDependency(.{ .interned = ty });
             try sema.addTypeReferenceEntry(src, ty);
             return Air.internedToRef(ty);
@@ -21608,8 +21640,9 @@ fn reifyStruct(
     }
 
     const tracked_inst = try block.trackZir(inst);
+    const type_hash = hasher.final();
 
-    const wip_ty = switch (try ip.getStructType(gpa, pt.tid, .{
+    const wip_ty = gop: while (true) switch (try ip.getStructType(gpa, pt.tid, .{
         .layout = layout,
         .fields_len = fields_len,
         .known_non_opv = false,
@@ -21620,11 +21653,15 @@ fn reifyStruct(
         .inits_resolved = true,
         .key = .{ .reified = .{
             .zir_index = tracked_inst,
-            .type_hash = hasher.final(),
+            .type_hash = type_hash,
         } },
     }, false)) {
-        .wip => |wip| wip,
+        .wip => |wip| break :gop wip,
         .existing => |ty| {
+            switch (zcu.awaitNamespaceTypeFinished(ty)) {
+                .cancelled => continue :gop,
+                .finished => {},
+            }
             try sema.declareDependency(.{ .interned = ty });
             try sema.addTypeReferenceEntry(src, ty);
             return Air.internedToRef(ty);
@@ -29185,9 +29222,12 @@ fn coerceExtra(
         try in_memory_result.report(sema, inst_src, msg);
 
         // Add notes about function return type
-        if (opts.is_ret and
-            !zcu.test_functions.contains(zcu.funcInfo(sema.func_index).owner_nav))
-        {
+        const is_test_fn = if (opts.is_ret) blk: {
+            zcu.test_functions_mutex.lock();
+            defer zcu.test_functions_mutex.unlock();
+            break :blk zcu.test_functions.contains(zcu.funcInfo(sema.func_index).owner_nav);
+        } else false;
+        if (opts.is_ret and !is_test_fn) {
             const ret_ty_src: LazySrcLoc = .{
                 .base_node_inst = ip.getNav(zcu.funcInfo(sema.func_index).owner_nav).srcInst(ip),
                 .offset = .{ .node_offset_fn_type_ret_ty = .zero },
@@ -35592,13 +35632,6 @@ fn structFields(
 
     struct_type.setFieldTypesAlignsAll(ip, tmp_types, if (any_aligned) tmp_aligns else null);
 
-    // Re-store the last field type with release so the unlocked
-    // `haveFieldTypes` fast-path acquire sees all preceding name/type
-    // slot writes from this loop.
-    if (struct_type.field_types.len > 0) {
-        const types = struct_type.field_types.get(ip);
-        @atomicStore(InternPool.Index, &types[types.len - 1], types[types.len - 1], .release);
-    }
     struct_type.clearFieldTypesWip(ip);
     if (!any_inits) struct_type.setHaveFieldInits(ip);
 

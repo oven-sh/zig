@@ -3895,8 +3895,15 @@ pub const LoadedStructType = struct {
         const extra_mutex = &ip.getLocal(s.tid).mutate.extra.mutex;
         extra_mutex.lock();
         defer extra_mutex.unlock();
-        @memcpy(s.field_types.get(ip), types);
+        if (types.len == 0) return;
+        const field_types_ptr = s.field_types.get(ip);
+        @memcpy(field_types_ptr[0 .. types.len - 1], types[0 .. types.len - 1]);
         if (aligns) |a| if (s.field_aligns.len != 0) @memcpy(s.field_aligns.get(ip), a);
+        // Release-store the last slot so the unlocked `haveFieldTypes`
+        // acquire fast-path synchronises-with this and sees all preceding
+        // type/align slot writes; readers must never observe a non-.none
+        // last slot via plain memcpy with no happens-before.
+        @atomicStore(InternPool.Index, &field_types_ptr[types.len - 1], types[types.len - 1], .release);
     }
 
     pub fn fieldAlign(s: LoadedStructType, ip: *const InternPool, i: usize) Alignment {
@@ -7871,9 +7878,15 @@ pub const wip_namespace_sentinel: u32 = std.math.maxInt(u32);
 /// `NamespaceIndex` (0 is a valid index).
 pub const cancelled_namespace_sentinel: u32 = std.math.maxInt(u32) - 1;
 
-/// Spin until `ty`'s namespace slot is no longer the wip sentinel.
-pub fn awaitNamespaceTypeFinished(ip: *const InternPool, ty: Index) void {
-    const ns_idx = ip.namespaceTypeNamespaceExtraIndex(ty) orelse return;
+pub const NamespaceTypeAwaitResult = enum { finished, cancelled };
+
+/// Spin until `ty`'s namespace slot is no longer the wip sentinel. Returns
+/// `.cancelled` if the wip owner invoked `cancel` (slot now holds
+/// `cancelled_namespace_sentinel`); the caller must not use `ty` and should
+/// retry the originating `get*Type` call, which will skip the now-`.removed`
+/// map entry and allocate fresh.
+pub fn awaitNamespaceTypeFinished(ip: *const InternPool, ty: Index) NamespaceTypeAwaitResult {
+    const ns_idx = ip.namespaceTypeNamespaceExtraIndex(ty) orelse return .finished;
     const unwrapped = ty.unwrap(ip);
     while (true) {
         // Re-acquire the shared view each iteration: the owning tid may
@@ -7881,8 +7894,12 @@ pub fn awaitNamespaceTypeFinished(ip: *const InternPool, ty: Index) void {
         // would leave a cached slot pointer dangling at the old buffer.
         const extra = ip.getLocalShared(unwrapped.tid).extra.acquire();
         const slot: *const u32 = &extra.view().items(.@"0")[ns_idx];
-        if (@atomicLoad(u32, slot, .acquire) != wip_namespace_sentinel) return;
-        std.atomic.spinLoopHint();
+        const loaded = @atomicLoad(u32, slot, .acquire);
+        if (loaded == wip_namespace_sentinel) {
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        return if (loaded == cancelled_namespace_sentinel) .cancelled else .finished;
     }
 }
 
@@ -7967,6 +7984,7 @@ fn getOrPutKeyInner(
         const index = entry.value;
         if (index == .none) break;
         if (entry.hash != hash) continue;
+        if (index.unwrap(ip).getTag(ip) == .removed) continue;
         if (ip.indexToKey(index).eql(key, ip)) {
             if (!prelocked) shard.mutate.map.mutex.unlock();
             return .{ .existing = index };
@@ -11829,8 +11847,14 @@ pub fn getNav(ip: *const InternPool, index: Nav.Index) Nav {
     // with a new payload (or vice versa).
     while (true) {
         const b1 = @atomicLoad(Nav.Repr.Bits, bits_ptr, .acquire);
-        repr.type_or_val = @atomicLoad(InternPool.Index, tov_ptr, .unordered);
-        repr.@"linksection" = @atomicLoad(OptionalNullTerminatedString, ls_ptr, .unordered);
+        // Payload loads must be .acquire (not .unordered): on ARM64 a plain
+        // LDR po-before LDAR (b2) is not barrier-ordered-before it and may
+        // reorder past b2, yielding a torn read that still passes b1 == b2.
+        // LDAR-before-LDAR is ordered, so .acquire here closes the window
+        // (the `@fence(.acquire)` builtin is gone; this is the fence-free
+        // equivalent for the seqlock read side).
+        repr.type_or_val = @atomicLoad(InternPool.Index, tov_ptr, .acquire);
+        repr.@"linksection" = @atomicLoad(OptionalNullTerminatedString, ls_ptr, .acquire);
         const b2 = @atomicLoad(Nav.Repr.Bits, bits_ptr, .acquire);
         if (!b1.writing and @as(u16, @bitCast(b1)) == @as(u16, @bitCast(b2))) {
             repr.bits = b2;
