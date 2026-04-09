@@ -644,14 +644,24 @@ pub fn ensureMemoizedStateUpToDate(pt: Zcu.PerThread, stage: InternPool.Memoized
         if (@atomicLoad(InternPool.Index, zcu.builtin_decl_values.getPtrConst(to_check), .acquire) != .none) return;
     }
 
-    switch (try zcu.claimOrWait(unit)) {
-        .claimed => {},
+    claim: while (true) switch (try zcu.claimOrWait(unit)) {
+        .claimed => break :claim,
         .recursed => return error.AnalysisFail,
         .done => {
             if (zcu.anyAnalysisFailed(unit)) return error.AnalysisFail;
-            return;
+            // The previous holder may have released its claim via a retry-abort
+            // (yield-and-requeue) without actually populating the stage. Re-check
+            // the sentinel decl and loop back to claim if not.
+            const to_check: Zcu.BuiltinDecl = switch (stage) {
+                .main => .@"Type.Declaration",
+                .panic => .@"panic.noreturnReturned",
+                .va_list => .VaList,
+                .assembly => .@"assembly.Clobbers",
+            };
+            if (zcu.builtin_decl_values.get(to_check) != .none) return;
+            continue :claim;
         },
-    }
+    };
     defer zcu.releaseClaim(unit);
 
     const need_sema_lock = !zcu.parallel_sema or zcu.comp.incremental;

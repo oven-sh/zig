@@ -2155,8 +2155,14 @@ pub fn unwrapShuffleTwo(air: *const Air, zcu: *const Zcu, inst_index: Inst.Index
 
 pub const typesFullyResolved = types_resolved.typesFullyResolved;
 pub const resolveTypesFully = types_resolved.resolveTypesFully;
-pub const typeFullyResolved = types_resolved.checkType;
-pub const valFullyResolved = types_resolved.checkVal;
+/// `checkType`/`checkVal` only allocate when `tls_resolve_pt` is set (i.e. via
+/// `resolveTypesFully`); these wrappers are for the non-resolving query path.
+pub fn typeFullyResolved(ty: Type, zcu: *Zcu) bool {
+    return types_resolved.checkType(ty, zcu) catch unreachable;
+}
+pub fn valFullyResolved(val: Value, zcu: *Zcu) bool {
+    return types_resolved.checkVal(val, zcu) catch unreachable;
+}
 pub const legalize = Legalize.legalize;
 pub const write = print.write;
 pub const writeInst = print.writeInst;

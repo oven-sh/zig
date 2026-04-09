@@ -3302,12 +3302,13 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
 
 fn dumpLlvmShardStats(comp: *Compilation, zcu: *Zcu) void {
     const ip = &zcu.intern_pool;
-    const n: u32 = if (comp.llvm_codegen_threads > 1) comp.llvm_codegen_threads else 16;
+    const n: u32 = @min(if (comp.llvm_codegen_threads > 1) comp.llvm_codegen_threads else 16, 256);
     var counts = [_]u32{0} ** 256;
     var top_file = [_]?*Zcu.File{null} ** 256;
     var top_file_count = [_]u32{0} ** 256;
 
-    var per_file = std.AutoHashMap(*Zcu.File, u32).init(comp.gpa);
+    const PerFileKey = struct { file: *Zcu.File, shard: u8 };
+    var per_file = std.AutoHashMap(PerFileKey, u32).init(comp.gpa);
     defer per_file.deinit();
 
     const total_navs = ip.navCount();
@@ -3324,7 +3325,7 @@ fn dumpLlvmShardStats(comp: *Compilation, zcu: *Zcu) void {
         const shard: u8 = @intCast(std.hash.Wyhash.hash(0, fqn) % n);
         counts[shard] += 1;
         const file = zcu.fileByIndex(nav.srcInst(ip).resolveFile(ip));
-        const gop = per_file.getOrPut(file) catch continue;
+        const gop = per_file.getOrPut(.{ .file = file, .shard = shard }) catch continue;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* += 1;
         if (gop.value_ptr.* > top_file_count[shard]) {
@@ -3469,7 +3470,7 @@ fn flush(
                     base_path_slice;
 
                 for (0..num_threads) |i| {
-                    list[i] = (try std.fmt.allocPrintSentinel(arena, "{s}.{d}.o", .{base_name, i}, 0)).ptr;
+                    list[i] = (try std.fmt.allocPrintSentinel(arena, "{s}.{d}.o", .{ base_name, i }, 0)).ptr;
                 }
                 break :blk list;
             } else null;
@@ -5305,12 +5306,18 @@ fn processOneJob(tid: usize, comp: *Compilation, job: Job) JobError!void {
             // body would leave a dangling cross-shard `__N<nav>` undef.
             // Force-resolve via `resolveTypesFully`, which blocks on the
             // claimOrWait-gated resolution; drop only if that errors.
+            Zcu.tls_retry_loop = null;
             const types_ok: bool = if (zcu.parallel_sema) ok: {
                 const pt: Zcu.PerThread = .activate(zcu, @enumFromInt(tid));
                 defer pt.deactivate();
-                break :ok air.resolveTypesFully(pt);
+                break :ok try air.resolveTypesFully(pt);
             } else air.typesFullyResolved(zcu);
             if (!types_ok) {
+                if (Zcu.tls_retry_loop != null) {
+                    Zcu.tls_retry_loop = null;
+                    try comp.queueJob(.{ .codegen_func = func });
+                    return;
+                }
                 // Type resolution failed in a way which affects this function. This is a transitive
                 // failure, but it doesn't need recording, because this function semantically depends
                 // on the failed type, so when it is changed the function is updated.
@@ -5441,7 +5448,10 @@ fn processOneJob(tid: usize, comp: *Compilation, job: Job) JobError!void {
 
                 // Check if this is a test function.
                 const ip = &pt.zcu.intern_pool;
-                if (!pt.zcu.test_functions.contains(nav)) {
+                pt.zcu.test_functions_mutex.lock();
+                const is_test = pt.zcu.test_functions.contains(nav);
+                pt.zcu.test_functions_mutex.unlock();
+                if (!is_test) {
                     break :queue_test_analysis;
                 }
 
