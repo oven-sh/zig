@@ -882,6 +882,7 @@ fn buildOutputType(
     var llvm_opt_bisect_limit: c_int = -1;
     var llvm_codegen_threads: u32 = 0;
     var llvm_shard_stats: bool = false;
+    var llvm_no_merge_shards: bool = false;
     var no_link_obj: bool = false;
     var linker_z_nocopyreloc = false;
     var linker_z_nodelete = false;
@@ -1636,6 +1637,8 @@ fn buildOutputType(
                             fatal("unable to parse '{s}': {s}", .{ arg, @errorName(err) });
                     } else if (mem.eql(u8, arg, "--llvm-shard-stats")) {
                         llvm_shard_stats = true;
+                    } else if (mem.eql(u8, arg, "--llvm-no-merge-shards")) {
+                        llvm_no_merge_shards = true;
                     } else if (mem.eql(u8, arg, "--no-link")) {
                         no_link_obj = true;
                     } else if (mem.eql(u8, arg, "--eh-frame-hdr")) {
@@ -3498,6 +3501,7 @@ fn buildOutputType(
         .llvm_opt_bisect_limit = llvm_opt_bisect_limit,
         .llvm_codegen_threads = llvm_codegen_threads,
         .llvm_shard_stats = llvm_shard_stats,
+        .llvm_no_merge_shards = llvm_no_merge_shards,
         .no_link_obj = no_link_obj,
         .linker_global_base = linker_global_base,
         .linker_export_symbol_names = linker_export_symbol_names.items,

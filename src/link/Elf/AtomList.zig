@@ -137,20 +137,68 @@ pub fn writeRelocatable(list: AtomList, buffer: *std.array_list.Managed(u8), elf
     try buffer.ensureUnusedCapacity(list_size);
     buffer.appendNTimesAssumeCapacity(0, list_size);
 
-    for (list.atoms.keys()) |ref| {
-        const atom_ptr = elf_file.atom(ref).?;
-        assert(atom_ptr.alive);
+    // Atoms arrive grouped by file then by input section index (see
+    // Object.initOutputSections). With per-function/COMDAT sections this loop
+    // would otherwise issue one pread + alloc per atom. Instead, coalesce
+    // contiguous input sections from the same object into a single pread and
+    // memcpy each atom's slice out of that span.
+    var in_data: std.ArrayListUnmanaged(u8) = .empty;
+    defer in_data.deinit(gpa);
 
-        const off = math.cast(usize, atom_ptr.value - list.value) orelse return error.Overflow;
-        const size = math.cast(usize, atom_ptr.size) orelse return error.Overflow;
+    const refs = list.atoms.keys();
+    var i: usize = 0;
+    while (i < refs.len) {
+        const head = elf_file.atom(refs[i]).?;
+        assert(head.alive);
+        const object = head.file(elf_file).?.object;
+        const head_shdr = object.shdrs.items[head.input_section_index];
 
-        log.debug("  atom({f}) at 0x{x}", .{ ref, list.offset(elf_file) + off });
+        if (head_shdr.sh_flags & elf.SHF_COMPRESSED != 0) {
+            const off = math.cast(usize, head.value - list.value) orelse return error.Overflow;
+            const size = math.cast(usize, head.size) orelse return error.Overflow;
+            log.debug("  atom({f}) at 0x{x}", .{ refs[i], list.offset(elf_file) + off });
+            const code = try object.codeDecompressAlloc(elf_file, refs[i].index);
+            defer gpa.free(code);
+            @memcpy(buffer.items[off..][0..size], code);
+            i += 1;
+            continue;
+        }
 
-        const object = atom_ptr.file(elf_file).?.object;
-        const code = try object.codeDecompressAlloc(elf_file, ref.index);
-        defer gpa.free(code);
-        const out_code = buffer.items[off..][0..size];
-        @memcpy(out_code, code);
+        // Greedily extend a run of uncompressed sections from the same file
+        // that are contiguous on disk (allowing small alignment gaps so we
+        // never over-read by more than a page per boundary).
+        var run_start: u64 = head_shdr.sh_offset;
+        var run_end: u64 = head_shdr.sh_offset + head_shdr.sh_size;
+        var j = i + 1;
+        while (j < refs.len) : (j += 1) {
+            const next = elf_file.atom(refs[j]).?;
+            if (next.file_index != head.file_index) break;
+            const next_shdr = object.shdrs.items[next.input_section_index];
+            if (next_shdr.sh_flags & elf.SHF_COMPRESSED != 0) break;
+            const ns = next_shdr.sh_offset;
+            const ne = next_shdr.sh_offset + next_shdr.sh_size;
+            if (ns > run_end and ns - run_end > 4096) break;
+            if (ns < run_start) run_start = ns;
+            if (ne > run_end) run_end = ne;
+        }
+
+        const ar_off: u64 = if (object.archive) |ar| ar.offset else 0;
+        const span = math.cast(usize, run_end - run_start) orelse return error.Overflow;
+        try in_data.resize(gpa, span);
+        const handle = elf_file.fileHandle(object.file_handle);
+        const amt = try handle.preadAll(in_data.items, ar_off + run_start);
+        if (amt != span) return error.InputOutput;
+
+        while (i < j) : (i += 1) {
+            const atom_ptr = elf_file.atom(refs[i]).?;
+            assert(atom_ptr.alive);
+            const off = math.cast(usize, atom_ptr.value - list.value) orelse return error.Overflow;
+            const size = math.cast(usize, atom_ptr.size) orelse return error.Overflow;
+            log.debug("  atom({f}) at 0x{x}", .{ refs[i], list.offset(elf_file) + off });
+            const shdr = object.shdrs.items[atom_ptr.input_section_index];
+            const src_off = math.cast(usize, shdr.sh_offset - run_start) orelse return error.Overflow;
+            @memcpy(buffer.items[off..][0..size], in_data.items[src_off..][0..size]);
+        }
     }
 
     try elf_file.base.file.?.pwriteAll(buffer.items, list.offset(elf_file));
