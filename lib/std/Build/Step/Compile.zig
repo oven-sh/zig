@@ -162,6 +162,11 @@ dead_strip_dylibs: bool = false,
 /// When enabled, outputs multiple .o files: filename.0.o, filename.1.o, etc.
 llvm_codegen_threads: u32 = 0,
 
+/// Skip the relocatable -r merge of partitioned LLVM output. The shard
+/// objects are emitted directly to `{emit}.{i}.o` for the downstream linker
+/// to consume. Only meaningful when `llvm_codegen_threads > 1`.
+llvm_no_merge_shards: bool = false,
+
 /// Skip linker step for build-obj - outputs raw LLVM object file(s).
 /// Saves time by avoiding parse/resolve/write cycle.
 no_link_obj: bool = false,
@@ -1531,6 +1536,9 @@ fn getZigArgs(compile: *Compile, fuzz: bool) ![][]const u8 {
     }
     if (compile.llvm_codegen_threads > 0) {
         try zig_args.append(b.fmt("--llvm-codegen-threads={d}", .{compile.llvm_codegen_threads}));
+    }
+    if (compile.llvm_no_merge_shards) {
+        try zig_args.append("--llvm-no-merge-shards");
     }
     if (compile.no_link_obj) {
         try zig_args.append("--no-link");

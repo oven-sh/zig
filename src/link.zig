@@ -403,6 +403,30 @@ pub const File = struct {
     lock: ?Cache.Lock = null,
     child_pid: ?std.process.Child.Id = null,
 
+    /// Resolve the LLVM-generated ZCU object path(s), expanding to N partition
+    /// paths when parallel codegen produced multiple object files.
+    pub fn resolveZcuObjectPaths(base: *const File, arena: Allocator) Allocator.Error![]const Cache.Path {
+        const raw = base.zcu_object_basename orelse return &.{};
+        const single = try base.comp.resolveEmitPathFlush(arena, .temp, raw);
+        const n = base.zcu_object_partition_count;
+        if (n <= 1) {
+            const out = try arena.alloc(Cache.Path, 1);
+            out[0] = single;
+            return out;
+        }
+        const base_path = single.sub_path;
+        const base_name = if (std.mem.endsWith(u8, base_path, ".o"))
+            base_path[0 .. base_path.len - 2]
+        else
+            base_path;
+        const out = try arena.alloc(Cache.Path, n);
+        for (out, 0..) |*p, i| p.* = .{
+            .root_dir = single.root_dir,
+            .sub_path = try std.fmt.allocPrint(arena, "{s}.{d}.o", .{ base_name, i }),
+        };
+        return out;
+    }
+
     pub const OpenOptions = struct {
         symbol_count_hint: u64 = 32,
         program_code_size_hint: u64 = 256 * 1024,

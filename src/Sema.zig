@@ -117,11 +117,14 @@ comptime_allocs: std.ArrayListUnmanaged(ComptimeAlloc) = .empty,
 /// these are flushed to `Zcu.single_exports` or `Zcu.multi_exports`.
 exports: std.ArrayListUnmanaged(Zcu.Export) = .empty,
 
-/// All references registered so far by this `Sema`. This is a temporary duplicate
-/// of data stored in `Zcu.all_references`. It exists to avoid adding references to
-/// a given `AnalUnit` multiple times.
-references: std.AutoArrayHashMapUnmanaged(AnalUnit, void) = .empty,
-type_references: std.AutoArrayHashMapUnmanaged(InternPool.Index, void) = .empty,
+/// All references registered so far by this `Sema`. Buffered locally and
+/// flushed to `Zcu.all_references` in `flushExports` so reference recording
+/// is lock-free during the body.
+references: std.AutoArrayHashMapUnmanaged(AnalUnit, struct {
+    src: LazySrcLoc,
+    inline_frame: Zcu.InlineReferenceFrame.Index.Optional,
+}) = .empty,
+type_references: std.AutoArrayHashMapUnmanaged(InternPool.Index, LazySrcLoc) = .empty,
 
 /// All dependencies registered so far by this `Sema`. This is a temporary duplicate
 /// of the main dependency data. It exists to avoid adding dependencies to a given
@@ -2649,14 +2652,12 @@ pub fn failWithOwnedErrorMsg(sema: *Sema, block: ?*Block, err_msg: *Zcu.ErrorMsg
 
     err_msg.reference_trace_root = sema.owner.toOptional();
 
-    const gop = try zcu.failed_analysis.getOrPut(gpa, sema.owner);
-    if (gop.found_existing) {
+    if (try zcu.failedAnalysisGetOrPut(sema.owner, err_msg)) {
         // If there are multiple errors for the same Decl, prefer the first one added.
         sema.err = null;
         err_msg.destroy(gpa);
     } else {
         sema.err = err_msg;
-        gop.value_ptr.* = err_msg;
     }
 
     return error.AnalysisFail;
@@ -2881,7 +2882,7 @@ fn getCaptures(sema: *Sema, block: *Block, type_src: LazySrcLoc, extra_index: us
         const zir_name_slice = sema.code.nullTerminatedString(zir_name);
         capture.* = switch (zir_capture.unwrap()) {
             .nested => |parent_idx| parent_captures.get(ip)[parent_idx],
-            .instruction_load => |ptr_inst| InternPool.CaptureValue.wrap(capture: {
+            .instruction_load => |ptr_inst| InternPool.CaptureValue.wrap(ip, capture: {
                 const ptr_ref = try sema.resolveInst(ptr_inst.toRef());
                 const ptr_val = try sema.resolveValue(ptr_ref) orelse {
                     break :capture .{ .runtime = sema.typeOf(ptr_ref).childType(zcu).toIntern() };
@@ -2897,7 +2898,7 @@ fn getCaptures(sema: *Sema, block: *Block, type_src: LazySrcLoc, extra_index: us
                 }
                 break :capture .{ .@"comptime" = loaded_val.toIntern() };
             }),
-            .instruction => |inst| InternPool.CaptureValue.wrap(capture: {
+            .instruction => |inst| InternPool.CaptureValue.wrap(ip, capture: {
                 const air_ref = try sema.resolveInst(inst.toRef());
                 if (try sema.resolveValueResolveLazy(air_ref)) |val| {
                     if (val.canMutateComptimeVarState(zcu)) {
@@ -2916,7 +2917,7 @@ fn getCaptures(sema: *Sema, block: *Block, type_src: LazySrcLoc, extra_index: us
                     .no_embedded_nulls,
                 );
                 const nav = try sema.lookupIdentifier(block, decl_name);
-                break :capture InternPool.CaptureValue.wrap(.{ .nav_val = nav });
+                break :capture InternPool.CaptureValue.wrap(ip, .{ .nav_val = nav });
             },
             .decl_ref => |str| capture: {
                 const decl_name = try ip.getOrPutString(
@@ -2926,7 +2927,7 @@ fn getCaptures(sema: *Sema, block: *Block, type_src: LazySrcLoc, extra_index: us
                     .no_embedded_nulls,
                 );
                 const nav = try sema.lookupIdentifier(block, decl_name);
-                break :capture InternPool.CaptureValue.wrap(.{ .nav_ref = nav });
+                break :capture InternPool.CaptureValue.wrap(ip, .{ .nav_ref = nav });
             },
         };
     }
@@ -3000,6 +3001,7 @@ fn zirStructDecl(
     };
     const wip_ty = switch (try ip.getStructType(gpa, pt.tid, struct_init, false)) {
         .existing => |ty| {
+            zcu.awaitNamespaceTypeFinished(ty);
             const new_ty = try pt.ensureTypeUpToDate(ty);
 
             // Make sure we update the namespace if the declaration is re-analyzed, to pick
@@ -3012,7 +3014,8 @@ fn zirStructDecl(
         },
         .wip => |wip| wip,
     };
-    errdefer wip_ty.cancel(ip, pt.tid);
+    var published = false;
+    errdefer if (!published) wip_ty.cancel(ip, pt.tid);
 
     const type_name = try sema.createTypeName(
         block,
@@ -3027,9 +3030,11 @@ fn zirStructDecl(
         .parent = block.namespace.toOptional(),
         .owner_type = wip_ty.index,
         .file_scope = block.getFileScopeIndex(zcu),
-        .generation = zcu.generation,
+        .generation = zcu.generation -% 1,
     });
-    errdefer pt.destroyNamespace(new_namespace_index);
+    errdefer if (!published) pt.destroyNamespace(new_namespace_index);
+    _ = wip_ty.finish(ip, new_namespace_index);
+    published = true;
 
     if (pt.zcu.comp.incremental) {
         try pt.addDependency(.wrap(.{ .type = wip_ty.index }), .{ .src_hash = tracked_inst });
@@ -3049,7 +3054,7 @@ fn zirStructDecl(
     try sema.declareDependency(.{ .interned = wip_ty.index });
     try sema.addTypeReferenceEntry(src, wip_ty.index);
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    return Air.internedToRef(wip_ty.finish(ip, new_namespace_index));
+    return Air.internedToRef(wip_ty.index);
 }
 
 pub fn createTypeName(
@@ -3241,6 +3246,7 @@ fn zirEnumDecl(
     };
     const wip_ty = switch (try ip.getEnumType(gpa, pt.tid, enum_init, false)) {
         .existing => |ty| {
+            zcu.awaitNamespaceTypeFinished(ty);
             const new_ty = try pt.ensureTypeUpToDate(ty);
 
             // Make sure we update the namespace if the declaration is re-analyzed, to pick
@@ -3254,7 +3260,7 @@ fn zirEnumDecl(
             // `ensureTypeUpToDate` has resolved the new type if necessary.
             // We just need to check for resolution failures.
             const ty_unit: AnalUnit = .wrap(.{ .type = new_ty });
-            if (zcu.failed_analysis.contains(ty_unit) or zcu.transitive_failed_analysis.contains(ty_unit)) {
+            if (zcu.anyAnalysisFailed(ty_unit)) {
                 return error.AnalysisFail;
             }
 
@@ -3282,7 +3288,7 @@ fn zirEnumDecl(
         .parent = block.namespace.toOptional(),
         .owner_type = wip_ty.index,
         .file_scope = block.getFileScopeIndex(zcu),
-        .generation = zcu.generation,
+        .generation = zcu.generation -% 1,
     });
     errdefer if (!done) pt.destroyNamespace(new_namespace_index);
 
@@ -3294,10 +3300,18 @@ fn zirEnumDecl(
     // We've finished the initial construction of this type, and are about to perform analysis.
     // Set the namespace appropriately, and don't destroy anything on failure.
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    wip_ty.prepare(ip, new_namespace_index);
     done = true;
 
+    // Defer clearing the namespace sentinel until after field names are
+    // populated so a parallel `enumFieldIndex` reader that awaits on it sees
+    // the full names_map. Same-thread recursion (a field value referencing an
+    // earlier field) is unblocked via `tls_wip_types`. On error past
+    // `done=true`, prepare() still publishes the namespace so readers don't
+    // spin forever; the partial enum is reported via `failed_analysis`.
+    zcu.wipTypeEnter(wip_ty.index) catch {};
     {
+        defer zcu.wipTypeExit(wip_ty.index);
+        defer wip_ty.prepare(ip, new_namespace_index);
         const tracked_unit = zcu.trackUnitSema(type_name.name.toSlice(ip), null);
         defer tracked_unit.end(zcu);
         try Sema.resolveDeclaredEnum(
@@ -3398,6 +3412,7 @@ fn zirUnionDecl(
     };
     const wip_ty = switch (try ip.getUnionType(gpa, pt.tid, union_init, false)) {
         .existing => |ty| {
+            zcu.awaitNamespaceTypeFinished(ty);
             const new_ty = try pt.ensureTypeUpToDate(ty);
 
             // Make sure we update the namespace if the declaration is re-analyzed, to pick
@@ -3410,7 +3425,8 @@ fn zirUnionDecl(
         },
         .wip => |wip| wip,
     };
-    errdefer wip_ty.cancel(ip, pt.tid);
+    var published = false;
+    errdefer if (!published) wip_ty.cancel(ip, pt.tid);
 
     const type_name = try sema.createTypeName(
         block,
@@ -3425,9 +3441,11 @@ fn zirUnionDecl(
         .parent = block.namespace.toOptional(),
         .owner_type = wip_ty.index,
         .file_scope = block.getFileScopeIndex(zcu),
-        .generation = zcu.generation,
+        .generation = zcu.generation -% 1,
     });
-    errdefer pt.destroyNamespace(new_namespace_index);
+    errdefer if (!published) pt.destroyNamespace(new_namespace_index);
+    _ = wip_ty.finish(ip, new_namespace_index);
+    published = true;
 
     if (pt.zcu.comp.incremental) {
         try pt.addDependency(.wrap(.{ .type = wip_ty.index }), .{ .src_hash = tracked_inst });
@@ -3447,7 +3465,7 @@ fn zirUnionDecl(
     try sema.declareDependency(.{ .interned = wip_ty.index });
     try sema.addTypeReferenceEntry(src, wip_ty.index);
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    return Air.internedToRef(wip_ty.finish(ip, new_namespace_index));
+    return Air.internedToRef(wip_ty.index);
 }
 
 fn zirOpaqueDecl(
@@ -3494,6 +3512,7 @@ fn zirOpaqueDecl(
     };
     const wip_ty = switch (try ip.getOpaqueType(gpa, pt.tid, opaque_init)) {
         .existing => |ty| {
+            zcu.awaitNamespaceTypeFinished(ty);
             // Make sure we update the namespace if the declaration is re-analyzed, to pick
             // up on e.g. changed comptime decls.
             try pt.ensureNamespaceUpToDate(Type.fromInterned(ty).getNamespaceIndex(zcu));
@@ -3504,7 +3523,8 @@ fn zirOpaqueDecl(
         },
         .wip => |wip| wip,
     };
-    errdefer wip_ty.cancel(ip, pt.tid);
+    var published = false;
+    errdefer if (!published) wip_ty.cancel(ip, pt.tid);
 
     const type_name = try sema.createTypeName(
         block,
@@ -3519,9 +3539,11 @@ fn zirOpaqueDecl(
         .parent = block.namespace.toOptional(),
         .owner_type = wip_ty.index,
         .file_scope = block.getFileScopeIndex(zcu),
-        .generation = zcu.generation,
+        .generation = zcu.generation -% 1,
     });
-    errdefer pt.destroyNamespace(new_namespace_index);
+    errdefer if (!published) pt.destroyNamespace(new_namespace_index);
+    _ = wip_ty.finish(ip, new_namespace_index);
+    published = true;
 
     const decls = sema.code.bodySlice(extra_index, decls_len);
     try pt.scanNamespace(new_namespace_index, decls);
@@ -3535,7 +3557,7 @@ fn zirOpaqueDecl(
     }
     try sema.addTypeReferenceEntry(src, wip_ty.index);
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    return Air.internedToRef(wip_ty.finish(ip, new_namespace_index));
+    return Air.internedToRef(wip_ty.index);
 }
 
 fn zirErrorSetDecl(
@@ -5532,6 +5554,8 @@ fn zirCompileLog(
 
     const line_data = try zcu.intern_pool.getOrPutString(gpa, pt.tid, aw.written(), .no_embedded_nulls);
 
+    zcu.compile_log_mutex.lock();
+    defer zcu.compile_log_mutex.unlock();
     const line_idx: Zcu.CompileLogLine.Index = if (zcu.free_compile_log_lines.pop()) |idx| idx: {
         zcu.compile_log_lines.items[@intFromEnum(idx)] = .{
             .next = .none,
@@ -5752,6 +5776,8 @@ fn zirCImport(sema: *Sema, parent_block: *Block, inst: Zir.Inst.Index) CompileEr
             if (!comp.config.link_libc)
                 try sema.errNote(src, msg, "libc headers not available; compilation does not link against libc", .{});
 
+            zcu.cimport_errors_mutex.lock();
+            defer zcu.cimport_errors_mutex.unlock();
             const gop = try zcu.cimport_errors.getOrPut(gpa, sema.owner);
             if (!gop.found_existing) {
                 gop.value_ptr.* = c_import_res.errors;
@@ -7546,6 +7572,8 @@ fn analyzeCall(
             } else resolved_ret_ty;
 
             // We now need to actually create the function instance.
+            // `getFuncInstanceIes` takes its 4 shard mutexes in sorted order
+            // via `lockShardsSorted`, so concurrent calls cannot ABBA-deadlock.
             const func_instance = try ip.getFuncInstance(gpa, pt.tid, .{
                 .param_types = runtime_param_tys.items,
                 .noalias_bits = noalias_bits,
@@ -7889,12 +7917,25 @@ fn analyzeCall(
     if (block.isComptime()) {
         const result_val = (try sema.resolveValue(maybe_opv)).?;
         if (want_memoize and sema.allow_memoize and !result_val.canMutateComptimeVarState(zcu)) {
-            _ = try pt.intern(.{ .memoized_call = .{
+            const memo_idx = try pt.intern(.{ .memoized_call = .{
                 .func = func_val.?.toIntern(),
                 .arg_values = memoized_arg_values,
                 .result = result_val.toIntern(),
                 .branch_count = sema.branch_count - old_branch_count,
             } });
+            // Under parallel Sema two threads can compute the same comptime
+            // call and observe different intermediate state (e.g. partial
+            // `@typeInfo` fields). The intern key ignores `result`, so the
+            // first thread to publish wins and the loser would otherwise
+            // silently adopt a wrong cached result. Detect the divergence and
+            // retry instead of returning the cached value.
+            if (zcu.parallel_sema) {
+                const cached = ip.indexToKey(memo_idx).memoized_call.result;
+                if (cached != result_val.toIntern()) {
+                    Zcu.tls_retry_loop = sema.owner;
+                    return error.AnalysisFail;
+                }
+            }
         }
     }
 
@@ -13839,7 +13880,9 @@ fn zirEmbedFile(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!A
     };
     try sema.declareDependency(.{ .embed_file = ef_idx });
 
-    const result = ef_idx.get(zcu);
+    zcu.semaLock();
+    const result = ef_idx.get(zcu).*;
+    zcu.semaUnlock();
     if (result.val == .none) {
         return sema.fail(block, operand_src, "unable to open '{s}': {s}", .{ name, @errorName(result.err.?) });
     }
@@ -16824,7 +16867,7 @@ fn zirThis(
             // `ensureTypeUpToDate` has resolved the new type if necessary.
             // We just need to check for resolution failures.
             const ty_unit: AnalUnit = .wrap(.{ .type = new_ty });
-            if (zcu.failed_analysis.contains(ty_unit) or zcu.transitive_failed_analysis.contains(ty_unit)) {
+            if (zcu.anyAnalysisFailed(ty_unit)) {
                 return error.AnalysisFail;
             }
             return Air.internedToRef(new_ty);
@@ -16842,7 +16885,7 @@ fn zirClosureGet(sema: *Sema, block: *Block, extended: Zir.Inst.Extended.InstDat
     const src_node: std.zig.Ast.Node.Offset = @enumFromInt(@as(i32, @bitCast(extended.operand)));
     const src = block.nodeOffset(src_node);
 
-    const capture_ty = switch (captures.get(ip)[extended.small].unwrap()) {
+    const capture_ty = switch (captures.get(ip)[extended.small].unwrap(ip)) {
         .@"comptime" => |index| return Air.internedToRef(index),
         .runtime => |index| index,
         .nav_val => |nav| return sema.analyzeNavVal(block, src, nav),
@@ -17672,6 +17715,50 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ai
                 struct_field_vals = try gpa.alloc(InternPool.Index, struct_type.field_types.len);
 
                 try ty.resolveStructFieldInits(pt);
+
+                // Under parallel Sema another thread may have left names/types
+                // partially populated when our `haveFieldInits`/`haveFieldTypes`
+                // fast-path observed a stale "done" flag. A wrong `@typeInfo`
+                // result here is permanently memoized via the comptime-call
+                // cache, so guard: if any slot is `.none`, retry the outer job.
+                if (zcu.parallel_sema) for (0..struct_type.field_types.len) |gi| {
+                    if (struct_type.fieldName(ip, gi) == .none or
+                        struct_type.field_types.get(ip)[gi] == .none)
+                    {
+                        Zcu.tls_retry_loop = .wrap(.{ .type = ty.toIntern() });
+                        return error.AnalysisFail;
+                    }
+                };
+
+                if (zcu.parallel_sema and std.process.hasNonEmptyEnvVarConstant("ZIG_TRACE_TYPEINFO")) diag: {
+                    var any_none_name: bool = false;
+                    var any_none_ty: bool = false;
+                    const n = struct_type.field_types.len;
+                    var idx: u32 = 0;
+                    while (idx < n) : (idx += 1) {
+                        if (struct_type.fieldName(ip, idx) == .none) any_none_name = true;
+                        if (struct_type.field_types.get(ip)[idx] == .none) any_none_ty = true;
+                    }
+                    if (!any_none_name and !any_none_ty) break :diag;
+                    std.debug.print(
+                        "TYPEINFO-RACE struct={f} fields_len={d} haveFieldTypes={} haveFieldInits={} names_map_count={d}\n",
+                        .{
+                            struct_type.name.fmt(ip),
+                            n,
+                            struct_type.haveFieldTypes(ip),
+                            struct_type.haveFieldInits(ip),
+                            if (struct_type.names_map.unwrap()) |m| m.get(ip).count() else 0,
+                        },
+                    );
+                    idx = 0;
+                    while (idx < n) : (idx += 1) {
+                        const nm = struct_type.fieldName(ip, idx);
+                        const ft = struct_type.field_types.get(ip)[idx];
+                        if (nm == .none or ft == .none)
+                            std.debug.print("  field[{d}] name={} type={}\n", .{ idx, nm, ft });
+                    }
+                    std.debug.dumpCurrentStackTrace(null);
+                }
 
                 for (struct_field_vals, 0..) |*field_val, field_index| {
                     const field_name = if (struct_type.fieldName(ip, field_index).unwrap()) |field_name|
@@ -19784,9 +19871,9 @@ fn structInitAnon(
                 if (init_val != .none) struct_type.setFieldComptime(ip, field_idx);
             }
 
-            @memcpy(struct_type.field_types.get(ip), types);
+            struct_type.setFieldTypesAll(ip, types);
             if (any_values) {
-                @memcpy(struct_type.field_inits.get(ip), values);
+                struct_type.setFieldInitsAll(ip, values);
             }
 
             const new_namespace_index = try pt.createNamespace(.{
@@ -19795,6 +19882,7 @@ fn structInitAnon(
                 .file_scope = block.getFileScopeIndex(zcu),
                 .generation = zcu.generation,
             });
+            _ = wip.finish(ip, new_namespace_index);
             try zcu.comp.queueJob(.{ .resolve_type_fully = wip.index });
             codegen_type: {
                 if (zcu.comp.config.use_llvm) break :codegen_type;
@@ -19803,10 +19891,14 @@ fn structInitAnon(
                 try zcu.comp.queueJob(.{ .link_type = wip.index });
             }
             if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip.index);
-            break :ty wip.finish(ip, new_namespace_index);
+            break :ty wip.index;
         },
         .existing => |ty| ty,
     };
+    // Under parallel Sema, `.existing` may dedup to a type whose `.wip` owner
+    // has not yet run `setFieldTypesAll`/`finish`; spin so `aggregateValue`'s
+    // canonicalization sees populated field_types.
+    zcu.awaitNamespaceTypeFinished(struct_ty);
     try sema.declareDependency(.{ .interned = struct_ty });
     try sema.addTypeReferenceEntry(src, struct_ty);
 
@@ -20805,7 +20897,8 @@ fn zirReify(
                 },
                 .wip => |wip| wip,
             };
-            errdefer wip_ty.cancel(ip, pt.tid);
+            var published = false;
+            errdefer if (!published) wip_ty.cancel(ip, pt.tid);
 
             const type_name = try sema.createTypeName(
                 block,
@@ -20822,10 +20915,12 @@ fn zirReify(
                 .file_scope = block.getFileScopeIndex(zcu),
                 .generation = zcu.generation,
             });
+            _ = wip_ty.finish(ip, new_namespace_index);
+            published = true;
 
             try sema.addTypeReferenceEntry(src, wip_ty.index);
             if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-            return Air.internedToRef(wip_ty.finish(ip, new_namespace_index));
+            return Air.internedToRef(wip_ty.index);
         },
         .@"union" => {
             const struct_type = ip.loadStructType(ip.typeOf(union_val.val));
@@ -21042,9 +21137,12 @@ fn reifyEnum(
     try sema.declareDependency(.{ .interned = wip_ty.index });
     try sema.addTypeReferenceEntry(src, wip_ty.index);
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    wip_ty.prepare(ip, new_namespace_index);
     wip_ty.setTagTy(ip, tag_ty.toIntern());
     done = true;
+
+    zcu.wipTypeEnter(wip_ty.index) catch {};
+    defer zcu.wipTypeExit(wip_ty.index);
+    defer wip_ty.prepare(ip, new_namespace_index);
 
     for (0..fields_len) |field_idx| {
         const field_info = try fields_val.elemValue(pt, field_idx);
@@ -21180,7 +21278,8 @@ fn reifyUnion(
             return Air.internedToRef(ty);
         },
     };
-    errdefer wip_ty.cancel(ip, pt.tid);
+    var published = false;
+    errdefer if (!published) wip_ty.cancel(ip, pt.tid);
 
     const type_name = try sema.createTypeName(
         block,
@@ -21226,12 +21325,12 @@ fn reifyUnion(
             }
             seen_tags.set(enum_index);
 
-            loaded_union.field_types.get(ip)[field_idx] = field_type_val.toIntern();
+            loaded_union.setFieldType(ip, field_idx, field_type_val.toIntern());
             const byte_align = try field_alignment_val.toUnsignedIntSema(pt);
             if (layout == .@"packed") {
                 if (byte_align != 0) return sema.fail(block, src, "alignment of a packed union field must be set to 0", .{});
             } else {
-                loaded_union.field_aligns.get(ip)[field_idx] = try sema.validateAlign(block, src, byte_align);
+                loaded_union.setFieldAlign(ip, field_idx, try sema.validateAlign(block, src, byte_align));
             }
         }
 
@@ -21270,12 +21369,12 @@ fn reifyUnion(
                 return sema.fail(block, src, "duplicate union field {f}", .{field_name.fmt(ip)});
             }
 
-            loaded_union.field_types.get(ip)[field_idx] = field_type_val.toIntern();
+            loaded_union.setFieldType(ip, field_idx, field_type_val.toIntern());
             const byte_align = try field_alignment_val.toUnsignedIntSema(pt);
             if (layout == .@"packed") {
                 if (byte_align != 0) return sema.fail(block, src, "alignment of a packed union field must be set to 0", .{});
             } else {
-                loaded_union.field_aligns.get(ip)[field_idx] = try sema.validateAlign(block, src, byte_align);
+                loaded_union.setFieldAlign(ip, field_idx, try sema.validateAlign(block, src, byte_align));
             }
         }
 
@@ -21327,6 +21426,8 @@ fn reifyUnion(
         .file_scope = block.getFileScopeIndex(zcu),
         .generation = zcu.generation,
     });
+    _ = wip_ty.finish(ip, new_namespace_index);
+    published = true;
 
     try zcu.comp.queueJob(.{ .resolve_type_fully = wip_ty.index });
     codegen_type: {
@@ -21339,7 +21440,7 @@ fn reifyUnion(
     try sema.declareDependency(.{ .interned = wip_ty.index });
     try sema.addTypeReferenceEntry(src, wip_ty.index);
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    return Air.internedToRef(wip_ty.finish(ip, new_namespace_index));
+    return Air.internedToRef(wip_ty.index);
 }
 
 fn reifyTuple(
@@ -21529,7 +21630,8 @@ fn reifyStruct(
             return Air.internedToRef(ty);
         },
     };
-    errdefer wip_ty.cancel(ip, pt.tid);
+    var published = false;
+    errdefer if (!published) wip_ty.cancel(ip, pt.tid);
 
     const type_name = try sema.createTypeName(
         block,
@@ -21566,7 +21668,7 @@ fn reifyStruct(
         if (layout == .@"packed") {
             if (byte_align != 0) return sema.fail(block, src, "alignment of a packed struct field must be set to 0", .{});
         } else {
-            struct_type.field_aligns.get(ip)[field_idx] = try sema.validateAlign(block, src, byte_align);
+            struct_type.setFieldAlign(ip, field_idx, try sema.validateAlign(block, src, byte_align));
         }
 
         const field_is_comptime = field_is_comptime_val.toBool();
@@ -21593,9 +21695,9 @@ fn reifyStruct(
             return sema.fail(block, src, "comptime field without default initialization value", .{});
         }
 
-        struct_type.field_types.get(ip)[field_idx] = field_type_val.toIntern();
+        struct_type.setFieldType(ip, field_idx, field_type_val.toIntern());
         if (field_default != .none) {
-            struct_type.field_inits.get(ip)[field_idx] = field_default;
+            struct_type.setFieldInit(ip, field_idx, field_default);
         }
 
         if (field_ty.zigTypeTag(zcu) == .@"opaque") {
@@ -21670,6 +21772,8 @@ fn reifyStruct(
         .file_scope = block.getFileScopeIndex(zcu),
         .generation = zcu.generation,
     });
+    _ = wip_ty.finish(ip, new_namespace_index);
+    published = true;
 
     try zcu.comp.queueJob(.{ .resolve_type_fully = wip_ty.index });
     codegen_type: {
@@ -21682,7 +21786,7 @@ fn reifyStruct(
     try sema.declareDependency(.{ .interned = wip_ty.index });
     try sema.addTypeReferenceEntry(src, wip_ty.index);
     if (zcu.comp.debugIncremental()) try zcu.incremental_debug_state.newType(zcu, wip_ty.index);
-    return Air.internedToRef(wip_ty.finish(ip, new_namespace_index));
+    return Air.internedToRef(wip_ty.index);
 }
 
 fn resolveVaListRef(sema: *Sema, block: *Block, src: LazySrcLoc, zir_ref: Zir.Inst.Ref) CompileError!Air.Inst.Ref {
@@ -31219,12 +31323,15 @@ fn addReferenceEntry(
     if (!zcu.comp.incremental and zcu.comp.reference_trace == 0) return;
     const gop = try sema.references.getOrPut(sema.gpa, referenced_unit);
     if (gop.found_existing) return;
-    try zcu.addUnitReference(sema.owner, referenced_unit, src, inline_frame: {
-        const block = opt_block orelse break :inline_frame .none;
-        const inlining = block.inlining orelse break :inline_frame .none;
-        const frame = try inlining.refFrame(zcu);
-        break :inline_frame frame.toOptional();
-    });
+    gop.value_ptr.* = .{
+        .src = src,
+        .inline_frame = inline_frame: {
+            const block = opt_block orelse break :inline_frame .none;
+            const inlining = block.inlining orelse break :inline_frame .none;
+            const frame = try inlining.refFrame(zcu);
+            break :inline_frame frame.toOptional();
+        },
+    };
 }
 
 pub fn addTypeReferenceEntry(
@@ -31236,7 +31343,7 @@ pub fn addTypeReferenceEntry(
     if (!zcu.comp.incremental and zcu.comp.reference_trace == 0) return;
     const gop = try sema.type_references.getOrPut(sema.gpa, referenced_type);
     if (gop.found_existing) return;
-    try zcu.addTypeReference(sema.owner, referenced_type, src);
+    gop.value_ptr.* = src;
 }
 
 fn ensureMemoizedStateResolved(sema: *Sema, src: LazySrcLoc, stage: InternPool.MemoizedStateStage) SemaError!void {
@@ -31246,10 +31353,32 @@ fn ensureMemoizedStateResolved(sema: *Sema, src: LazySrcLoc, stage: InternPool.M
     try sema.addReferenceEntry(null, src, unit);
     try sema.declareDependency(.{ .memoized_state = stage });
 
-    if (pt.zcu.analysis_in_progress.contains(unit)) {
+    if (pt.zcu.semaAipContains(unit)) {
         return sema.failWithOwnedErrorMsg(null, try sema.errMsg(src, "dependency loop detected", .{}));
     }
     try pt.ensureMemoizedStateUpToDate(stage);
+}
+
+/// Under parallel Sema, a wip-flag self-dependency may be order-dependent
+/// (an intermediate nav would have short-circuited the chain in serial).
+/// Returns true if the caller should set `tls_retry_loop` and propagate
+/// AnalysisFail so the outermost job can release-and-requeue.
+fn maybeRetryTypeLoop(sema: *Sema, ty: Type) Allocator.Error!bool {
+    const zcu = sema.pt.zcu;
+    const unit: AnalUnit = .wrap(.{ .type = ty.toIntern() });
+    zcu.sema_retry_mutex.lock();
+    defer zcu.sema_retry_mutex.unlock();
+    const gop = try zcu.sema_retry_counts.getOrPut(zcu.gpa, unit);
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    gop.value_ptr.* +|= 1;
+    // Cap scaled to thread count: with the ensure*UpToDate sema_lock gate
+    // dropped, far more workers can hit the same wip-flag concurrently and
+    // each bumps this counter; 8 was tuned for the serialised path.
+    if (gop.value_ptr.* < 128) {
+        Zcu.tls_retry_loop = unit;
+        return true;
+    }
+    return false;
 }
 
 pub fn ensureNavResolved(sema: *Sema, block: *Block, src: LazySrcLoc, nav_index: InternPool.Nav.Index, kind: enum { type, fully }) CompileError!void {
@@ -31277,7 +31406,24 @@ pub fn ensureNavResolved(sema: *Sema, block: *Block, src: LazySrcLoc, nav_index:
     });
     try sema.addReferenceEntry(block, src, anal_unit);
 
-    if (zcu.analysis_in_progress.contains(anal_unit)) {
+    if (zcu.semaAipContains(anal_unit)) {
+        if (zcu.parallel_sema) {
+            // The loop may be order-dependent: another thread could resolve
+            // an intermediate nav and break the chain. Signal the outermost
+            // analyze_func to release-and-requeue instead of marking failed.
+            zcu.sema_retry_mutex.lock();
+            const tries: u8 = blk: {
+                const gop = zcu.sema_retry_counts.getOrPut(zcu.gpa, anal_unit) catch break :blk 255;
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* +|= 1;
+                break :blk gop.value_ptr.*;
+            };
+            zcu.sema_retry_mutex.unlock();
+            if (tries < 128) {
+                Zcu.tls_retry_loop = anal_unit;
+                return error.AnalysisFail;
+            }
+        }
         return sema.failWithOwnedErrorMsg(null, try sema.errMsg(.{
             .base_node_inst = nav.analysis.?.zir_index,
             .offset = LazySrcLoc.Offset.nodeOffset(.zero),
@@ -31317,7 +31463,12 @@ fn analyzeNavRefInner(sema: *Sema, block: *Block, src: LazySrcLoc, orig_nav_inde
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
 
-    try sema.ensureNavResolved(block, src, orig_nav_index, if (is_ref) .type else .fully);
+    // Under parallel Sema another thread may transition the nav from
+    // .type_resolved → .fully_resolved between our ensureNavResolved and
+    // the getNav below, leaving a torn read in `isExternOrFn`. Fully
+    // resolving here serialises via claimOrWait so the subsequent getNav
+    // observes a stable status.
+    try sema.ensureNavResolved(block, src, orig_nav_index, if (is_ref and !zcu.parallel_sema) .type else .fully);
 
     const nav_index = nav: {
         if (ip.getNav(orig_nav_index).isExternOrFn(ip)) {
@@ -31396,7 +31547,21 @@ fn maybeQueueFuncBodyAnalysis(sema: *Sema, block: *Block, src: LazySrcLoc, nav_i
     try sema.ensureNavResolved(block, src, nav_index, .type);
     const nav_ty: Type = .fromInterned(ip.getNav(nav_index).typeOf(ip));
     if (nav_ty.zigTypeTag(zcu) != .@"fn") return;
-    if (!try nav_ty.fnHasRuntimeBitsSema(pt)) return;
+    // `fnHasRuntimeBitsSema` may trigger a yield-and-requeue retry; if so,
+    // the caller has already committed (export registered / pointer taken),
+    // so swallow it and conservatively queue analysis rather than dropping
+    // the func body and crashing in `processExports`.
+    const has_rt_bits = nav_ty.fnHasRuntimeBitsSema(pt) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AnalysisFail => blk: {
+            if (Zcu.tls_retry_loop != null) {
+                Zcu.tls_retry_loop = null;
+                break :blk true;
+            }
+            return error.AnalysisFail;
+        },
+    };
+    if (!has_rt_bits) return;
 
     try sema.ensureNavResolved(block, src, nav_index, .fully);
     const nav_val = zcu.navValue(nav_index);
@@ -34315,7 +34480,9 @@ pub fn resolveStructAlignment(
     assert(sema.owner.unwrap().type == ty);
 
     assert(struct_type.layout != .@"packed");
-    assert(struct_type.flagsUnordered(ip).alignment == .none);
+    // The unlocked caller-side check is a TOCTOU under parallel Sema; another
+    // thread may have completed this resolution while we waited on sema_lock.
+    if (struct_type.flagsUnordered(ip).alignment != .none) return;
 
     const ptr_align = Alignment.fromByteUnits(@divExact(target.ptrBitWidth(), 8));
 
@@ -34377,6 +34544,7 @@ pub fn resolveStructLayout(sema: *Sema, ty: Type) SemaError!void {
     }
 
     if (struct_type.setLayoutWip(ip)) {
+        if (zcu.parallel_sema) if (try sema.maybeRetryTypeLoop(ty)) return error.AnalysisFail;
         const msg = try sema.errMsg(
             ty.srcLoc(zcu),
             "struct '{f}' depends on itself",
@@ -34394,7 +34562,7 @@ pub fn resolveStructLayout(sema: *Sema, ty: Type) SemaError!void {
     for (aligns, sizes, 0..) |*field_align, *field_size, i| {
         const field_ty: Type = .fromInterned(struct_type.field_types.get(ip)[i]);
         if (struct_type.fieldIsComptime(ip, i) or try field_ty.comptimeOnlySema(pt)) {
-            struct_type.offsets.get(ip)[i] = 0;
+            struct_type.setOffset(ip, @intCast(i), 0);
             field_size.* = 0;
             field_align.* = .none;
             continue;
@@ -34437,7 +34605,10 @@ pub fn resolveStructLayout(sema: *Sema, ty: Type) SemaError!void {
     }
 
     if (struct_type.hasReorderedFields()) {
-        const runtime_order = struct_type.runtime_order.get(ip);
+        const RuntimeOrder = InternPool.LoadedStructType.RuntimeOrder;
+        // Compute into a temp to avoid cross-tid writes to InternPool extra
+        // without `extra.mutex` while calling back into Sema.
+        const runtime_order = try sema.arena.alloc(RuntimeOrder, struct_type.field_types.len);
 
         for (runtime_order, 0..) |*ro, i| {
             const field_ty: Type = .fromInterned(struct_type.field_types.get(ip)[i]);
@@ -34447,8 +34618,6 @@ pub fn resolveStructLayout(sema: *Sema, ty: Type) SemaError!void {
                 ro.* = @enumFromInt(i);
             }
         }
-
-        const RuntimeOrder = InternPool.LoadedStructType.RuntimeOrder;
 
         const AlignSortContext = struct {
             aligns: []const Alignment,
@@ -34485,16 +34654,20 @@ pub fn resolveStructLayout(sema: *Sema, ty: Type) SemaError!void {
                 .aligns = aligns,
             }, AlignSortContext.lessThan);
         }
+        struct_type.setRuntimeOrderAll(ip, runtime_order);
     }
 
-    // Calculate size, alignment, and field offsets.
-    const offsets = struct_type.offsets.get(ip);
+    // Calculate size, alignment, and field offsets in a temp, then publish
+    // under `extra.mutex` so a foreign-tid realloc cannot lose our writes.
+    const offsets = try sema.arena.alloc(u32, struct_type.field_types.len);
+    @memcpy(offsets, struct_type.offsets.get(ip));
     var it = struct_type.iterateRuntimeOrder(ip);
     var offset: u64 = 0;
     while (it.next()) |i| {
         offsets[i] = @intCast(aligns[i].forward(offset));
         offset = offsets[i] + sizes[i];
     }
+    struct_type.setOffsetsAll(ip, offsets);
     const size = std.math.cast(u32, big_align.forward(offset)) orelse {
         const msg = try sema.errMsg(
             ty.srcLoc(zcu),
@@ -34504,7 +34677,15 @@ pub fn resolveStructLayout(sema: *Sema, ty: Type) SemaError!void {
         return sema.failWithOwnedErrorMsg(null, msg);
     };
     struct_type.setLayoutResolved(ip, size, big_align);
-    _ = try ty.comptimeOnlySema(pt);
+    _ = ty.comptimeOnlySema(pt) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AnalysisFail => {
+            if (Zcu.tls_retry_loop != null) {
+                // layout already committed; re-queue would early-return.
+                Zcu.tls_retry_loop = null;
+            } else return error.AnalysisFail;
+        },
+    };
 }
 
 fn backingIntType(
@@ -34660,7 +34841,7 @@ pub fn resolveUnionAlignment(
 
     assert(sema.owner.unwrap().type == ty.toIntern());
 
-    assert(!union_type.haveLayout(ip));
+    if (union_type.haveLayout(ip)) return;
 
     const ptr_align = Alignment.fromByteUnits(@divExact(target.ptrBitWidth(), 8));
 
@@ -34707,6 +34888,7 @@ pub fn resolveUnionLayout(sema: *Sema, ty: Type) SemaError!void {
     switch (old_flags.status) {
         .none, .have_field_types => {},
         .field_types_wip, .layout_wip => {
+            if (pt.zcu.parallel_sema) if (try sema.maybeRetryTypeLoop(ty)) return error.AnalysisFail;
             const msg = try sema.errMsg(
                 ty.srcLoc(pt.zcu),
                 "union '{f}' depends on itself",
@@ -34802,7 +34984,17 @@ pub fn resolveUnionLayout(sema: *Sema, ty: Type) SemaError!void {
     };
     union_type.setHaveLayout(ip, casted_size, padding, alignment);
 
-    if (union_type.flagsUnordered(ip).assumed_runtime_bits and !(try ty.hasRuntimeBitsSema(pt))) {
+    const has_rt_bits = ty.hasRuntimeBitsSema(pt) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AnalysisFail => blk: {
+            if (Zcu.tls_retry_loop != null) {
+                Zcu.tls_retry_loop = null;
+                break :blk true;
+            }
+            return error.AnalysisFail;
+        },
+    };
+    if (union_type.flagsUnordered(ip).assumed_runtime_bits and !has_rt_bits) {
         const msg = try sema.errMsg(
             ty.srcLoc(pt.zcu),
             "union layout depends on it having runtime bits",
@@ -34821,7 +35013,14 @@ pub fn resolveUnionLayout(sema: *Sema, ty: Type) SemaError!void {
         );
         return sema.failWithOwnedErrorMsg(null, msg);
     }
-    _ = try ty.comptimeOnlySema(pt);
+    _ = ty.comptimeOnlySema(pt) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AnalysisFail => {
+            if (Zcu.tls_retry_loop != null) {
+                Zcu.tls_retry_loop = null;
+            } else return error.AnalysisFail;
+        },
+    };
 }
 
 /// Returns `error.AnalysisFail` if any of the types (recursively) failed to
@@ -34904,6 +35103,7 @@ pub fn resolveStructFieldTypes(
     if (struct_type.haveFieldTypes(ip)) return;
 
     if (struct_type.setFieldTypesWip(ip)) {
+        if (zcu.parallel_sema) if (try sema.maybeRetryTypeLoop(Type.fromInterned(ty))) return error.AnalysisFail;
         const msg = try sema.errMsg(
             Type.fromInterned(ty).srcLoc(zcu),
             "struct '{f}' depends on itself",
@@ -34937,6 +35137,7 @@ pub fn resolveStructFieldInits(sema: *Sema, ty: Type) SemaError!void {
     try sema.resolveStructLayout(ty);
 
     if (struct_type.setInitsWip(ip)) {
+        if (zcu.parallel_sema) if (try sema.maybeRetryTypeLoop(ty)) return error.AnalysisFail;
         const msg = try sema.errMsg(
             ty.srcLoc(zcu),
             "struct '{f}' depends on itself",
@@ -34967,6 +35168,7 @@ pub fn resolveUnionFieldTypes(sema: *Sema, ty: Type, union_type: InternPool.Load
     switch (union_type.flagsUnordered(ip).status) {
         .none => {},
         .field_types_wip => {
+            if (zcu.parallel_sema) if (try sema.maybeRetryTypeLoop(ty)) return error.AnalysisFail;
             const msg = try sema.errMsg(ty.srcLoc(zcu), "union '{f}' depends on itself", .{ty.fmt(pt)});
             return sema.failWithOwnedErrorMsg(null, msg);
         },
@@ -35011,7 +35213,7 @@ fn resolveInferredErrorSet(
     const resolved_ty = func.resolvedErrorSetUnordered(ip);
     if (resolved_ty != .none) return resolved_ty;
 
-    if (zcu.analysis_in_progress.contains(.wrap(.{ .func = func_index }))) {
+    if (zcu.semaAipContains(.wrap(.{ .func = func_index }))) {
         return sema.fail(block, src, "unable to resolve inferred error set", .{});
     }
 
@@ -35281,7 +35483,8 @@ fn structFields(
 
             // This string needs to outlive the ZIR code.
             const field_name = try ip.getOrPutString(gpa, pt.tid, field_name_zir, .no_embedded_nulls);
-            assert(struct_type.addFieldName(ip, field_name) == null);
+            // A previous yield-and-requeue may have populated some names already.
+            if (struct_type.addFieldName(ip, field_name)) |existing| assert(existing == field_i);
 
             if (has_align) {
                 fields[field_i].align_body_len = zir.extra[extra_index];
@@ -35299,6 +35502,13 @@ fn structFields(
     // Next we do only types and alignments, saving the inits for a second pass,
     // so that init values may depend on type layout.
 
+    // Collect into arena temps and batch-publish under one `extra.mutex` hold
+    // at the end so each field doesn't take the per-tid mutex separately.
+    const tmp_types = try sema.arena.alloc(InternPool.Index, fields.len);
+    @memset(tmp_types, .none);
+    const tmp_aligns = try sema.arena.alloc(InternPool.Alignment, fields.len);
+    @memset(tmp_aligns, .none);
+
     for (fields, 0..) |zir_field, field_i| {
         const ty_src: LazySrcLoc = .{
             .base_node_inst = struct_type.zir_index,
@@ -35315,7 +35525,7 @@ fn structFields(
             break :ty try sema.analyzeAsType(&block_scope, ty_src, ty_ref);
         };
 
-        struct_type.field_types.get(ip)[field_i] = field_ty.toIntern();
+        tmp_types[field_i] = field_ty.toIntern();
 
         if (field_ty.zigTypeTag(zcu) == .@"opaque") {
             const msg = msg: {
@@ -35374,12 +35584,21 @@ fn structFields(
                 .offset = .{ .container_field_align = @intCast(field_i) },
             };
             const field_align = try sema.analyzeAsAlign(&block_scope, align_src, align_ref);
-            struct_type.field_aligns.get(ip)[field_i] = field_align;
+            tmp_aligns[field_i] = field_align;
         }
 
         extra_index += zir_field.init_body_len;
     }
 
+    struct_type.setFieldTypesAlignsAll(ip, tmp_types, if (any_aligned) tmp_aligns else null);
+
+    // Re-store the last field type with release so the unlocked
+    // `haveFieldTypes` fast-path acquire sees all preceding name/type
+    // slot writes from this loop.
+    if (struct_type.field_types.len > 0) {
+        const types = struct_type.field_types.get(ip);
+        @atomicStore(InternPool.Index, &types[types.len - 1], types[types.len - 1], .release);
+    }
     struct_type.clearFieldTypesWip(ip);
     if (!any_inits) struct_type.setHaveFieldInits(ip);
 
@@ -35395,7 +35614,7 @@ fn structFieldInits(
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
 
-    assert(!struct_type.haveFieldInits(ip));
+    if (struct_type.haveFieldInits(ip)) return;
 
     const namespace_index = struct_type.namespace;
     const zir = zcu.namespacePtr(namespace_index).fileScope(zcu).zir.?;
@@ -35464,6 +35683,8 @@ fn structFieldInits(
     }
 
     if (any_inits) {
+        const tmp_inits = try sema.arena.alloc(InternPool.Index, fields.len);
+        @memset(tmp_inits, .none);
         for (fields, 0..) |zir_field, field_i| {
             extra_index += zir_field.type_body_len;
             extra_index += zir_field.align_body_len;
@@ -35498,8 +35719,9 @@ fn structFieldInits(
                 const field_name = struct_type.fieldName(ip, field_i).unwrap().?;
                 return sema.failWithContainsReferenceToComptimeVar(&block_scope, init_src, field_name, "field default value", default_val);
             }
-            struct_type.field_inits.get(ip)[field_i] = default_val.toIntern();
+            tmp_inits[field_i] = default_val.toIntern();
         }
+        struct_type.setFieldInitsAll(ip, tmp_inits);
     }
 
     try sema.flushExports();
@@ -37204,22 +37426,54 @@ fn analyzeUnreachable(sema: *Sema, block: *Block, src: LazySrcLoc, safety_check:
 /// It takes the exports stored in `sema.export` and flushes them to the `Zcu`
 /// to be processed by the linker after the update.
 pub fn flushExports(sema: *Sema) !void {
-    if (sema.exports.items.len == 0) return;
-
     const zcu = sema.pt.zcu;
     const gpa = zcu.gpa;
+
+    if (sema.exports.items.len == 0 and
+        sema.references.count() == 0 and
+        sema.type_references.count() == 0) return;
+
+    {
+        var it = sema.references.iterator();
+        while (it.next()) |e|
+            try zcu.addUnitReference(sema.owner, e.key_ptr.*, e.value_ptr.src, e.value_ptr.inline_frame);
+        sema.references.clearRetainingCapacity();
+    }
+    {
+        var it = sema.type_references.iterator();
+        while (it.next()) |e|
+            try zcu.addTypeReference(sema.owner, e.key_ptr.*, e.value_ptr.*);
+        sema.type_references.clearRetainingCapacity();
+    }
+
+    if (sema.exports.items.len == 0) return;
+
+    zcu.exports_mutex.lock();
+    defer zcu.exports_mutex.unlock();
 
     // There may be existing exports. For instance, a struct may export
     // things during both field type resolution and field default resolution.
     //
     // So, pick up and delete any existing exports. This strategy performs
     // redundant work, but that's okay, because this case is exceedingly rare.
+    // Skip any existing entry that is identical to one already in
+    // `sema.exports` (re-analysis under parallel-Sema retry can re-flush the
+    // same export, which would otherwise duplicate it and trip the symbol
+    // collision check).
+    const new_len = sema.exports.items.len;
     if (zcu.single_exports.get(sema.owner)) |export_idx| {
-        try sema.exports.append(gpa, export_idx.ptr(zcu).*);
+        const e = export_idx.ptr(zcu).*;
+        for (sema.exports.items[0..new_len]) |n| {
+            if (std.meta.eql(n.exported, e.exported) and n.opts.name == e.opts.name) break;
+        } else try sema.exports.append(gpa, e);
     } else if (zcu.multi_exports.get(sema.owner)) |info| {
-        try sema.exports.appendSlice(gpa, zcu.all_exports.items[info.index..][0..info.len]);
+        for (zcu.all_exports.items[info.index..][0..info.len]) |e| {
+            for (sema.exports.items[0..new_len]) |n| {
+                if (std.meta.eql(n.exported, e.exported) and n.opts.name == e.opts.name) break;
+            } else try sema.exports.append(gpa, e);
+        }
     }
-    zcu.deleteUnitExports(sema.owner);
+    zcu.deleteUnitExportsAssumeLocked(sema.owner);
 
     // `sema.exports` is completed; store the data into the `Zcu`.
     if (sema.exports.items.len == 1) {
@@ -37239,6 +37493,7 @@ pub fn flushExports(sema: *Sema) !void {
             .len = @intCast(sema.exports.items.len),
         });
     }
+    sema.exports.clearRetainingCapacity();
 }
 
 /// Called as soon as a `declared` enum type is created.
@@ -37324,6 +37579,8 @@ pub fn resolveDeclaredEnum(
         error.ComptimeReturn => unreachable,
         error.OutOfMemory => |e| return e,
         error.AnalysisFail => {
+            zcu.failed_analysis_mutex.lock();
+            defer zcu.failed_analysis_mutex.unlock();
             if (!zcu.failed_analysis.contains(sema.owner)) {
                 try zcu.transitive_failed_analysis.put(gpa, sema.owner, {});
             }
@@ -37610,7 +37867,10 @@ pub fn analyzeMemoizedState(sema: *Sema, block: *Block, simple_src: LazySrcLoc, 
 
             const prev = zcu.builtin_decl_values.get(builtin_decl);
             if (val.toIntern() != prev) {
-                zcu.builtin_decl_values.set(builtin_decl, val.toIntern());
+                // Release-store so that once the final entry of a stage becomes
+                // visible to the acquire fast-path in `PerThread.ensureMemoizedStateUpToDate`,
+                // all prior entries for that stage are visible too.
+                @atomicStore(InternPool.Index, zcu.builtin_decl_values.getPtr(builtin_decl), val.toIntern(), .release);
                 any_changed = true;
             }
         }

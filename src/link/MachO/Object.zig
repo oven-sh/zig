@@ -875,6 +875,11 @@ fn initSymbols(self: *Object, allocator: Allocator, macho_file: *MachO) !void {
         if (nlist.ext()) {
             if (nlist.undf()) {
                 symbol.flags.weak_ref = nlist.weakRef();
+                // Private-extern commons (e.g. asan's
+                // `____asan_globals_registered`) are N_PEXT|N_EXT|N_UNDF —
+                // record their hidden visibility so `markExportsRelocatable`
+                // and `setOutputSym` emit them as private-extern, not local.
+                if (nlist.pext()) symbol.visibility = .hidden;
             } else if (nlist.pext() or (nlist.weakDef() and nlist.weakRef()) or self.hidden) {
                 symbol.visibility = .hidden;
             } else {
@@ -1586,10 +1591,12 @@ pub fn convertTentativeDefinitions(self: *Object, macho_file: *MachO) !void {
         sym.flags.weak = false;
         sym.flags.weak_ref = false;
         sym.flags.tentative = false;
-        sym.visibility = .global;
+        // Preserve hidden visibility (private-extern commons stay private).
+        if (sym.visibility == .local) sym.visibility = .global;
 
         nlist.n_value = 0;
         nlist.n_type = macho.N_EXT | macho.N_SECT;
+        if (sym.visibility == .hidden) nlist.n_type |= macho.N_PEXT;
         nlist.n_sect = 0;
         nlist.n_desc = 0;
         nlist_atom.* = atom_index;
