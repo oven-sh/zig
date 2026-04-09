@@ -35280,7 +35280,30 @@ fn resolveInferredErrorSet(
         // In this case we are dealing with the actual InferredErrorSet object that
         // corresponds to the function, not one created to track an inline/comptime call.
         const orig_func_index = ip.unwrapCoercedFunc(func_index);
-        try sema.addReferenceEntry(block, src, .wrap(.{ .func = orig_func_index }));
+        const ies_unit: AnalUnit = .wrap(.{ .func = orig_func_index });
+        if (zcu.parallel_sema and zcu.isClaimedByOther(ies_unit)) {
+            // The IES owner's body is being analysed by another worker right
+            // now. `ensureFuncBodyUpToDate` would park this thread on
+            // `sema_claim_cond` until that worker finishes — under chained
+            // IES dependencies that idles a core for the bulk of Sema.
+            // Instead, yield: re-queue `sema.owner` and let this thread
+            // pull the next job. Cap retries low because each one re-runs
+            // the caller's body from scratch; once the cap is hit, fall
+            // through to the blocking wait.
+            zcu.sema_retry_mutex.lock();
+            const tries: u8 = blk: {
+                const gop = zcu.sema_retry_counts.getOrPut(zcu.gpa, ies_unit) catch break :blk 255;
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* +|= 1;
+                break :blk gop.value_ptr.*;
+            };
+            zcu.sema_retry_mutex.unlock();
+            if (tries < 8) {
+                Zcu.tls_retry_loop = sema.owner;
+                return error.AnalysisFail;
+            }
+        }
+        try sema.addReferenceEntry(block, src, ies_unit);
         try pt.ensureFuncBodyUpToDate(orig_func_index);
     }
 
