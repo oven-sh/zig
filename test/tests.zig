@@ -2242,6 +2242,7 @@ const ModuleTestOptions = struct {
     skip_non_native: bool,
     skip_freebsd: bool,
     skip_netbsd: bool,
+    llvm_codegen_threads: u32 = 0,
     skip_windows: bool,
     skip_macos: bool,
     skip_linux: bool,
@@ -2351,6 +2352,7 @@ pub fn addModuleTests(b: *std.Build, options: ModuleTestOptions) *Step {
             .zig_lib_dir = b.path("lib"),
         });
         these_tests.linkage = test_target.linkage;
+        if (would_use_llvm) these_tests.llvm_codegen_threads = options.llvm_codegen_threads;
         if (options.no_builtin) these_tests.root_module.no_builtin = false;
         if (options.build_options) |build_options| {
             these_tests.root_module.addOptions("build_options", build_options);
