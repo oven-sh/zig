@@ -193,6 +193,7 @@ pub const Module = struct {
         Variable,
         Function,
         Alias,
+        Comdat,
     };
 
     pub const Version = struct {
@@ -209,6 +210,18 @@ pub const Module = struct {
         };
         code: u16,
         string: []const u8,
+    };
+
+    pub const Comdat = struct {
+        pub const ops = [_]AbbrevOp{
+            .{ .literal = 12 }, // MODULE_CODE_COMDAT
+            .{ .vbr = 16 }, // strtab_offset
+            .{ .vbr = 16 }, // strtab_size
+            .{ .fixed = @bitSizeOf(Builder.Comdat.SelectionKind) },
+        };
+        strtab_offset: usize,
+        strtab_size: usize,
+        selection_kind: Builder.Comdat.SelectionKind,
     };
 
     pub const Variable = struct {
@@ -233,7 +246,7 @@ pub const Module = struct {
             .{ .fixed = @bitSizeOf(Builder.UnnamedAddr) },
             .{ .fixed = @bitSizeOf(Builder.ExternallyInitialized) },
             .{ .fixed = @bitSizeOf(Builder.DllStorageClass) },
-            .{ .literal = 0 }, // comdat
+            .{ .vbr = 16 }, // comdat
             .{ .literal = 0 }, // attributes
             .{ .fixed = @bitSizeOf(Builder.Preemption) },
         };
@@ -250,6 +263,7 @@ pub const Module = struct {
         unnamed_addr: Builder.UnnamedAddr,
         externally_initialized: Builder.ExternallyInitialized,
         dllstorageclass: Builder.DllStorageClass,
+        comdat: u32,
         preemption: Builder.Preemption,
     };
 

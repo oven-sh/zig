@@ -3742,6 +3742,19 @@ pub fn releaseClaim(zcu: *Zcu, unit: AnalUnit) void {
     zcu.sema_claim_cond.broadcast();
 }
 
+/// Returns true if `unit` is currently claimed for analysis by a thread other
+/// than the caller. Used by `Sema.resolveInferredErrorSet` to yield-and-requeue
+/// instead of parking on `sema_claim_cond` when a dependency IES is already in
+/// progress on another worker.
+pub fn isClaimedByOther(zcu: *Zcu, unit: AnalUnit) bool {
+    if (!zcu.parallel_sema) return false;
+    const me = std.Thread.getCurrentId();
+    zcu.unit_claims_mutex.lock();
+    defer zcu.unit_claims_mutex.unlock();
+    const owner = zcu.unit_claims.get(unit) orelse return false;
+    return owner != me;
+}
+
 /// Under parallel Sema, `analysis_in_progress` is per-OS-thread (lock-free).
 threadlocal var tls_aip: std.AutoArrayHashMapUnmanaged(AnalUnit, void) = .empty;
 /// Set by `ensureNavResolved` when a dependency loop is detected under
@@ -4651,9 +4664,26 @@ pub fn navFileScope(zcu: *Zcu, nav: InternPool.Nav.Index) *File {
 
 pub fn navShard(zcu: *Zcu, nav: InternPool.Nav.Index, n: u32) u32 {
     if (n <= 1) return 0;
+    return zcu.navFileScope(nav).computeShard(n);
+}
+
+/// Returns the LLVM codegen shard that owns `unit`. Module-level assembly is
+/// keyed by `AnalUnit`; routing each asm string to the same shard as the
+/// same-file navs it references (e.g. `.set` alias targets) lets the integrated
+/// assembler resolve those symbols and avoids emitting any string twice.
+pub fn analUnitShard(zcu: *Zcu, unit: AnalUnit, n: u32) u32 {
+    if (n <= 1) return 0;
     const ip = &zcu.intern_pool;
-    const fqn = ip.getNav(nav).fqn.toSlice(ip);
-    return @intCast(std.hash.Wyhash.hash(0, fqn) % n);
+    return switch (unit.unwrap()) {
+        .@"comptime" => |cu_id| s: {
+            const cu = ip.getComptimeUnit(cu_id);
+            const resolved = cu.zir_index.resolveFull(ip) orelse break :s 0;
+            break :s zcu.fileByIndex(resolved.file).computeShard(n);
+        },
+        .nav_val, .nav_ty => |nav| zcu.navShard(nav, n),
+        .func => |func| zcu.navShard(zcu.funcInfo(func).owner_nav, n),
+        .type, .memoized_state => 0,
+    };
 }
 
 pub fn fmtAnalUnit(zcu: *Zcu, unit: AnalUnit) std.fmt.Formatter(FormatAnalUnit, formatAnalUnit) {

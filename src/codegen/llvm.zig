@@ -554,13 +554,16 @@ pub const PartitionSet = struct {
         exported: Zcu.Exported,
         export_indices: []const Zcu.Export.Index,
     ) link.File.UpdateExportsError!void {
-        const shard: u32 = switch (exported) {
-            .nav => |nav| pt.zcu.navShard(nav, self.n),
-            .uav => 0,
-        };
-        self.mutexes[shard].lock();
-        defer self.mutexes[shard].unlock();
-        return self.objects[shard].updateExports(pt, exported, export_indices);
+        // Route to every shard: the owning shard emits the definition and
+        // aliases; non-owning shards collapse any bare extern declarations
+        // they hold for these export names onto one canonical decl so LLVM
+        // cannot constant-fold `icmp eq @a, @b` between distinct externs to
+        // `false` before the linker has a chance to unify them.
+        for (self.objects, self.mutexes) |obj, *m| {
+            m.lock();
+            defer m.unlock();
+            try obj.updateExports(pt, exported, export_indices);
+        }
     }
 
     pub fn emit(self: *PartitionSet, pt: Zcu.PerThread, options: Object.EmitOptions) error{ LinkFailure, OutOfMemory }!void {
@@ -928,11 +931,13 @@ pub const Object = struct {
     }
 
     fn genModuleLevelAssembly(object: *Object, pt: Zcu.PerThread) Allocator.Error!void {
-        if (object.isSharded() and object.partition_id != 0) return;
         const b = &object.builder;
         const gpa = b.gpa;
+        const zcu = pt.zcu;
         b.module_asm.clearRetainingCapacity();
-        for (pt.zcu.global_assembly.values()) |assembly| {
+        const n: u32 = if (object.partition_set) |ps| ps.n else 1;
+        for (zcu.global_assembly.keys(), zcu.global_assembly.values()) |unit, assembly| {
+            if (zcu.analUnitShard(unit, n) != object.partition_id) continue;
             try b.module_asm.ensureUnusedCapacity(gpa, assembly.len + 1);
             b.module_asm.appendSliceAssumeCapacity(assembly);
             b.module_asm.appendAssumeCapacity('\n');
@@ -1809,15 +1814,76 @@ pub const Object = struct {
         export_indices: []const Zcu.Export.Index,
     ) link.File.UpdateExportsError!void {
         const zcu = pt.zcu;
+        const ip = &zcu.intern_pool;
         const nav_index = switch (exported) {
             .nav => |nav| nav,
             .uav => |uav| {
-                if (self.isSharded() and self.partition_id != 0) return;
+                if (self.isSharded() and self.partition_id != 0) {
+                    // Non-owning shard: collapse any extern decls held for these
+                    // export names onto this shard's `__anon_{idx}` so address
+                    // comparisons survive InstCombine. If this shard never
+                    // referenced the uav directly there is nothing local to
+                    // compare against, so skip.
+                    const canonical = self.uav_map.get(uav) orelse return;
+                    for (export_indices) |export_idx| {
+                        const exp_name = export_idx.ptr(zcu).opts.name.toSlice(ip);
+                        const s = self.builder.strtabStringIfExists(exp_name) orelse continue;
+                        const existing = self.builder.getGlobal(s) orelse continue;
+                        if (existing == canonical) continue;
+                        switch (existing.ptrConst(&self.builder).kind) {
+                            .variable, .function => {
+                                try existing.rename(.empty, &self.builder);
+                                try existing.replace(canonical, &self.builder);
+                            },
+                            .alias, .replaced => {},
+                        }
+                    }
+                    return;
+                }
                 return updateExportedValue(self, pt, uav, export_indices);
             },
         };
-        if (!self.ownsNav(zcu, nav_index)) return;
-        const ip = &zcu.intern_pool;
+        if (!self.ownsNav(zcu, nav_index)) {
+            // Non-owning shard may hold bare extern decls for one or more of
+            // these export names (created by resolveGlobalNav/resolveLlvmFunction
+            // on the synthetic extern owner Nav). LLVM constant-folds
+            // `icmp eq @a, @b` to `false` for any two distinct external
+            // GlobalValues, so collapse them onto one canonical declaration of
+            // the underlying nav — the same `{fqn}__N{idx}` symbol the owning
+            // shard exports its definition under.
+            if (export_indices.len == 0) return;
+            var any = false;
+            for (export_indices) |export_idx| {
+                const exp_name = export_idx.ptr(zcu).opts.name.toSlice(ip);
+                if (self.builder.strtabStringIfExists(exp_name)) |s|
+                    if (self.builder.getGlobal(s) != null) {
+                        any = true;
+                        break;
+                    };
+            }
+            if (!any) return;
+            const nav = ip.getNav(nav_index);
+            const is_fn = ip.isFunctionType(nav.typeOf(ip));
+            const canonical: Builder.Global.Index = if (is_fn)
+                (try self.resolveLlvmFunction(pt, nav_index)).ptrConst(&self.builder).global
+            else
+                (try self.resolveGlobalNav(pt, nav_index)).ptrConst(&self.builder).global;
+            canonical.setUnnamedAddr(.default, &self.builder);
+            for (export_indices) |export_idx| {
+                const exp_name = export_idx.ptr(zcu).opts.name.toSlice(ip);
+                const s = self.builder.strtabStringIfExists(exp_name) orelse continue;
+                const existing = self.builder.getGlobal(s) orelse continue;
+                if (existing == canonical) continue;
+                switch (existing.ptrConst(&self.builder).kind) {
+                    .variable, .function => {
+                        try existing.rename(.empty, &self.builder);
+                        try existing.replace(canonical, &self.builder);
+                    },
+                    .alias, .replaced => {},
+                }
+            }
+            return;
+        }
         const global_index = self.nav_map.get(nav_index) orelse gi: {
             // The nav was exported but its `link_nav` / `codegen_func` job
             // never ran (likely a post-commit retry under parallel Sema dropping
@@ -1916,7 +1982,13 @@ pub const Object = struct {
             try variable_index.setInitializer(init_val, &o.builder);
             if (o.isSharded()) {
                 variable_index.setLinkage(.linkonce_odr, &o.builder);
-                variable_index.setVisibility(.hidden, &o.builder);
+                if (o.target.ofmt == .coff) {
+                    // See resolveGlobalUav: COFF needs an explicit comdat for
+                    // linkonce_odr to dedup across shard objects.
+                    variable_index.setComdat(try o.builder.addComdat(def_name, .any), &o.builder);
+                } else {
+                    variable_index.setVisibility(.hidden, &o.builder);
+                }
                 variable_index.setMutability(.constant, &o.builder);
             }
             break :i global_index;
@@ -3343,8 +3415,9 @@ pub const Object = struct {
         const zcu = pt.zcu;
         const decl_ty = zcu.intern_pool.typeOf(uav);
 
+        const def_name = try o.builder.strtabStringFmt("__anon_{d}", .{@intFromEnum(uav)});
         const variable_index = try o.builder.addVariable(
-            try o.builder.strtabStringFmt("__anon_{d}", .{@intFromEnum(uav)}),
+            def_name,
             try o.lowerType(pt, Type.fromInterned(decl_ty)),
             llvm_addr_space,
         );
@@ -3357,7 +3430,15 @@ pub const Object = struct {
             // canonical definition per `__anon_{ip_index}` and let the linker
             // coalesce duplicates so every shard sees the same address.
             variable_index.setLinkage(.linkonce_odr, &o.builder);
-            variable_index.setVisibility(.hidden, &o.builder);
+            // ELF/Wasm lower linkonce_odr to a weak definition automatically; COFF
+            // does not, so without an explicit comdat lld-link sees N strong
+            // `__anon_N` symbols and rejects the link. MachO forbids comdats but
+            // also coalesces linkonce_odr on its own.
+            if (o.target.ofmt == .coff) {
+                variable_index.setComdat(try o.builder.addComdat(def_name, .any), &o.builder);
+            } else {
+                variable_index.setVisibility(.hidden, &o.builder);
+            }
         } else {
             variable_index.setLinkage(.internal, &o.builder);
         }
