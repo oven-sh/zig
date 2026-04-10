@@ -2273,7 +2273,7 @@ fn buildOutputType(
                                 mod_opts.sanitize_thread = enable;
                                 recognized_any = true;
                             } else if (mem.eql(u8, sub_arg, "address")) {
-                                mod_opts.sanitize_address = true;
+                                mod_opts.sanitize_address = enable;
                                 recognized_any = true;
                             } else if (mem.eql(u8, sub_arg, "fuzzer") or mem.eql(u8, sub_arg, "fuzzer-no-link")) {
                                 mod_opts.fuzz = enable;

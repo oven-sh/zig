@@ -566,10 +566,18 @@ pub fn hasRuntimeBitsInner(
             },
             .struct_type => {
                 const struct_type = ip.loadStructType(ty.toIntern());
-                if (strat != .eager and struct_type.assumeRuntimeBitsIfFieldTypesWip(ip)) {
-                    // In this case, we guess that hasRuntimeBits() for this type is true,
-                    // and then later if our guess was incorrect, we emit a compile error.
-                    return true;
+                if (strat != .eager) {
+                    // Under parallel Sema, .field_types_wip may belong to another worker
+                    // (the queued resolve_type_fully job). Only treat it as self-recursion
+                    // if WE hold the claim; otherwise fall through to resolveFields which
+                    // will block on claimOrWait instead of poisoning assumed_runtime_bits.
+                    if (!zcu.isClaimedByOther(.wrap(.{ .type = ty.toIntern() })) and
+                        struct_type.assumeRuntimeBitsIfFieldTypesWip(ip))
+                    {
+                        // In this case, we guess that hasRuntimeBits() for this type is true,
+                        // and then later if our guess was incorrect, we emit a compile error.
+                        return true;
+                    }
                 }
                 switch (strat) {
                     .sema => try ty.resolveFields(strat.pt(zcu, tid)),
@@ -603,9 +611,17 @@ pub fn hasRuntimeBitsInner(
                 const union_flags = union_type.flagsUnordered(ip);
                 switch (union_flags.runtime_tag) {
                     .none => if (strat != .eager) {
-                        // In this case, we guess that hasRuntimeBits() for this type is true,
-                        // and then later if our guess was incorrect, we emit a compile error.
-                        if (union_type.assumeRuntimeBitsIfFieldTypesWip(ip)) return true;
+                        // Under parallel Sema, .field_types_wip may belong to another worker
+                        // (the queued resolve_type_fully job). Only treat it as self-recursion
+                        // if WE hold the claim; otherwise fall through to resolveFields which
+                        // will block on claimOrWait instead of poisoning assumed_runtime_bits.
+                        if (!zcu.isClaimedByOther(.wrap(.{ .type = ty.toIntern() })) and
+                            union_type.assumeRuntimeBitsIfFieldTypesWip(ip))
+                        {
+                            // In this case, we guess that hasRuntimeBits() for this type is true,
+                            // and then later if our guess was incorrect, we emit a compile error.
+                            return true;
+                        }
                     },
                     .safety, .tagged => {},
                 }
@@ -2830,7 +2846,13 @@ pub fn comptimeOnlyInner(
                         .no, .wip => false,
                         .yes => true,
                         .unknown => {
-                            if (struct_type.flagsUnordered(ip).field_types_wip) {
+                            // Under parallel Sema, .field_types_wip set by another worker is
+                            // concurrent progress, not self-recursion: fall through to
+                            // resolveFields (which blocks on claimOrWait) rather than
+                            // guessing `false` and caching a wrong requires_comptime.
+                            if (struct_type.flagsUnordered(ip).field_types_wip and
+                                !zcu.isClaimedByOther(.wrap(.{ .type = ty.toIntern() })))
+                            {
                                 struct_type.setRequiresComptime(ip, .unknown);
                                 return false;
                             }
@@ -2891,7 +2913,13 @@ pub fn comptimeOnlyInner(
                         .no, .wip => return false,
                         .yes => return true,
                         .unknown => {
-                            if (union_type.flagsUnordered(ip).status == .field_types_wip) {
+                            // Under parallel Sema, .field_types_wip set by another worker is
+                            // concurrent progress, not self-recursion: fall through to
+                            // resolveFields (which blocks on claimOrWait) rather than
+                            // guessing `false` and caching a wrong requires_comptime.
+                            if (union_type.flagsUnordered(ip).status == .field_types_wip and
+                                !zcu.isClaimedByOther(.wrap(.{ .type = ty.toIntern() })))
+                            {
                                 union_type.setRequiresComptime(ip, .unknown);
                                 return false;
                             }
