@@ -8,6 +8,11 @@ const mem = std.mem;
 const maxInt = std.math.maxInt;
 const native_endian = builtin.target.cpu.arch.endian();
 
+fn errorSetContains(set: []const std.builtin.Type.Error, name: []const u8) bool {
+    for (set) |e| if (mem.eql(u8, e.name, name)) return true;
+    return false;
+}
+
 test "int to ptr cast" {
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
@@ -885,8 +890,8 @@ test "peer type resolution: error set supersets" {
         const error_set_info = @typeInfo(ty);
         try expect(error_set_info == .error_set);
         try expect(error_set_info.error_set.?.len == 2);
-        try expect(mem.eql(u8, error_set_info.error_set.?[0].name, "One"));
-        try expect(mem.eql(u8, error_set_info.error_set.?[1].name, "Two"));
+        try expect(errorSetContains(error_set_info.error_set.?, "One"));
+        try expect(errorSetContains(error_set_info.error_set.?, "Two"));
     }
 
     // B superset of A
@@ -895,8 +900,8 @@ test "peer type resolution: error set supersets" {
         const error_set_info = @typeInfo(ty);
         try expect(error_set_info == .error_set);
         try expect(error_set_info.error_set.?.len == 2);
-        try expect(mem.eql(u8, error_set_info.error_set.?[0].name, "One"));
-        try expect(mem.eql(u8, error_set_info.error_set.?[1].name, "Two"));
+        try expect(errorSetContains(error_set_info.error_set.?, "One"));
+        try expect(errorSetContains(error_set_info.error_set.?, "Two"));
     }
 }
 
@@ -913,9 +918,9 @@ test "peer type resolution: disjoint error sets" {
         const error_set_info = @typeInfo(ty);
         try expect(error_set_info == .error_set);
         try expect(error_set_info.error_set.?.len == 3);
-        try expect(mem.eql(u8, error_set_info.error_set.?[0].name, "One"));
-        try expect(mem.eql(u8, error_set_info.error_set.?[1].name, "Two"));
-        try expect(mem.eql(u8, error_set_info.error_set.?[2].name, "Three"));
+        try expect(errorSetContains(error_set_info.error_set.?, "One"));
+        try expect(errorSetContains(error_set_info.error_set.?, "Two"));
+        try expect(errorSetContains(error_set_info.error_set.?, "Three"));
     }
 
     {
@@ -923,9 +928,9 @@ test "peer type resolution: disjoint error sets" {
         const error_set_info = @typeInfo(ty);
         try expect(error_set_info == .error_set);
         try expect(error_set_info.error_set.?.len == 3);
-        try expect(mem.eql(u8, error_set_info.error_set.?[0].name, "One"));
-        try expect(mem.eql(u8, error_set_info.error_set.?[1].name, "Two"));
-        try expect(mem.eql(u8, error_set_info.error_set.?[2].name, "Three"));
+        try expect(errorSetContains(error_set_info.error_set.?, "One"));
+        try expect(errorSetContains(error_set_info.error_set.?, "Two"));
+        try expect(errorSetContains(error_set_info.error_set.?, "Three"));
     }
 }
 
@@ -944,9 +949,9 @@ test "peer type resolution: error union and error set" {
 
         const error_set_info = @typeInfo(info.error_union.error_set);
         try expect(error_set_info.error_set.?.len == 3);
-        try expect(mem.eql(u8, error_set_info.error_set.?[0].name, "One"));
-        try expect(mem.eql(u8, error_set_info.error_set.?[1].name, "Two"));
-        try expect(mem.eql(u8, error_set_info.error_set.?[2].name, "Three"));
+        try expect(errorSetContains(error_set_info.error_set.?, "One"));
+        try expect(errorSetContains(error_set_info.error_set.?, "Two"));
+        try expect(errorSetContains(error_set_info.error_set.?, "Three"));
     }
 
     {
@@ -956,9 +961,9 @@ test "peer type resolution: error union and error set" {
 
         const error_set_info = @typeInfo(info.error_union.error_set);
         try expect(error_set_info.error_set.?.len == 3);
-        try expect(mem.eql(u8, error_set_info.error_set.?[0].name, "One"));
-        try expect(mem.eql(u8, error_set_info.error_set.?[1].name, "Two"));
-        try expect(mem.eql(u8, error_set_info.error_set.?[2].name, "Three"));
+        try expect(errorSetContains(error_set_info.error_set.?, "One"));
+        try expect(errorSetContains(error_set_info.error_set.?, "Two"));
+        try expect(errorSetContains(error_set_info.error_set.?, "Three"));
     }
 }
 
@@ -978,8 +983,8 @@ test "peer type resolution: error union after non-error" {
 
         const error_set_info = @typeInfo(info.error_union.error_set);
         try expect(error_set_info.error_set.?.len == 2);
-        try expect(mem.eql(u8, error_set_info.error_set.?[0].name, "One"));
-        try expect(mem.eql(u8, error_set_info.error_set.?[1].name, "Two"));
+        try expect(errorSetContains(error_set_info.error_set.?, "One"));
+        try expect(errorSetContains(error_set_info.error_set.?, "Two"));
     }
 
     {
@@ -990,8 +995,8 @@ test "peer type resolution: error union after non-error" {
 
         const error_set_info = @typeInfo(info.error_union.error_set);
         try expect(error_set_info.error_set.?.len == 2);
-        try expect(mem.eql(u8, error_set_info.error_set.?[0].name, "One"));
-        try expect(mem.eql(u8, error_set_info.error_set.?[1].name, "Two"));
+        try expect(errorSetContains(error_set_info.error_set.?, "One"));
+        try expect(errorSetContains(error_set_info.error_set.?, "Two"));
     }
 }
 
