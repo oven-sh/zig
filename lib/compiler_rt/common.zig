@@ -119,8 +119,6 @@ pub fn F16T(comptime OtherType: type) type {
         .armeb,
         .thumb,
         .thumbeb,
-        .aarch64,
-        .aarch64_be,
         .nvptx,
         .nvptx64,
         .riscv32,
@@ -128,6 +126,16 @@ pub fn F16T(comptime OtherType: type) type {
         .spirv32,
         .spirv64,
         => f16,
+        .aarch64, .aarch64_be => if (builtin.target.os.tag.isDarwin()) switch (OtherType) {
+            // Apple's libcompiler_rt (shipped in libSystem) is built without
+            // COMPILER_RT_HAS_FLOAT16, so its __extendhfsf2/__truncsfhf2/
+            // __extendhfdf2/__truncdfhf2 use the legacy uint16_t-in-GPR ABI
+            // rather than _Float16-in-FPR. Match that so we interoperate
+            // regardless of which compiler_rt wins at link time.
+            f32, f64 => u16,
+            f80, f128 => f16,
+            else => unreachable,
+        } else f16,
         .hexagon => if (builtin.target.cpu.has(.hexagon, .v68)) f16 else u16,
         .x86, .x86_64 => if (builtin.target.os.tag.isDarwin()) switch (OtherType) {
             // Starting with LLVM 16, Darwin uses different abi for f16
