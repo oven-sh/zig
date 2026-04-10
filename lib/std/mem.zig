@@ -1105,11 +1105,13 @@ extern "c" fn wcslen(s: [*:0]const u16) usize;
 extern "c" fn strlen(s: [*:0]const u8) usize;
 
 pub fn indexOfSentinel(comptime T: type, comptime sentinel: T, p: [*:sentinel]const T) usize {
-    if (comptime builtin.link_libc and T == u16 and sentinel == 0 and builtin.target.os.tag == .windows) {
-        return wcslen(p);
-    }
-    if (comptime builtin.link_libc and T == u8 and sentinel == 0) {
-        return strlen(p);
+    if (!@inComptime() and builtin.zig_backend != .stage2_c) {
+        if (comptime builtin.link_libc and T == u16 and sentinel == 0 and builtin.target.os.tag == .windows) {
+            return wcslen(p);
+        }
+        if (comptime builtin.link_libc and T == u8 and sentinel == 0) {
+            return strlen(p);
+        }
     }
 
     var i: usize = 0;

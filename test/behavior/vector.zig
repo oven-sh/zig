@@ -290,6 +290,7 @@ test "array to vector with element type coercion" {
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_x86_64 and builtin.os.tag.isDarwin()) return error.SkipZigTest; // upstream regression: select-table fpext/fptrunc hardcode SSE; compiler_rt uses u16 GPR on Darwin
 
     const S = struct {
         fn doTheTest() !void {

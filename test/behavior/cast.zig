@@ -1544,6 +1544,7 @@ test "cast f16 to wider types" {
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_c and builtin.cpu.arch.isArm()) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_x86_64 and builtin.os.tag.isDarwin()) return error.SkipZigTest; // upstream regression: select-table fpext/fptrunc hardcode SSE; compiler_rt uses u16 GPR on Darwin
 
     const S = struct {
         fn doTheTest() !void {

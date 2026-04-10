@@ -3283,7 +3283,7 @@ typedef uint16_t zig_f16;
 #undef zig_init_special_f16
 #define zig_init_special_f16(sign, name, arg, repr) repr
 #endif
-#if defined(zig_darwin) && defined(zig_x86)
+#if defined(zig_darwin) && (defined(zig_x86) || defined(zig_aarch64))
 typedef uint16_t zig_compiler_rt_f16;
 #else
 typedef zig_f16 zig_compiler_rt_f16;
@@ -3476,7 +3476,7 @@ zig_bitCast_float(f128, zig_u128)
         extern_res = zig_expand_concat(zig_expand_concat(zig_expand_concat(__##operation, \
             zig_compiler_rt_abbrev_##ArgType), zig_compiler_rt_abbrev_##ResType), version)(extern_arg); \
         memcpy(&res, &extern_res, sizeof(res)); \
-        return extern_res; \
+        return res; \
     }
 zig_convert_builtin(zig_compiler_rt_f16, zig_f16,   trunc, zig_f32,             zig_f32,  2)
 zig_convert_builtin(zig_compiler_rt_f16, zig_f16,   trunc, zig_f64,             zig_f64,  2)
