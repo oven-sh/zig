@@ -31503,12 +31503,17 @@ fn analyzeNavRefInner(sema: *Sema, block: *Block, src: LazySrcLoc, orig_nav_inde
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
 
-    // Under parallel Sema another thread may transition the nav from
-    // .type_resolved → .fully_resolved between our ensureNavResolved and
-    // the getNav below, leaving a torn read in `isExternOrFn`. Fully
-    // resolving here serialises via claimOrWait so the subsequent getNav
-    // observes a stable status.
-    try sema.ensureNavResolved(block, src, orig_nav_index, if (is_ref and !zcu.parallel_sema) .type else .fully);
+    // For `is_ref` we resolve only `.type`: self-referential globals
+    // (`const foo: T = .{ .self = &foo }`) require the lazy nav-ptr path
+    // below, which only needs the type. Forcing `.fully` here under
+    // parallel_sema made `semaAipContains(.nav_val)` fire on the in-progress
+    // unit and retry-exhaust into a spurious "dependency loop detected".
+    // A concurrent .type_resolved -> .fully_resolved transition between
+    // here and the `getNav` below is harmless: `getNav` returns a by-value
+    // snapshot, `isExternOrFn` and the status switches below handle both
+    // arms, and the extern/fn branch re-ensures `.fully` before reading
+    // `.fully_resolved.val`.
+    try sema.ensureNavResolved(block, src, orig_nav_index, if (is_ref) .type else .fully);
 
     const nav_index = nav: {
         if (ip.getNav(orig_nav_index).isExternOrFn(ip)) {
