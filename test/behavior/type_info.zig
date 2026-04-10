@@ -9,6 +9,11 @@ const assert = std.debug.assert;
 const expect = std.testing.expect;
 const expectEqualStrings = std.testing.expectEqualStrings;
 
+fn errorSetContains(set: []const Type.Error, name: []const u8) bool {
+    for (set) |e| if (mem.eql(u8, e.name, name)) return true;
+    return false;
+}
+
 test "type info: integer, floating point type info" {
     try testIntFloat();
     try comptime testIntFloat();
@@ -176,7 +181,9 @@ fn testErrorSet() !void {
     const error_set_info = @typeInfo(TestErrorSet);
     try expect(error_set_info == .error_set);
     try expect(error_set_info.error_set.?.len == 3);
-    try expect(mem.eql(u8, error_set_info.error_set.?[0].name, "First"));
+    try expect(errorSetContains(error_set_info.error_set.?, "First"));
+    try expect(errorSetContains(error_set_info.error_set.?, "Second"));
+    try expect(errorSetContains(error_set_info.error_set.?, "Third"));
 
     const error_union_info = @typeInfo(TestErrorSet!usize);
     try expect(error_union_info == .error_union);
@@ -211,9 +218,9 @@ test "type info: error set merged" {
     const error_set_info = @typeInfo(TestSet);
     try expect(error_set_info == .error_set);
     try expect(error_set_info.error_set.?.len == 3);
-    try expect(mem.eql(u8, error_set_info.error_set.?[0].name, "One"));
-    try expect(mem.eql(u8, error_set_info.error_set.?[1].name, "Two"));
-    try expect(mem.eql(u8, error_set_info.error_set.?[2].name, "Three"));
+    try expect(errorSetContains(error_set_info.error_set.?, "One"));
+    try expect(errorSetContains(error_set_info.error_set.?, "Two"));
+    try expect(errorSetContains(error_set_info.error_set.?, "Three"));
 }
 
 test "type info: enum info" {
