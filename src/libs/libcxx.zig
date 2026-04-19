@@ -522,18 +522,18 @@ pub fn addCxxArgs(
         abi_version,
     }));
     try cflags.append(try std.fmt.allocPrint(arena, "-D_LIBCPP_HAS_THREADS={d}", .{
-        @as(u1, if (comp.config.any_non_single_threaded) 1 else 0),
+        @intFromBool(comp.config.any_non_single_threaded),
     }));
     try cflags.append("-D_LIBCPP_HAS_MONOTONIC_CLOCK");
     try cflags.append("-D_LIBCPP_HAS_TERMINAL");
     try cflags.append(try std.fmt.allocPrint(arena, "-D_LIBCPP_HAS_MUSL_LIBC={d}", .{
-        @as(u1, if (target.abi.isMusl()) 1 else 0),
+        @intFromBool(target.abi.isMusl()),
     }));
     try cflags.append("-D_LIBCXXABI_DISABLE_VISIBILITY_ANNOTATIONS");
     try cflags.append("-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS");
     try cflags.append("-D_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS=0");
     try cflags.append(try std.fmt.allocPrint(arena, "-D_LIBCPP_HAS_FILESYSTEM={d}", .{
-        @as(u1, if (target.os.tag == .wasi) 0 else 1),
+        @intFromBool(target.os.tag != .wasi),
     }));
     try cflags.append("-D_LIBCPP_HAS_RANDOM_DEVICE");
     try cflags.append("-D_LIBCPP_HAS_LOCALIZATION");

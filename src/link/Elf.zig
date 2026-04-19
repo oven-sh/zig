@@ -771,33 +771,12 @@ fn flushInner(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id) !void {
         return;
     }
 
-    const zcu_obj_path: ?Path = if (self.base.zcu_object_basename) |raw| p: {
-        break :p try comp.resolveEmitPathFlush(arena, .temp, raw);
-    } else null;
-
     if (self.zigObjectPtr()) |zig_object| try zig_object.flush(self, tid);
 
-    // Parse LLVM-generated object file(s)
-    if (zcu_obj_path) |path| {
-        const partition_count = self.base.zcu_object_partition_count;
-        if (partition_count > 1) {
-            // Parallel codegen: parse all partition files
-            const base_path = path.sub_path;
-            const base_name = if (std.mem.endsWith(u8, base_path, ".o"))
-                base_path[0 .. base_path.len - 2]
-            else
-                base_path;
-
-            for (0..partition_count) |i| {
-                const partition_path: Path = .{
-                    .root_dir = path.root_dir,
-                    .sub_path = try std.fmt.allocPrint(arena, "{s}.{d}.o", .{ base_name, i }),
-                };
-                openParseObjectReportingFailure(self, partition_path);
-            }
-        } else {
-            openParseObjectReportingFailure(self, path);
-        }
+    // Parse LLVM-generated object file(s); helper expands to N partition paths
+    // when parallel codegen produced multiple shards.
+    for (try self.base.resolveZcuObjectPaths(arena)) |path| {
+        openParseObjectReportingFailure(self, path);
     }
 
     switch (comp.config.output_mode) {

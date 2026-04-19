@@ -79,26 +79,30 @@ codegen_prog_node: std.Progress.Node = .none,
 sema_lock: std.Thread.Mutex = .{},
 sema_lock_owner: std.atomic.Value(std.Thread.Id) = .init(no_sema_owner),
 sema_lock_depth: u32 = 0,
-/// Signalled whenever a claim in `unit_claims` is released.
-sema_claim_cond: std.Thread.Condition = .{},
-/// AnalUnits currently being analysed by some worker; value is the owning tid.
-/// Guarded by `sema_lock`. A worker that finds an entry here for a unit it
-/// needs waits on `sema_claim_cond` until the entry is removed.
-unit_claims: std.AutoHashMapUnmanaged(AnalUnit, std.Thread.Id) = .empty,
+/// Per-unit claim state, sharded by `claimShardIndex(unit)` so the
+/// `tryClaim`/`claimOrWait`/`releaseClaim` hot path (one call per
+/// analyzed body, ~180k for behavior tests, plus ~250k nested waits) only
+/// contends with units that hash to the same shard.
+unit_claim_shards: [unit_claim_shard_count]UnitClaimShard = @splat(.{}),
 /// Tracks which unit each thread is currently waiting on, for deadlock
-/// detection in `claimOrWait`. Guarded by `sema_lock`.
+/// detection in `claimOrWait`. Guarded by `claim_waits_mutex`; separate
+/// from the shards because the chain walk crosses shards.
 claim_waits: std.AutoHashMapUnmanaged(std.Thread.Id, AnalUnit) = .empty,
+claim_waits_mutex: std.Thread.Mutex = .{},
 /// Per-unit retry count for order-dependent dependency loops, to avoid
 /// livelock on a true source-level cycle. Guarded by `sema_lock`.
 sema_retry_counts: std.AutoHashMapUnmanaged(AnalUnit, u8) = .empty,
 sema_pending_jobs: std.atomic.Value(u32) = .init(0),
+/// Debug counters; printed under ZIG_PSEMA_STATS.
+psema_body_runs: std.atomic.Value(u64) = .init(0),
+psema_yields: std.atomic.Value(u64) = .init(0),
+psema_claim_waits: std.atomic.Value(u64) = .init(0),
+psema_dispatched: std.atomic.Value(u64) = .init(0),
+psema_skip_busy: std.atomic.Value(u64) = .init(0),
+psema_skip_done: std.atomic.Value(u64) = .init(0),
 /// Guards `inline_reference_frames` / `free_inline_reference_frames` so that
 /// the very hot `Inlining.refFrame` path does not contend on `sema_lock`.
 inline_ref_mutex: std.Thread.Mutex = .{},
-/// Guards `unit_claims` / `claim_waits` so `claimOrWait` does not contend on
-/// `sema_lock` (the entry-lock at ensureFuncBodyUpToDate was the hottest
-/// contention site at 12.4 s × 15 684 stalls).
-unit_claims_mutex: std.Thread.Mutex = .{},
 /// Guards `failed_analysis` + `transitive_failed_analysis`.
 failed_analysis_mutex: std.Thread.Mutex = .{},
 /// Guards `reference_table` / `all_references` / `free_references` and the
@@ -121,6 +125,13 @@ test_functions_mutex: std.Thread.Mutex = .{},
 cimport_errors_mutex: std.Thread.Mutex = .{},
 /// Guards `sema_retry_counts`.
 sema_retry_mutex: std.Thread.Mutex = .{},
+/// Funcs whose analysis yielded waiting on the keyed unit. When the key
+/// unit's claim is released, these are re-queued (not before — re-running
+/// the caller's body before the dependency is resolved just yields again).
+/// Guards `embed_table` and the `*EmbedFile` payloads it owns.
+embed_mutex: std.Thread.Mutex = .{},
+/// Guards `global_assembly`.
+global_assembly_mutex: std.Thread.Mutex = .{},
 /// Guards `compile_logs` + `compile_log_lines` + `free_compile_log_lines`.
 compile_log_mutex: std.Thread.Mutex = .{},
 /// True while parallel Sema is enabled for this update.
@@ -872,6 +883,11 @@ pub const Namespace = struct {
     /// All `test` declarations in this namespace. We store these purely so that incremental
     /// compilation can re-use the existing `Nav`s when a namespace changes.
     test_decls: std.ArrayListUnmanaged(InternPool.Nav.Index) = .empty,
+    /// Guards `pub_decls`/`priv_decls`/`comptime_decls`/`test_decls`/`generation`
+    /// under `parallel_sema`. `scanNamespace` is the only writer; readers are
+    /// `Sema.lookupInNamespace` and namespace iterators. Per-namespace so two
+    /// independent type decls don't serialise on the global `sema_lock`.
+    decls_mutex: std.Thread.Mutex = .{},
 
     pub const Index = InternPool.NamespaceIndex;
     pub const OptionalIndex = InternPool.OptionalNamespaceIndex;
@@ -2859,7 +2875,11 @@ pub fn deinit(zcu: *Zcu) void {
         for (zcu.failed_codegen.values()) |value| value.destroy(gpa);
         for (zcu.failed_types.values()) |value| value.destroy(gpa);
         zcu.analysis_in_progress.deinit(gpa);
-        zcu.unit_claims.deinit(gpa);
+        for (&zcu.unit_claim_shards) |*s| {
+            s.map.deinit(gpa);
+            for (s.deferred.values()) |*v| v.deinit(gpa);
+            s.deferred.deinit(gpa);
+        }
         zcu.claim_waits.deinit(gpa);
         zcu.sema_retry_counts.deinit(gpa);
         zcu.failed_analysis.deinit(gpa);
@@ -3623,6 +3643,26 @@ pub const ImportResult = struct {
 
 pub const no_sema_owner: std.Thread.Id = std.math.maxInt(std.Thread.Id);
 
+pub const unit_claim_shard_count = 256;
+pub const UnitClaimShard = struct {
+    mutex: std.Thread.Mutex = .{},
+    /// Paired with `mutex`; signalled by `releaseClaim` for any unit in this
+    /// shard so waiters don't share a single global condvar.
+    cond: std.Thread.Condition = .{},
+    /// Units in this shard currently being analysed; value is the owning tid.
+    map: std.AutoHashMapUnmanaged(AnalUnit, std.Thread.Id) = .empty,
+    /// Funcs whose analysis yielded waiting on a unit in this shard.
+    deferred: std.AutoArrayHashMapUnmanaged(AnalUnit, std.ArrayListUnmanaged(InternPool.Index)) = .empty,
+    /// Count of threads currently parked on `cond`.
+    waiters: u32 = 0,
+};
+pub fn claimShardIndex(unit: AnalUnit) u8 {
+    return @truncate(std.hash.int(@as(u64, @bitCast(unit))));
+}
+pub fn claimShard(zcu: *Zcu, unit: AnalUnit) *UnitClaimShard {
+    return &zcu.unit_claim_shards[claimShardIndex(unit)];
+}
+
 /// Recursive acquire of `sema_lock` if parallel Sema is active. No-op otherwise.
 pub fn semaLock(zcu: *Zcu) void {
     if (!zcu.parallel_sema) return;
@@ -3684,74 +3724,163 @@ pub fn awaitNamespaceTypeFinished(zcu: *Zcu, ty: InternPool.Index) InternPool.Na
 pub fn awaitNamespaceTypeFinishedConst(zcu: *const Zcu, ty: InternPool.Index) InternPool.NamespaceTypeAwaitResult {
     if (!zcu.parallel_sema) return .finished;
     if (tls_wip_types.contains(ty)) return .finished;
+    // Another thread holds the wip. Spinning here while holding a
+    // `unit_claim` deadlocks if the wip owner's `resolveDeclaredEnum` (or
+    // similar) needs that claim. Check once and return `.would_block` so the
+    // caller yields-and-requeues; the requeue's queue depth provides natural
+    // backoff. Callers that cannot propagate `.would_block` (Type.getNamespace
+    // — reached only with already-finished types per its callers' contract)
+    // use `awaitNamespaceTypeFinishedSpin` instead.
+    return zcu.intern_pool.awaitNamespaceTypeFinishedBounded(ty, 1);
+}
+/// Unbounded spin for callers that cannot propagate `.would_block` (no
+/// `sema.owner` in scope to requeue). Prefer `awaitNamespaceTypeFinished`.
+pub fn awaitNamespaceTypeFinishedSpin(zcu: *const Zcu, ty: InternPool.Index) InternPool.NamespaceTypeAwaitResult {
+    if (!zcu.parallel_sema) return .finished;
+    if (tls_wip_types.contains(ty)) return .finished;
     return zcu.intern_pool.awaitNamespaceTypeFinished(ty);
 }
 
 /// Try to claim `unit` for analysis on behalf of `tid`. Returns:
 ///  - `.claimed` if the caller now owns analysis of this unit and must call
 ///    `releaseClaim` when done.
-///  - `.recursed` if this thread already owns it (dependency-loop detection
-///    handled by caller as before via `analysis_in_progress`).
+///  - `.recursed` if this thread already owns it, or a cross-thread wait
+///    chain leads back to a unit this thread holds.
 ///  - `.done` if another thread finished analysing it while we waited; caller
 ///    should re-read the unit's resolved status and return.
-/// Uses its own `unit_claims_mutex`; may temporarily release any held
-/// `sema_lock` while waiting on the per-unit condvar.
+/// Locks only `unit`'s shard for the hot path; `claim_waits_mutex` is taken
+/// only when actually parking (rare relative to total calls).
 pub fn claimOrWait(zcu: *Zcu, unit: AnalUnit) Allocator.Error!enum { claimed, recursed, done } {
     if (!zcu.parallel_sema) return .claimed;
     const me = std.Thread.getCurrentId();
-    zcu.unit_claims_mutex.lock();
-    defer zcu.unit_claims_mutex.unlock();
+    const shard = zcu.claimShard(unit);
+    shard.mutex.lock();
+    defer shard.mutex.unlock();
     while (true) {
-        const gop = try zcu.unit_claims.getOrPut(zcu.gpa, unit);
+        const gop = try shard.map.getOrPut(zcu.gpa, unit);
         if (!gop.found_existing) {
             gop.value_ptr.* = me;
             return .claimed;
         }
         if (gop.value_ptr.* == me) return .recursed;
-        var chain_unit = unit;
-        var hops: u32 = 0;
-        while (hops < 64) : (hops += 1) {
-            const holder = zcu.unit_claims.get(chain_unit) orelse break;
-            if (holder == me) return .recursed;
-            chain_unit = zcu.claim_waits.get(holder) orelse break;
-        }
-        // Another thread holds the claim; record our wait, fully release any
-        // held sema_lock, then sleep on the dedicated claims condvar.
-        try zcu.claim_waits.put(zcu.gpa, me, unit);
-        zcu.unit_claims_mutex.unlock();
-        const d = zcu.semaRelease();
-        zcu.unit_claims_mutex.lock();
-        // Lost-wakeup guard: holder may have released between our two locks.
-        if (zcu.unit_claims.contains(unit))
-            zcu.sema_claim_cond.wait(&zcu.unit_claims_mutex);
+        // Cycle detection: walk holder → its waited-on unit → that unit's
+        // holder, until we either reach ourselves (cycle) or a thread that
+        // isn't waiting. The chain crosses shards, so peek under each shard's
+        // mutex; lock order is shard(unit) then claim_waits then transient
+        // shard(chain_unit), and the transient lock is released before the
+        // next hop, so no two shard mutexes are held simultaneously.
+        if (zcu.detectClaimCycle(shard, gop.value_ptr.*, me)) return .recursed;
+        _ = zcu.psema_claim_waits.rmw(.Add, 1, .monotonic);
+        zcu.claim_waits_mutex.lock();
+        zcu.claim_waits.put(zcu.gpa, me, unit) catch {};
+        zcu.claim_waits_mutex.unlock();
+        // Under parallel non-incremental, `sema_lock` is never held so the
+        // wait is a single shard.cond round-trip. Under incremental,
+        // `parallel_sema` is gated off (`ensure*UpToDate` set
+        // `need_sema_lock = !parallel_sema || incremental` and the dispatch
+        // loop only spawns when `parallel_sema`), so d == 0 here always.
+        std.debug.assert(zcu.sema_lock_owner.load(.acquire) != me);
+        shard.waiters += 1;
+        shard.cond.wait(&shard.mutex);
+        shard.waiters -= 1;
+        zcu.claim_waits_mutex.lock();
         _ = zcu.claim_waits.remove(me);
-        zcu.unit_claims_mutex.unlock();
-        zcu.semaReacquire(d);
-        zcu.unit_claims_mutex.lock();
-        // After wake, check whether the unit is now resolved; if the claim is
-        // gone, another thread finished it.
-        if (!zcu.unit_claims.contains(unit)) return .done;
+        zcu.claim_waits_mutex.unlock();
+        if (!shard.map.contains(unit)) return .done;
     }
+}
+
+/// Walk the wait chain from `first_holder` and report whether it reaches `me`.
+fn detectClaimCycle(zcu: *Zcu, held_shard: *UnitClaimShard, first_holder: std.Thread.Id, me: std.Thread.Id) bool {
+    zcu.claim_waits_mutex.lock();
+    defer zcu.claim_waits_mutex.unlock();
+    var holder = first_holder;
+    var hops: u32 = 0;
+    while (hops < unit_claim_shard_count) : (hops += 1) {
+        const next_unit = zcu.claim_waits.get(holder) orelse return false;
+        const next_shard = zcu.claimShard(next_unit);
+        if (next_shard == held_shard) {
+            // Our shard (caller already holds its mutex): read directly.
+            holder = next_shard.map.get(next_unit) orelse return false;
+        } else if (next_shard.mutex.tryLock()) {
+            defer next_shard.mutex.unlock();
+            holder = next_shard.map.get(next_unit) orelse return false;
+        } else {
+            // A different shard is contended. Reading its map without the
+            // lock could fault mid-rehash; conservatively report no-cycle and
+            // retry on the next wake (a true cycle is stable so the next walk
+            // sees it; a false negative just delays detection one round).
+            return false;
+        }
+        if (holder == me) return true;
+    }
+    return false;
 }
 
 pub fn releaseClaim(zcu: *Zcu, unit: AnalUnit) void {
     if (!zcu.parallel_sema) return;
-    zcu.unit_claims_mutex.lock();
-    _ = zcu.unit_claims.remove(unit);
-    zcu.unit_claims_mutex.unlock();
-    zcu.sema_claim_cond.broadcast();
+    const shard = zcu.claimShard(unit);
+    shard.mutex.lock();
+    _ = shard.map.remove(unit);
+    const have_waiters = shard.waiters != 0;
+    var deferred_list: std.ArrayListUnmanaged(InternPool.Index) = if (shard.deferred.fetchSwapRemove(unit)) |kv| kv.value else .empty;
+    shard.mutex.unlock();
+    if (have_waiters) shard.cond.broadcast();
+    for (deferred_list.items) |func| {
+        zcu.comp.queueJob(.{ .analyze_func = func }) catch zcu.comp.setAllocFailure();
+    }
+    if (deferred_list.items.len != 0) {
+        _ = zcu.sema_pending_jobs.rmw(.Sub, @intCast(deferred_list.items.len), .release);
+    }
+    deferred_list.deinit(zcu.gpa);
+}
+
+/// Record that `waiter_func` yielded because `dep_unit` is held by another
+/// thread. `waiter_func` will be re-queued by `releaseClaim(dep_unit)`. Returns
+/// `true` if deferred; `false` if `dep_unit` was no longer claimed by the time
+/// we acquired the mutex, in which case the caller should re-queue immediately.
+pub fn deferOn(zcu: *Zcu, dep_unit: AnalUnit, waiter_func: InternPool.Index) Allocator.Error!bool {
+    if (!zcu.parallel_sema) return false;
+    const shard = zcu.claimShard(dep_unit);
+    shard.mutex.lock();
+    defer shard.mutex.unlock();
+    if (!shard.map.contains(dep_unit)) return false;
+    const gop = try shard.deferred.getOrPut(zcu.gpa, dep_unit);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    try gop.value_ptr.append(zcu.gpa, waiter_func);
+    return true;
+}
+
+/// Non-blocking variant of `claimOrWait`. Never sleeps; returns `.busy` if
+/// another thread holds the claim. Top-level dispatch (workerAnalyzeFunc) uses
+/// this so a worker that picks a duplicate-dispatched unit returns to the pool
+/// immediately instead of parking on `cond` for the duration of the holder's
+/// analysis. Nested callers that need the result still go through
+/// `claimOrWait` so its chain-walk catches cross-thread cycles.
+pub fn tryClaim(zcu: *Zcu, unit: AnalUnit) Allocator.Error!enum { claimed, recursed, busy } {
+    if (!zcu.parallel_sema) return .claimed;
+    const me = std.Thread.getCurrentId();
+    const shard = zcu.claimShard(unit);
+    shard.mutex.lock();
+    defer shard.mutex.unlock();
+    const gop = try shard.map.getOrPut(zcu.gpa, unit);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = me;
+        return .claimed;
+    }
+    if (gop.value_ptr.* == me) return .recursed;
+    return .busy;
 }
 
 /// Returns true if `unit` is currently claimed for analysis by a thread other
-/// than the caller. Used by `Sema.resolveInferredErrorSet` to yield-and-requeue
-/// instead of parking on `sema_claim_cond` when a dependency IES is already in
-/// progress on another worker.
+/// than the caller.
 pub fn isClaimedByOther(zcu: *Zcu, unit: AnalUnit) bool {
     if (!zcu.parallel_sema) return false;
     const me = std.Thread.getCurrentId();
-    zcu.unit_claims_mutex.lock();
-    defer zcu.unit_claims_mutex.unlock();
-    const owner = zcu.unit_claims.get(unit) orelse return false;
+    const shard = zcu.claimShard(unit);
+    shard.mutex.lock();
+    defer shard.mutex.unlock();
+    const owner = shard.map.get(unit) orelse return false;
     return owner != me;
 }
 
@@ -3762,10 +3891,22 @@ threadlocal var tls_aip: std.AutoArrayHashMapUnmanaged(AnalUnit, void) = .empty;
 /// resolvable by another thread). Consumed by the outer `ensure*UpToDate`
 /// to release-and-requeue instead of marking the unit failed.
 pub threadlocal var tls_retry_loop: ?AnalUnit = null;
+/// When `tls_retry_loop` is set because a dependency is claimed by another
+/// thread, this names that dependency so the requeue can be deferred until it
+/// completes (via `deferOn`/`releaseClaim`) instead of re-spawning immediately
+/// and re-running the caller's body just to yield again at the same point.
+pub threadlocal var tls_retry_dep: ?AnalUnit = null;
 
 pub fn semaAipContains(zcu: *Zcu, unit: AnalUnit) bool {
     if (!zcu.parallel_sema) return zcu.analysis_in_progress.contains(unit);
     return tls_aip.contains(unit);
+}
+/// True at top-level dispatch (workerAnalyzeFunc) before any nested ensure*
+/// has pushed onto `tls_aip`. Used to choose `tryClaim` (skip-on-busy) vs the
+/// blocking `claimOrWait` path in `ensureFuncBodyUpToDate`.
+pub fn semaAipEmpty(zcu: *Zcu) bool {
+    if (!zcu.parallel_sema) return zcu.analysis_in_progress.count() == 0;
+    return tls_aip.count() == 0;
 }
 
 pub fn dumpTlsAip(zcu: *Zcu) void {
@@ -4104,8 +4245,8 @@ pub fn failedAnalysisGetOrPut(zcu: *Zcu, unit: AnalUnit, msg: *ErrorMsg) Allocat
 
 pub fn addGlobalAssembly(zcu: *Zcu, unit: AnalUnit, source: []const u8) !void {
     const gpa = zcu.gpa;
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    zcu.global_assembly_mutex.lock();
+    defer zcu.global_assembly_mutex.unlock();
     const gop = try zcu.global_assembly.getOrPut(gpa, unit);
     if (gop.found_existing) {
         const new_value = try std.fmt.allocPrint(gpa, "{s}\n{s}", .{ gop.value_ptr.*, source });
@@ -4777,6 +4918,12 @@ fn formatDependee(data: FormatDependee, writer: *std.io.Writer) std.io.Writer.Er
 /// Given the `InternPool.Index` of a function, set its resolved IES to `.none` if it
 /// may be outdated. `Sema` should do this before ever loading a resolved IES.
 pub fn maybeUnresolveIes(zcu: *Zcu, func_index: InternPool.Index) !void {
+    // `outdated`/`potentially_outdated` are incremental-only state. Under
+    // parallel non-incremental Sema they are conceptually empty, but
+    // `scanDecl` still touches `outdated`/`outdated_ready` for comptime
+    // units under `outdated_mutex`; an unlocked `contains()` here can read
+    // mid-rehash. Short-circuit before the unlocked read.
+    if (zcu.parallel_sema and !zcu.comp.incremental) return;
     const unit = AnalUnit.wrap(.{ .func = func_index });
     if (zcu.outdated.contains(unit) or zcu.potentially_outdated.contains(unit)) {
         // We're consulting the resolved IES now, but the function is outdated, so its

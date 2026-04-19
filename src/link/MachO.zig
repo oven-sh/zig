@@ -633,24 +633,9 @@ pub fn appendZcuObjectInputs(
     positionals: *std.array_list.Managed(link.Input),
     zcu_obj_path: ?Path,
 ) !void {
+    _ = zcu_obj_path;
     const diags = &self.base.comp.link_diags;
-    const path = zcu_obj_path orelse return;
-    const partition_count = self.base.zcu_object_partition_count;
-    if (partition_count > 1) {
-        const base_path = path.sub_path;
-        const base_name = if (std.mem.endsWith(u8, base_path, ".o"))
-            base_path[0 .. base_path.len - 2]
-        else
-            base_path;
-
-        for (0..partition_count) |i| {
-            const partition_path: Path = .{
-                .root_dir = path.root_dir,
-                .sub_path = try std.fmt.allocPrint(arena, "{s}.{d}.o", .{ base_name, i }),
-            };
-            try positionals.append(try link.openObjectInput(diags, partition_path));
-        }
-    } else {
+    for (try self.base.resolveZcuObjectPaths(arena)) |path| {
         try positionals.append(try link.openObjectInput(diags, path));
     }
 }

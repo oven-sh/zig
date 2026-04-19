@@ -3007,6 +3007,10 @@ fn zirStructDecl(
                 // claim a fresh wip ourselves.
                 .cancelled => continue :gop,
                 .finished => {},
+                .would_block => {
+                    Zcu.tls_retry_loop = sema.owner;
+                    return error.AnalysisFail;
+                },
             }
             const new_ty = try pt.ensureTypeUpToDate(ty);
 
@@ -3255,6 +3259,10 @@ fn zirEnumDecl(
             switch (zcu.awaitNamespaceTypeFinished(ty)) {
                 .cancelled => continue :gop,
                 .finished => {},
+                .would_block => {
+                    Zcu.tls_retry_loop = sema.owner;
+                    return error.AnalysisFail;
+                },
             }
             const new_ty = try pt.ensureTypeUpToDate(ty);
 
@@ -3424,6 +3432,10 @@ fn zirUnionDecl(
             switch (zcu.awaitNamespaceTypeFinished(ty)) {
                 .cancelled => continue :gop,
                 .finished => {},
+                .would_block => {
+                    Zcu.tls_retry_loop = sema.owner;
+                    return error.AnalysisFail;
+                },
             }
             const new_ty = try pt.ensureTypeUpToDate(ty);
 
@@ -3527,6 +3539,10 @@ fn zirOpaqueDecl(
             switch (zcu.awaitNamespaceTypeFinished(ty)) {
                 .cancelled => continue :gop,
                 .finished => {},
+                .would_block => {
+                    Zcu.tls_retry_loop = sema.owner;
+                    return error.AnalysisFail;
+                },
             }
             // Make sure we update the namespace if the declaration is re-analyzed, to pick
             // up on e.g. changed comptime decls.
@@ -13895,9 +13911,9 @@ fn zirEmbedFile(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!A
     };
     try sema.declareDependency(.{ .embed_file = ef_idx });
 
-    zcu.semaLock();
+    zcu.embed_mutex.lock();
     const result = ef_idx.get(zcu).*;
-    zcu.semaUnlock();
+    zcu.embed_mutex.unlock();
     if (result.val == .none) {
         return sema.fail(block, operand_src, "unable to open '{s}': {s}", .{ name, @errorName(result.err.?) });
     }
@@ -19915,6 +19931,10 @@ fn structInitAnon(
         .existing => |ty| switch (zcu.awaitNamespaceTypeFinished(ty)) {
             .cancelled => continue :gop,
             .finished => break :gop ty,
+            .would_block => {
+                Zcu.tls_retry_loop = sema.owner;
+                return error.AnalysisFail;
+            },
         },
     };
     try sema.declareDependency(.{ .interned = struct_ty });
@@ -20913,6 +20933,10 @@ fn zirReify(
                     switch (zcu.awaitNamespaceTypeFinished(ty)) {
                         .cancelled => continue :gop,
                         .finished => {},
+                        .would_block => {
+                            Zcu.tls_retry_loop = sema.owner;
+                            return error.AnalysisFail;
+                        },
                     }
                     try sema.addTypeReferenceEntry(src, ty);
                     return Air.internedToRef(ty);
@@ -21132,6 +21156,10 @@ fn reifyEnum(
             switch (zcu.awaitNamespaceTypeFinished(ty)) {
                 .cancelled => continue :gop,
                 .finished => {},
+                .would_block => {
+                    Zcu.tls_retry_loop = sema.owner;
+                    return error.AnalysisFail;
+                },
             }
             try sema.declareDependency(.{ .interned = ty });
             try sema.addTypeReferenceEntry(src, ty);
@@ -21304,6 +21332,10 @@ fn reifyUnion(
             switch (zcu.awaitNamespaceTypeFinished(ty)) {
                 .cancelled => continue :gop,
                 .finished => {},
+                .would_block => {
+                    Zcu.tls_retry_loop = sema.owner;
+                    return error.AnalysisFail;
+                },
             }
             try sema.declareDependency(.{ .interned = ty });
             try sema.addTypeReferenceEntry(src, ty);
@@ -21661,6 +21693,10 @@ fn reifyStruct(
             switch (zcu.awaitNamespaceTypeFinished(ty)) {
                 .cancelled => continue :gop,
                 .finished => {},
+                .would_block => {
+                    Zcu.tls_retry_loop = sema.owner;
+                    return error.AnalysisFail;
+                },
             }
             try sema.declareDependency(.{ .interned = ty });
             try sema.addTypeReferenceEntry(src, ty);
@@ -35286,28 +35322,12 @@ fn resolveInferredErrorSet(
         // corresponds to the function, not one created to track an inline/comptime call.
         const orig_func_index = ip.unwrapCoercedFunc(func_index);
         const ies_unit: AnalUnit = .wrap(.{ .func = orig_func_index });
-        if (zcu.parallel_sema and zcu.isClaimedByOther(ies_unit)) {
-            // The IES owner's body is being analysed by another worker right
-            // now. `ensureFuncBodyUpToDate` would park this thread on
-            // `sema_claim_cond` until that worker finishes — under chained
-            // IES dependencies that idles a core for the bulk of Sema.
-            // Instead, yield: re-queue `sema.owner` and let this thread
-            // pull the next job. Cap retries low because each one re-runs
-            // the caller's body from scratch; once the cap is hit, fall
-            // through to the blocking wait.
-            zcu.sema_retry_mutex.lock();
-            const tries: u8 = blk: {
-                const gop = zcu.sema_retry_counts.getOrPut(zcu.gpa, ies_unit) catch break :blk 255;
-                if (!gop.found_existing) gop.value_ptr.* = 0;
-                gop.value_ptr.* +|= 1;
-                break :blk gop.value_ptr.*;
-            };
-            zcu.sema_retry_mutex.unlock();
-            if (tries < 8) {
-                Zcu.tls_retry_loop = sema.owner;
-                return error.AnalysisFail;
-            }
-        }
+        // The nested `ensureFuncBodyUpToDate` blocks via `claimOrWait` if
+        // another worker is already analysing this body. With `sema_lock`
+        // eliminated under parallel non-incremental and the thundering-herd
+        // broadcast skipped when `claim_waits` is empty, the wait is a single
+        // futex; yielding here instead re-runs the *caller's* entire body on
+        // requeue, which dominated CPU at high core counts.
         try sema.addReferenceEntry(block, src, ies_unit);
         try pt.ensureFuncBodyUpToDate(orig_func_index);
     }

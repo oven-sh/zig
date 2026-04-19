@@ -1257,8 +1257,11 @@ pub const Object = struct {
         // var error_message: [*:0]const u8 = undefined;
 
         // Convert bin_path_list to NULL-terminated C array if provided
+        var null_term_buf: ?[]?[*:0]const u8 = null;
+        defer if (null_term_buf) |buf| comp.gpa.free(buf);
         const bin_filename_list: ?[*:null]const ?[*:0]const u8 = if (options.bin_path_list) |list| blk: {
             const null_term = try comp.gpa.alloc(?[*:0]const u8, list.len + 1);
+            null_term_buf = null_term;
             for (list, 0..) |path, i| {
                 null_term[i] = path;
             }
