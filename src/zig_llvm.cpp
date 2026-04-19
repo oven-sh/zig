@@ -225,17 +225,6 @@ static SanitizerCoverageOptions getSanCovOptions(ZigLLVMCoverageOptions z) {
     o.CollectControlFlow = z.CollectControlFlow;
     return o;
 }
-static AddressSanitizerOptions getAsanOptions(void) {
-    AddressSanitizerOptions o;
-    o.CompileKernel = false;
-    o.Recover = false;
-    o.UseAfterScope = false;
-    o.UseAfterReturn = AsanDetectStackUseAfterReturnMode::Always;
-    o.InstrumentationWithCallsThreshold = 7000;
-    o.MaxInlinePoisoningSize = 64;
-    o.InsertVersionCheck = true;
-    return o;
-}
 
 // Builds and runs the full middle-end optimization pipeline on `llvm_module`.
 // Self-contained so it can be invoked once on the whole module (serial path) or
