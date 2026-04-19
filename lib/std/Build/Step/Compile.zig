@@ -898,6 +898,32 @@ pub fn getEmittedBin(compile: *Compile) LazyPath {
     return compile.getEmittedFileGeneric(&compile.generated_bin);
 }
 
+/// Returns the per-shard object paths when `llvm_no_merge_shards` is set.
+/// Shard `i` lives at `{dir}/{stem}.{i}.o` where `dir` is the emitted-bin
+/// directory and `stem` is `out_filename` with a trailing `.o` stripped. The
+/// returned slice has `llvm_codegen_threads` entries, allocated from the
+/// build arena.
+///
+/// Intended use: `addObject` is configured with `llvm_codegen_threads > 1`
+/// and `llvm_no_merge_shards = true`; the consumer (an executable's link
+/// step, or `addInstallFile`) iterates this slice instead of calling
+/// `getEmittedBin()` (which points at a stub the compiler deletes).
+pub fn getEmittedBinShards(compile: *Compile) []std.Build.LazyPath {
+    assert(compile.llvm_no_merge_shards);
+    assert(compile.llvm_codegen_threads > 1);
+    const b = compile.step.owner;
+    const dir = compile.getEmittedBinDirectory();
+    const stem = if (std.mem.endsWith(u8, compile.out_filename, ".o"))
+        compile.out_filename[0 .. compile.out_filename.len - 2]
+    else
+        compile.out_filename;
+    const out = b.allocator.alloc(std.Build.LazyPath, compile.llvm_codegen_threads) catch @panic("OOM");
+    for (out, 0..) |*p, i| {
+        p.* = dir.path(b, b.fmt("{s}.{d}.o", .{ stem, i }));
+    }
+    return out;
+}
+
 /// Returns the path to the generated import library.
 /// This function can only be called for libraries.
 pub fn getEmittedImplib(compile: *Compile) LazyPath {
