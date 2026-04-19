@@ -2837,10 +2837,14 @@ pub fn comptimeOnlyInner(
 
                 return switch (strat) {
                     .normal => switch (struct_type.requiresComptime(ip)) {
-                        .wip => unreachable,
+                        // Under parallel Sema another worker may be in the
+                        // `.sema` arm right now (`setRequiresComptimeWip`
+                        // → `.wip`, or the field-types-wip fallback →
+                        // `.unknown`). The documented contract permits a
+                        // false negative; only unreachable in serial.
+                        .wip, .unknown => if (zcu.parallel_sema) false else unreachable,
                         .no => false,
                         .yes => true,
-                        .unknown => unreachable,
                     },
                     .sema => switch (struct_type.setRequiresComptimeWip(ip)) {
                         .no, .wip => false,
@@ -2904,10 +2908,9 @@ pub fn comptimeOnlyInner(
                 const union_type = ip.loadUnionType(ty.toIntern());
                 return switch (strat) {
                     .normal => switch (union_type.requiresComptime(ip)) {
-                        .wip => unreachable,
+                        .wip, .unknown => if (zcu.parallel_sema) false else unreachable,
                         .no => false,
                         .yes => true,
-                        .unknown => unreachable,
                     },
                     .sema => switch (union_type.setRequiresComptimeWip(ip)) {
                         .no, .wip => return false,
@@ -3039,7 +3042,7 @@ pub fn getNamespace(ty: Type, zcu: *Zcu) InternPool.OptionalNamespaceIndex {
     // Callers reach here only with indices that have already passed the
     // `.existing` retry loop in Sema (or are owned by this thread via
     // `tls_wip_types`), so `.cancelled` is not expected.
-    _ = zcu.awaitNamespaceTypeFinished(ty.toIntern());
+    _ = zcu.awaitNamespaceTypeFinishedSpin(ty.toIntern());
     return switch (ip.indexToKey(ty.toIntern())) {
         .opaque_type => ip.loadOpaqueType(ty.toIntern()).namespace.toOptional(),
         .struct_type => ip.loadStructType(ty.toIntern()).namespace.toOptional(),
@@ -3173,7 +3176,7 @@ pub fn enumFieldIndex(ty: Type, field_name: InternPool.NullTerminatedString, zcu
     const ip = &zcu.intern_pool;
     // The `.existing` dedup may return an enum whose `WipEnumType` owner is
     // still populating names; spin until prepare() so the lookup sees them.
-    _ = Zcu.awaitNamespaceTypeFinishedConst(zcu, ty.toIntern());
+    _ = Zcu.awaitNamespaceTypeFinishedSpin(zcu, ty.toIntern());
     const enum_type = ip.loadEnumType(ty.toIntern());
     return enum_type.nameIndex(ip, field_name);
 }
@@ -3183,7 +3186,7 @@ pub fn enumFieldIndex(ty: Type, field_name: InternPool.NullTerminatedString, zcu
 /// declaration order, or `null` if `enum_tag` does not match any field.
 pub fn enumTagFieldIndex(ty: Type, enum_tag: Value, zcu: *const Zcu) ?u32 {
     const ip = &zcu.intern_pool;
-    _ = Zcu.awaitNamespaceTypeFinishedConst(zcu, ty.toIntern());
+    _ = Zcu.awaitNamespaceTypeFinishedSpin(zcu, ty.toIntern());
     const enum_type = ip.loadEnumType(ty.toIntern());
     const int_tag = switch (ip.indexToKey(enum_tag.toIntern())) {
         .int => enum_tag.toIntern(),
@@ -3915,7 +3918,13 @@ fn resolveStructInner(
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
-    _ = zcu.awaitNamespaceTypeFinished(ty.toIntern());
+    switch (zcu.awaitNamespaceTypeFinished(ty.toIntern())) {
+        .finished, .cancelled => {},
+        .would_block => {
+            Zcu.tls_retry_loop = .wrap(.{ .type = ty.toIntern() });
+            return error.AnalysisFail;
+        },
+    }
 
     const ip = &zcu.intern_pool;
     const struct_obj = zcu.typeToStruct(ty).?;
@@ -3952,8 +3961,9 @@ fn resolveStructInner(
     }
     defer if (owns_claim) zcu.releaseClaim(owner);
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    const need_sema_lock = !zcu.parallel_sema or zcu.comp.incremental;
+    if (need_sema_lock) zcu.semaLock();
+    defer if (need_sema_lock) zcu.semaUnlock();
     if (zcu.anyAnalysisFailed(owner)) return error.AnalysisFail;
     if (zcu.comp.debugIncremental()) {
         const info = try zcu.incremental_debug_state.getUnitInfo(gpa, owner);
@@ -4010,7 +4020,13 @@ fn resolveUnionInner(
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
-    _ = zcu.awaitNamespaceTypeFinished(ty.toIntern());
+    switch (zcu.awaitNamespaceTypeFinished(ty.toIntern())) {
+        .finished, .cancelled => {},
+        .would_block => {
+            Zcu.tls_retry_loop = .wrap(.{ .type = ty.toIntern() });
+            return error.AnalysisFail;
+        },
+    }
 
     const ip = &zcu.intern_pool;
     const union_obj = zcu.typeToUnion(ty).?;
@@ -4039,8 +4055,9 @@ fn resolveUnionInner(
     }
     defer if (owns_claim) zcu.releaseClaim(owner);
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    const need_sema_lock = !zcu.parallel_sema or zcu.comp.incremental;
+    if (need_sema_lock) zcu.semaLock();
+    defer if (need_sema_lock) zcu.semaUnlock();
     if (zcu.anyAnalysisFailed(owner)) return error.AnalysisFail;
     if (zcu.comp.debugIncremental()) {
         const info = try zcu.incremental_debug_state.getUnitInfo(gpa, owner);

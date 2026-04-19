@@ -181,8 +181,11 @@ pub fn main() anyerror!void {
             break :gpa .{ std.heap.raw_c_allocator, false };
         }
         break :gpa switch (builtin.mode) {
-            .Debug, .ReleaseSafe => .{ debug_allocator.allocator(), true },
-            .ReleaseFast, .ReleaseSmall => .{ std.heap.smp_allocator, false },
+            .Debug => .{ debug_allocator.allocator(), true },
+            // ReleaseSafe keeps runtime safety checks but uses smp_allocator:
+            // debug_allocator's single mutex serialises every allocation
+            // across all threads, which defeats parallel Sema/codegen.
+            .ReleaseSafe, .ReleaseFast, .ReleaseSmall => .{ std.heap.smp_allocator, false },
         };
     };
     defer if (is_debug) {

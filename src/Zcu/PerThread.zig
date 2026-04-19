@@ -611,8 +611,12 @@ pub fn ensureFileAnalyzed(pt: Zcu.PerThread, file_index: Zcu.File.Index) Zcu.Sem
             else => |e| return e,
         }
     }
-    pt.zcu.semaLock();
-    defer pt.zcu.semaUnlock();
+    // File-root creation is once-per-file; serialise on `comp.mutex` (same
+    // lock `discoverImport` uses for file registration) so two threads
+    // importing the same module don't both run `semaFile` and hit the
+    // `.existing => unreachable` in `createFileRootStruct`.
+    pt.zcu.comp.mutex.lock();
+    defer pt.zcu.comp.mutex.unlock();
     if (pt.zcu.fileRootType(file_index) != .none) return;
     return pt.semaFile(file_index);
 }
@@ -1762,10 +1766,22 @@ pub fn ensureFuncBodyUpToDate(pt: Zcu.PerThread, func_index: InternPool.Index) Z
         return;
     }
 
-    // `claimOrWait` self-locks `unit_claims_mutex`; we only take the global
-    // `sema_lock` after the claim succeeds, so the (very hot) entry path no
-    // longer contends on `sema_lock`.
-    claim: while (true) switch (try zcu.claimOrWait(anal_unit)) {
+    // Top-level dispatch (workerAnalyzeFunc, no enclosing analysis on this
+    // thread): if another worker already holds this unit, return immediately.
+    // The work queue may dispatch the same func to several workers (re-queues
+    // from the retry path, plus discovery from multiple callers); only one
+    // analysis is needed. Parking N-1 workers on `sema_claim_cond` for the
+    // duration was the dominant idle cost at high core counts.
+    if (zcu.parallel_sema and zcu.semaAipEmpty()) {
+        switch (try zcu.tryClaim(anal_unit)) {
+            .claimed => {},
+            .recursed => return error.AnalysisFail,
+            .busy => {
+                _ = zcu.psema_skip_busy.rmw(.Add, 1, .monotonic);
+                return;
+            },
+        }
+    } else claim: while (true) switch (try zcu.claimOrWait(anal_unit)) {
         .claimed => break :claim,
         .recursed => return error.AnalysisFail,
         .done => {
@@ -2071,7 +2087,7 @@ fn semaFile(pt: Zcu.PerThread, file_index: Zcu.File.Index) Zcu.SemaError!void {
     errdefer zcu.intern_pool.remove(pt.tid, struct_ty);
 
     if (zcu.comp.time_report) |*tr| {
-        tr.stats.n_imported_files += 1;
+        _ = @atomicRmw(u32, &tr.stats.n_imported_files, .Add, 1, .monotonic);
     }
 }
 
@@ -2550,8 +2566,8 @@ pub fn embedFile(
 
     // `embed_table` and `EmbedFile` allocation are shared state accessed
     // from the carve-out under parallel Sema.
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    zcu.embed_mutex.lock();
+    defer zcu.embed_mutex.unlock();
 
     const opt_mod: ?*Module = m: {
         if (mem.eql(u8, import_string, "std")) break :m zcu.std_mod;
@@ -2752,8 +2768,8 @@ pub fn scanNamespace(
     const gpa = zcu.gpa;
     const namespace = zcu.namespacePtr(namespace_index);
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    namespace.decls_mutex.lock();
+    defer namespace.decls_mutex.unlock();
     // Another thread may have already scanned this namespace (e.g. via
     // ensureNamespaceUpToDate before the creator reached its own scan).
     if (zcu.parallel_sema and namespace.generation == zcu.generation) return;
@@ -2999,6 +3015,7 @@ fn analyzeFnBodyInner(pt: Zcu.PerThread, func_index: InternPool.Index) Zcu.SemaE
     defer tracy.end();
 
     const zcu = pt.zcu;
+    _ = zcu.psema_body_runs.rmw(.Add, 1, .monotonic);
     const gpa = zcu.gpa;
     const ip = &zcu.intern_pool;
 
@@ -3018,7 +3035,7 @@ fn analyzeFnBodyInner(pt: Zcu.PerThread, func_index: InternPool.Index) Zcu.SemaE
 
     if (zcu.comp.time_report) |*tr| {
         if (func.generic_owner != .none) {
-            tr.stats.n_generic_instances += 1;
+            _ = @atomicRmw(u32, &tr.stats.n_generic_instances, .Add, 1, .monotonic);
         }
     }
 
@@ -4441,8 +4458,13 @@ pub fn ensureNamespaceUpToDate(pt: Zcu.PerThread, namespace_index: Zcu.Namespace
 
     if (zcu.parallel_sema and @atomicLoad(u32, &namespace.generation, .acquire) == zcu.generation) return;
 
-    zcu.semaLock();
-    defer zcu.semaUnlock();
+    // Decl-map exclusion is provided by `scanNamespace` taking
+    // `namespace.decls_mutex` (and re-checking `generation` under it). The
+    // span from here to the `scanNamespace` call only reads InternPool/ZIR to
+    // compute `decls`, so two threads racing to here is wasted work but safe:
+    // the second `scanNamespace` early-returns on the locked `generation`
+    // check. Under incremental, `parallel_sema` is gated off so this path is
+    // single-threaded.
     if (namespace.generation == zcu.generation) return;
 
     const Container = enum { @"struct", @"union", @"enum", @"opaque" };
@@ -4457,7 +4479,7 @@ pub fn ensureNamespaceUpToDate(pt: Zcu.PerThread, namespace_index: Zcu.Namespace
     const key = switch (full_key) {
         .reified, .generated_tag => {
             // Namespace always empty, so up-to-date.
-            namespace.generation = zcu.generation;
+            @atomicStore(u32, &namespace.generation, zcu.generation, .release);
             return;
         },
         .declared => |d| d,

@@ -7878,7 +7878,14 @@ pub const wip_namespace_sentinel: u32 = std.math.maxInt(u32);
 /// `NamespaceIndex` (0 is a valid index).
 pub const cancelled_namespace_sentinel: u32 = std.math.maxInt(u32) - 1;
 
-pub const NamespaceTypeAwaitResult = enum { finished, cancelled };
+pub const NamespaceTypeAwaitResult = enum {
+    finished,
+    cancelled,
+    /// Another thread holds the wip and the caller is not the same-thread
+    /// owner. Caller should yield-and-requeue (set `tls_retry_loop`) instead
+    /// of spinning, since it may hold a `unit_claim` the wip owner needs.
+    would_block,
+};
 
 /// Spin until `ty`'s namespace slot is no longer the wip sentinel. Returns
 /// `.cancelled` if the wip owner invoked `cancel` (slot now holds
@@ -7886,8 +7893,12 @@ pub const NamespaceTypeAwaitResult = enum { finished, cancelled };
 /// retry the originating `get*Type` call, which will skip the now-`.removed`
 /// map entry and allocate fresh.
 pub fn awaitNamespaceTypeFinished(ip: *const InternPool, ty: Index) NamespaceTypeAwaitResult {
+    return ip.awaitNamespaceTypeFinishedBounded(ty, std.math.maxInt(u32));
+}
+pub fn awaitNamespaceTypeFinishedBounded(ip: *const InternPool, ty: Index, max_spins: u32) NamespaceTypeAwaitResult {
     const ns_idx = ip.namespaceTypeNamespaceExtraIndex(ty) orelse return .finished;
     const unwrapped = ty.unwrap(ip);
+    var spins: u32 = 0;
     while (true) {
         // Re-acquire the shared view each iteration: the owning tid may
         // realloc its extra array between `getStructType` and `finish`, which
@@ -7896,6 +7907,8 @@ pub fn awaitNamespaceTypeFinished(ip: *const InternPool, ty: Index) NamespaceTyp
         const slot: *const u32 = &extra.view().items(.@"0")[ns_idx];
         const loaded = @atomicLoad(u32, slot, .acquire);
         if (loaded == wip_namespace_sentinel) {
+            spins += 1;
+            if (spins >= max_spins) return .would_block;
             std.atomic.spinLoopHint();
             continue;
         }
@@ -10646,6 +10659,7 @@ pub fn getIfExists(ip: *const InternPool, key: Key) ?Index {
         const index = entry.acquire();
         if (index == .none) return null;
         if (entry.hash != hash) continue;
+        if (index.unwrap(ip).getTag(ip) == .removed) continue;
         if (ip.indexToKey(index).eql(key, ip)) return index;
     }
 }

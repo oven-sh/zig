@@ -1309,8 +1309,12 @@ pub fn realpath(self: Dir, pathname: []const u8, out_buffer: []u8) RealPathError
     }
     if (native_os == .windows) {
         if (pathname.len == 1 and pathname[0] == '.') {
-            const ptr: *[std.fs.max_path_bytes]u8 = out_buffer[0..std.fs.max_path_bytes];
-            return try std.os.getFdPath(self.fd, ptr);
+            var buffer: [fs.max_path_bytes]u8 = undefined;
+            const out_path = try std.os.getFdPath(self.fd, &buffer);
+            if (out_path.len > out_buffer.len) return error.NameTooLong;
+            const result = out_buffer[0..out_path.len];
+            @memcpy(result, out_path);
+            return result;
         }
         const pathname_w = try windows.sliceToPrefixedFileW(self.fd, pathname);
         return self.realpathW(pathname_w.span(), out_buffer);

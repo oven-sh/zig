@@ -128,6 +128,10 @@ work_queues: [
 ]DeprecatedLinearFifo(Job),
 /// Protects `work_queues` when Sema runs on worker threads and calls `queueJob`.
 work_queue_mutex: std.Thread.Mutex = .{},
+/// Signalled by `queueJob` and when `sema_pending_jobs` reaches 0, so the
+/// dispatch loop in `performAllTheWork` parks instead of busy-spinning on
+/// `Thread.yield()` while parallel-Sema workers are running.
+work_queue_cond: std.Thread.Condition = .{},
 
 /// These jobs are to invoke the Clang compiler to create an object file, which
 /// gets linked with the Compilation.
@@ -278,6 +282,9 @@ no_merge_shards: bool,
 time_report: ?TimeReport,
 
 file_system_inputs: ?*std.ArrayListUnmanaged(u8),
+/// Guards `file_system_inputs` appends. Called from `newEmbedFile` (sema
+/// workers) and C-object workers concurrently under parallel sema.
+file_system_inputs_mutex: std.Thread.Mutex = .{},
 
 /// This is the digest of the cache for the current compilation.
 /// This digest will be known after update() is called.
@@ -3321,8 +3328,7 @@ fn dumpLlvmShardStats(comp: *Compilation, zcu: *Zcu) void {
             skipped += 1;
             continue;
         }
-        const fqn = nav.fqn.toSlice(ip);
-        const shard: u8 = @intCast(std.hash.Wyhash.hash(0, fqn) % n);
+        const shard: u8 = @intCast(zcu.navShard(nav_index, n));
         counts[shard] += 1;
         const file = zcu.fileByIndex(nav.srcInst(ip).resolveFile(ip));
         const gop = per_file.getOrPut(.{ .file = file, .shard = shard }) catch continue;
@@ -3363,6 +3369,8 @@ fn dumpLlvmShardStats(comp: *Compilation, zcu: *Zcu) void {
 pub fn appendFileSystemInput(comp: *Compilation, path: Compilation.Path) Allocator.Error!void {
     const gpa = comp.gpa;
     const fsi = comp.file_system_inputs orelse return;
+    comp.file_system_inputs_mutex.lock();
+    defer comp.file_system_inputs_mutex.unlock();
     const prefixes = comp.cache_parent.prefixes();
 
     const want_prefix_dir: Cache.Directory = switch (path.root) {
@@ -5202,7 +5210,11 @@ fn performAllTheWork(
                 // produce duplicate analyze_func jobs and N-1 workers then
                 // condvar-wait on the one analyzer.
                 const a = zcu.intern_pool.funcAnalysisUnordered(job.analyze_func);
-                if (a.is_analyzed) continue :work;
+                if (a.is_analyzed) {
+                    _ = zcu.psema_skip_done.rmw(.Add, 1, .monotonic);
+                    continue :work;
+                }
+                _ = zcu.psema_dispatched.rmw(.Add, 1, .monotonic);
                 _ = zcu.sema_pending_jobs.rmw(.Add, 1, .acquire);
                 comp.thread_pool.spawnWgId(&comp.link_task_wait_group, workerAnalyzeFunc, .{ comp, job.analyze_func });
                 continue :work;
@@ -5217,7 +5229,19 @@ fn performAllTheWork(
         }
         if (comp.zcu) |zcu| {
             if (zcu.sema_pending_jobs.load(.acquire) > 0) {
-                std.Thread.yield() catch {};
+                // Park until a worker enqueues new work or the last
+                // pending sema job finishes; busy-spinning here contended
+                // `work_queue_mutex` against every `queueJob` call.
+                comp.work_queue_mutex.lock();
+                if (zcu.sema_pending_jobs.load(.acquire) > 0) {
+                    var any: bool = false;
+                    for (&comp.work_queues) |*q| if (q.count > 0) {
+                        any = true;
+                        break;
+                    };
+                    if (!any) comp.work_queue_cond.wait(&comp.work_queue_mutex);
+                }
+                comp.work_queue_mutex.unlock();
                 continue :work;
             }
             // A worker may have enqueued between our queue read and the
@@ -5265,7 +5289,19 @@ fn performAllTheWork(
         }
         break;
     }
-    if (comp.zcu) |zcu| zcu.parallel_sema = false;
+    if (comp.zcu) |zcu| {
+        if (std.process.hasNonEmptyEnvVarConstant("ZIG_PSEMA_STATS")) {
+            std.debug.print("[PSEMA] body_runs={d} yields={d} claim_waits={d} dispatched={d} skip_busy={d} skip_done={d}\n", .{
+                zcu.psema_body_runs.load(.monotonic),
+                zcu.psema_yields.load(.monotonic),
+                zcu.psema_claim_waits.load(.monotonic),
+                zcu.psema_dispatched.load(.monotonic),
+                zcu.psema_skip_busy.load(.monotonic),
+                zcu.psema_skip_done.load(.monotonic),
+            });
+        }
+        zcu.parallel_sema = false;
+    }
     if (comp.llvm_shard_stats or std.process.hasNonEmptyEnvVarConstant("ZIG_JOB_STATS")) {
         std.debug.print("=== work loop job timings (main thread) ===\n", .{});
         inline for (@typeInfo(Job.Tag).@"enum".fields, 0..) |f, i| {
@@ -5281,6 +5317,7 @@ pub fn queueJob(comp: *Compilation, job: Job) !void {
     comp.work_queue_mutex.lock();
     defer comp.work_queue_mutex.unlock();
     try comp.work_queues[Job.stage(job)].writeItem(job);
+    comp.work_queue_cond.signal();
 }
 
 pub fn queueJobs(comp: *Compilation, jobs: []const Job) !void {
@@ -6148,19 +6185,31 @@ fn workerAnalyzeFunc(tid: usize, comp: *Compilation, func: InternPool.Index) voi
     const pt: Zcu.PerThread = .activate(zcu, @enumFromInt(tid));
     defer pt.deactivate();
     Zcu.tls_retry_loop = null;
+    Zcu.tls_retry_dep = null;
     pt.ensureFuncBodyUpToDate(func) catch |err| switch (err) {
         error.OutOfMemory => comp.setAllocFailure(),
         error.AnalysisFail => {
             if (Zcu.tls_retry_loop != null) {
-                // Order-dependent dependency loop: re-queue this func so
-                // another thread (or a later attempt) can try after
-                // intermediates have been resolved independently.
+                _ = zcu.psema_yields.rmw(.Add, 1, .monotonic);
                 Zcu.tls_retry_loop = null;
-                comp.queueJob(.{ .analyze_func = func }) catch comp.setAllocFailure();
+                if (Zcu.tls_retry_dep) |dep| {
+                    Zcu.tls_retry_dep = null;
+                    if (zcu.deferOn(dep, func) catch false) {
+                        _ = zcu.sema_pending_jobs.rmw(.Add, 1, .acquire);
+                    } else {
+                        comp.queueJob(.{ .analyze_func = func }) catch comp.setAllocFailure();
+                    }
+                } else {
+                    comp.queueJob(.{ .analyze_func = func }) catch comp.setAllocFailure();
+                }
             }
         },
     };
-    _ = zcu.sema_pending_jobs.rmw(.Sub, 1, .release);
+    if (zcu.sema_pending_jobs.rmw(.Sub, 1, .release) == 1) {
+        comp.work_queue_mutex.lock();
+        comp.work_queue_cond.signal();
+        comp.work_queue_mutex.unlock();
+    }
 }
 
 fn workerZcuCodegen(
