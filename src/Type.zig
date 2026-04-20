@@ -3953,6 +3953,10 @@ fn resolveStructInner(
                 break :claim;
             },
             .recursed => break :claim,
+            .cycle => {
+                Zcu.tls_retry_loop = owner;
+                return error.AnalysisFail;
+            },
             .done => {
                 if (zcu.anyAnalysisFailed(owner)) return error.AnalysisFail;
                 continue :claim;
@@ -4047,6 +4051,10 @@ fn resolveUnionInner(
                 break :claim;
             },
             .recursed => break :claim,
+            .cycle => {
+                Zcu.tls_retry_loop = owner;
+                return error.AnalysisFail;
+            },
             .done => {
                 if (zcu.anyAnalysisFailed(owner)) return error.AnalysisFail;
                 continue :claim;

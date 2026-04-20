@@ -6168,9 +6168,15 @@ fn ensureExportFuncQueued(zcu: *Zcu, export_idx: Zcu.Export.Index) bool {
     };
     if (!ip.isFuncBody(v)) return false;
     const func = ip.unwrapCoercedFunc(v);
-    // Check the LLVM nav_map: if the body landed there, codegen ran.
+    // Check the LLVM nav_map: if the body landed there, codegen ran. The
+    // shard mutex must be held — `workerZcuCodegen` may still be running
+    // (link_task_wait_group is not waited until performAllTheWork returns)
+    // and `Object.updateFunc`/`resolveGlobalNav` `getOrPut()` into nav_map
+    // under that mutex; an unlocked `contains()` here can read mid-rehash.
     if (zcu.llvm_object) |llvm| {
         const shard = zcu.navShard(nav, llvm.n);
+        llvm.mutexes[shard].lock();
+        defer llvm.mutexes[shard].unlock();
         if (llvm.objects[shard].nav_map.contains(nav)) return false;
     } else if (ip.funcAnalysisUnordered(func).is_analyzed) return false;
     // Clear is_analyzed so the fast-path doesn't no-op and re-analysis
