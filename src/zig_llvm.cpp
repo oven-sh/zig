@@ -577,7 +577,12 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machi
 }
 
 void ZigLLVMSetOptBisectLimit(LLVMContextRef context_ref, int limit) {
-    static OptBisect opt_bisect;
+    // Per-thread: with --llvm-codegen-threads>1 each shard has its own
+    // LLVMContext on its own emit thread; a single shared OptBisect would
+    // have N threads racing on LastBisectNum and the count would be
+    // meaningless. thread_local gives each shard a stable, independent
+    // bisection counter.
+    static thread_local OptBisect opt_bisect;
     opt_bisect.setLimit(limit);
     unwrap(context_ref)->setOptPassGate(opt_bisect);
 }

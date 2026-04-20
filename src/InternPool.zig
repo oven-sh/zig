@@ -10096,6 +10096,12 @@ pub fn getFuncInstanceIes(
     const es_key: Key = .{ .inferred_error_set_type = func_index };
     const fty_key: Key = .{ .func_type = extraFuncType(tid, extra.list.*, func_type_extra_index) };
 
+    // Precompute the instance nav's name/fqn so the string interning (fmt +
+    // hash + alloc) is not serialised under the four shard mutexes below.
+    // `func_index`/`generic_owner` are known here; on the `.existing` path the
+    // interned strings are simply unused (string-pool entries are not freed).
+    const ffi_prep = try prepareFuncInstanceNav(ip, gpa, tid, generic_owner, func_index);
+
     // Four shard mutexes are held simultaneously below; lock in sorted order
     // so concurrent callers cannot ABBA-deadlock.
     var locked_shards: [4]u32 = undefined;
@@ -10120,15 +10126,7 @@ pub fn getFuncInstanceIes(
     var func_ty_gop = try ip.getOrPutKeyPrelocked(gpa, tid, fty_key, 0);
     defer func_ty_gop.deinit();
     func_ty_gop.putTentative(func_ty);
-    try finishFuncInstance(
-        ip,
-        gpa,
-        tid,
-        extra,
-        generic_owner,
-        func_index,
-        func_extra_index,
-    );
+    try commitFuncInstanceNav(ip, gpa, tid, extra, func_index, func_extra_index, ffi_prep);
 
     func_gop.putFinal(func_index);
     error_union_type_gop.putFinal(error_union_type);
@@ -10137,15 +10135,27 @@ pub fn getFuncInstanceIes(
     return func_index;
 }
 
-fn finishFuncInstance(
+const FuncInstanceNavPrep = struct {
+    name: NullTerminatedString,
+    fqn: NullTerminatedString,
+    is_const: bool,
+    alignment: Alignment,
+    @"linksection": OptionalNullTerminatedString,
+    @"addrspace": std.builtin.AddressSpace,
+};
+
+/// String interning + owner-nav modifier reads for `commitFuncInstanceNav`.
+/// Hoisted out of `getFuncInstanceIes` so the (fmt + hash + alloc) cost is
+/// not paid while holding up to four shard mutexes; at high core counts that
+/// serialised every generic instantiation behind whichever shards happened
+/// to collide.
+fn prepareFuncInstanceNav(
     ip: *InternPool,
     gpa: Allocator,
     tid: Zcu.PerThread.Id,
-    extra: Local.Extra.Mutable,
     generic_owner: Index,
     func_index: Index,
-    func_extra_index: u32,
-) Allocator.Error!void {
+) Allocator.Error!FuncInstanceNavPrep {
     const fn_owner_nav = ip.getNav(ip.funcDeclInfo(generic_owner).owner_nav);
     const fn_namespace = fn_owner_nav.analysis.?.namespace;
 
@@ -10165,20 +10175,55 @@ fn finishFuncInstance(
         // state; a genuine `.unresolved` cannot reach instantiation.
         .unresolved => unreachable,
     };
-    const nav_index = try ip.createNav(gpa, tid, .{
+    return .{
         .name = nav_name,
         .fqn = try ip.namespacePtr(fn_namespace).internFullyQualifiedName(ip, gpa, tid, nav_name),
-        .val = func_index,
         .is_const = owner_mods[0],
         .alignment = owner_mods[1],
         .@"linksection" = owner_mods[2],
         .@"addrspace" = owner_mods[3],
-    });
+    };
+}
 
+/// Create the instance Nav and publish it into the func's `owner_nav` slot.
+/// Must run while the func-key shard lock is held: `putTentative` already
+/// published `func_index`, so a concurrent reader that acquires the shard
+/// after we release would otherwise observe `owner_nav == undefined`.
+fn commitFuncInstanceNav(
+    ip: *InternPool,
+    gpa: Allocator,
+    tid: Zcu.PerThread.Id,
+    extra: Local.Extra.Mutable,
+    func_index: Index,
+    func_extra_index: u32,
+    prep: FuncInstanceNavPrep,
+) Allocator.Error!void {
+    const nav_index = try ip.createNav(gpa, tid, .{
+        .name = prep.name,
+        .fqn = prep.fqn,
+        .val = func_index,
+        .is_const = prep.is_const,
+        .alignment = prep.alignment,
+        .@"linksection" = prep.@"linksection",
+        .@"addrspace" = prep.@"addrspace",
+    });
     // Populate the owner_nav field which was left undefined until now.
     extra.view().items(.@"0")[
         func_extra_index + std.meta.fieldIndex(Tag.FuncInstance, "owner_nav").?
     ] = @intFromEnum(nav_index);
+}
+
+fn finishFuncInstance(
+    ip: *InternPool,
+    gpa: Allocator,
+    tid: Zcu.PerThread.Id,
+    extra: Local.Extra.Mutable,
+    generic_owner: Index,
+    func_index: Index,
+    func_extra_index: u32,
+) Allocator.Error!void {
+    const prep = try prepareFuncInstanceNav(ip, gpa, tid, generic_owner, func_index);
+    try commitFuncInstanceNav(ip, gpa, tid, extra, func_index, func_extra_index, prep);
 }
 
 pub const EnumTypeInit = struct {
@@ -12033,10 +12078,19 @@ pub fn resolveNavType(
     assert(nav_analysis_namespace[unwrapped.index] != .none);
     assert(nav_analysis_zir_index[unwrapped.index] != .none);
 
+    // Seqlock-style write paired with the loop in `getNav`: invalidate `bits`
+    // before mutating `type_or_val` so a concurrent reader cannot pair the old
+    // status with the new payload (it sees b1 != b2 and retries). Mirrors
+    // `resolveNavValue` — without this prelude, an unresolved→type_resolved
+    // re-resolution under incremental could tear.
+    var bits = nav_bits[unwrapped.index];
+    bits.writing = true;
+    @atomicStore(Nav.Repr.Bits, &nav_bits[unwrapped.index], bits, .release);
+
     @atomicStore(InternPool.Index, &nav_types[unwrapped.index], resolved.type, .release);
     @atomicStore(OptionalNullTerminatedString, &nav_linksections[unwrapped.index], resolved.@"linksection", .release);
 
-    var bits = nav_bits[unwrapped.index];
+    bits.writing = false;
     bits.status = if (resolved.is_extern_decl) .type_resolved_extern_decl else .type_resolved;
     bits.is_const = resolved.is_const;
     bits.alignment = resolved.alignment;
