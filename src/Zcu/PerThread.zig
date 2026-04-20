@@ -651,6 +651,10 @@ pub fn ensureMemoizedStateUpToDate(pt: Zcu.PerThread, stage: InternPool.Memoized
     claim: while (true) switch (try zcu.claimOrWait(unit)) {
         .claimed => break :claim,
         .recursed => return error.AnalysisFail,
+        .cycle => {
+            Zcu.tls_retry_loop = unit;
+            return error.AnalysisFail;
+        },
         .done => {
             if (zcu.anyAnalysisFailed(unit)) return error.AnalysisFail;
             // The previous holder may have released its claim via a retry-abort
@@ -822,6 +826,10 @@ pub fn ensureComptimeUnitUpToDate(pt: Zcu.PerThread, cu_id: InternPool.ComptimeU
     switch (try zcu.claimOrWait(anal_unit)) {
         .claimed => {},
         .recursed => return error.AnalysisFail,
+        .cycle => {
+            Zcu.tls_retry_loop = anal_unit;
+            return error.AnalysisFail;
+        },
         .done => {
             if (zcu.anyAnalysisFailed(anal_unit)) return error.AnalysisFail;
             return;
@@ -1025,6 +1033,10 @@ pub fn ensureNavValUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zcu
     claim: while (true) switch (try zcu.claimOrWait(anal_unit)) {
         .claimed => break :claim,
         .recursed => return error.AnalysisFail,
+        .cycle => {
+            Zcu.tls_retry_loop = anal_unit;
+            return error.AnalysisFail;
+        },
         .done => {
             if (zcu.anyAnalysisFailed(anal_unit)) return error.AnalysisFail;
             // The previous holder may have released its claim via a retry-abort
@@ -1503,6 +1515,10 @@ pub fn ensureNavTypeUpToDate(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Zc
     claim: while (true) switch (try zcu.claimOrWait(anal_unit)) {
         .claimed => break :claim,
         .recursed => return error.AnalysisFail,
+        .cycle => {
+            Zcu.tls_retry_loop = anal_unit;
+            return error.AnalysisFail;
+        },
         .done => {
             if (zcu.anyAnalysisFailed(anal_unit)) return error.AnalysisFail;
             switch (ip.getNav(nav_id).status) {
@@ -1784,6 +1800,10 @@ pub fn ensureFuncBodyUpToDate(pt: Zcu.PerThread, func_index: InternPool.Index) Z
     } else claim: while (true) switch (try zcu.claimOrWait(anal_unit)) {
         .claimed => break :claim,
         .recursed => return error.AnalysisFail,
+        .cycle => {
+            Zcu.tls_retry_loop = anal_unit;
+            return error.AnalysisFail;
+        },
         .done => {
             if (zcu.anyAnalysisFailed(anal_unit)) return error.AnalysisFail;
             // The previous holder may have released its claim via a retry-abort

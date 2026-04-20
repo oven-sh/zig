@@ -3597,12 +3597,16 @@ pub fn ensureNavValAnalysisQueued(zcu: *Zcu, nav_id: InternPool.Nav.Index) !void
 
     if (zcu.parallel_sema and !zcu.comp.incremental) {
         if (ip.getNav(nav_id).status == .fully_resolved) return;
-        zcu.nav_queued_mutex.lock();
-        defer zcu.nav_queued_mutex.unlock();
-        if (zcu.nav_val_analysis_queued.contains(nav_id)) return;
-        try zcu.nav_val_analysis_queued.ensureUnusedCapacity(zcu.gpa, 1);
-        try zcu.comp.queueJob(.{ .analyze_comptime_unit = .wrap(.{ .nav_val = nav_id }) });
-        zcu.nav_val_analysis_queued.putAssumeCapacityNoClobber(nav_id, {});
+        // Decide under `nav_queued_mutex`, then queue outside it so the
+        // dispatch loop's hot spin on `work_queue_mutex` (taken by
+        // `queueJob`) can't stall threads waiting on `nav_queued_mutex`.
+        const should_queue = sq: {
+            zcu.nav_queued_mutex.lock();
+            defer zcu.nav_queued_mutex.unlock();
+            const gop = try zcu.nav_val_analysis_queued.getOrPut(zcu.gpa, nav_id);
+            break :sq !gop.found_existing;
+        };
+        if (should_queue) try zcu.comp.queueJob(.{ .analyze_comptime_unit = .wrap(.{ .nav_val = nav_id }) });
         return;
     }
 
@@ -3744,13 +3748,18 @@ pub fn awaitNamespaceTypeFinishedSpin(zcu: *const Zcu, ty: InternPool.Index) Int
 /// Try to claim `unit` for analysis on behalf of `tid`. Returns:
 ///  - `.claimed` if the caller now owns analysis of this unit and must call
 ///    `releaseClaim` when done.
-///  - `.recursed` if this thread already owns it, or a cross-thread wait
-///    chain leads back to a unit this thread holds.
+///  - `.recursed` if this thread already owns it (same-thread reentry).
+///  - `.cycle` if a cross-thread wait chain leads back to a unit this thread
+///    holds. Caller must yield-and-requeue (set `tls_retry_loop`) so the
+///    cycle is broken on the next attempt by one thread nesting both claims
+///    and reaching the same-thread `.recursed` path, which produces the
+///    "dependency loop detected" diagnostic. Returning bare AnalysisFail
+///    here would silently `markTransitiveFailed` both units with no error.
 ///  - `.done` if another thread finished analysing it while we waited; caller
 ///    should re-read the unit's resolved status and return.
 /// Locks only `unit`'s shard for the hot path; `claim_waits_mutex` is taken
 /// only when actually parking (rare relative to total calls).
-pub fn claimOrWait(zcu: *Zcu, unit: AnalUnit) Allocator.Error!enum { claimed, recursed, done } {
+pub fn claimOrWait(zcu: *Zcu, unit: AnalUnit) Allocator.Error!enum { claimed, recursed, cycle, done } {
     if (!zcu.parallel_sema) return .claimed;
     const me = std.Thread.getCurrentId();
     const shard = zcu.claimShard(unit);
@@ -3769,7 +3778,7 @@ pub fn claimOrWait(zcu: *Zcu, unit: AnalUnit) Allocator.Error!enum { claimed, re
         // mutex; lock order is shard(unit) then claim_waits then transient
         // shard(chain_unit), and the transient lock is released before the
         // next hop, so no two shard mutexes are held simultaneously.
-        if (zcu.detectClaimCycle(shard, gop.value_ptr.*, me)) return .recursed;
+        if (zcu.detectClaimCycle(shard, gop.value_ptr.*, me)) return .cycle;
         _ = zcu.psema_claim_waits.rmw(.Add, 1, .monotonic);
         zcu.claim_waits_mutex.lock();
         zcu.claim_waits.put(zcu.gpa, me, unit) catch {};
