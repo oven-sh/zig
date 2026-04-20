@@ -40,6 +40,30 @@ jobs:
         if: matrix.safe == 'true'
       - run: sed -i 's/max_rss = 7_800_000_000/max_rss = 10_000_000_000/' zig/build.zig
         if: matrix.safe == 'true'
+      - name: Fetch mimalloc
+        uses: actions/checkout@v4
+        with:
+          repository: oven-sh/mimalloc
+          ref: bun-dev3-v2
+          path: mimalloc
+      - name: Splice mimalloc into bootstrap build
+        # musl's malloc has a single global rwlock; with N parallel LLVM
+        # contexts (--llvm-codegen-threads=N) every `operator new` serialises
+        # on it. mimalloc has per-thread heaps. Compile its unity-build
+        # static.c (with MI_OVERRIDE so it replaces malloc/free) for the
+        # target after the host zig exists, then link the object into the
+        # final cross-compiled zig. Inserted just before the final
+        # `$ZIG build` (the `cd "$ROOTDIR/zig"` line) so $ZIG is available.
+        run: |
+          sed -i '/^cd "\$ROOTDIR\/zig"$/i \
+          MI_MUSL=$(case "$TARGET" in *-linux-musl*) echo "-DMI_LIBC_MUSL=1";; esac)\
+          $ZIG cc -c "$ROOTDIR/mimalloc/src/static.c" \\\
+            -I "$ROOTDIR/mimalloc/include" \\\
+            -target $TARGET -mcpu=$MCPU -O2 -fno-builtin -DNDEBUG -Wno-date-time \\\
+            -DMI_MALLOC_OVERRIDE=1 $MI_MUSL -DMI_STATIC_LIB \\\
+            -o "$ROOTDIR/out/mimalloc-$TARGET-$MCPU.o"\
+          ' build
+          sed -i 's#-Dversion-string="$ZIG_VERSION"#-Dversion-string="$ZIG_VERSION" -Dmimalloc-obj="$ROOTDIR/out/mimalloc-$TARGET-$MCPU.o"#' build
       - run: cat build
       - name: Cache host toolchain
         uses: actions/cache@v4
