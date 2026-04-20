@@ -129,6 +129,14 @@ pub fn build(b: *std.Build) !void {
         "llvm-has-polly",
         "Whether LLVM was built with Polly and requires linking it",
     ) orelse false;
+    const mimalloc_obj = b.option(
+        []const u8,
+        "mimalloc-obj",
+        "Path to a mimalloc static.c object built with MI_OVERRIDE; linked " ++
+            "into the compiler so libc malloc (musl's single-lock allocator " ++
+            "in static builds) is replaced. LLVM emit at high codegen-thread " ++
+            "counts otherwise serialises on the malloc lock.",
+    );
     const enable_ios_sdk = b.option(bool, "enable-ios-sdk", "Run tests requiring presence of iOS SDK and frameworks") orelse false;
     const enable_macos_sdk = b.option(bool, "enable-macos-sdk", "Run tests requiring presence of macOS SDK and frameworks") orelse enable_ios_sdk;
     const enable_symlinks_windows = b.option(bool, "enable-symlinks-windows", "Run tests requiring presence of symlinks on Windows") orelse false;
@@ -208,6 +216,7 @@ pub fn build(b: *std.Build) !void {
     });
     exe.pie = pie;
     exe.entitlements = entitlements;
+    if (mimalloc_obj) |p| exe.addObjectFile(.{ .cwd_relative = p });
 
     const use_llvm = b.option(bool, "use-llvm", "Use the llvm backend");
     exe.use_llvm = use_llvm;
