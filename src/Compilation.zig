@@ -2188,6 +2188,12 @@ pub fn create(gpa: Allocator, arena: Allocator, diag: *CreateDiagnostic, options
         cache.hash.add(options.emit_llvm_ir != .no);
         cache.hash.add(options.emit_llvm_bc != .no);
         cache.hash.add(options.emit_docs != .no);
+        // Sharded codegen changes the output file *set* (one merged object vs.
+        // N shard objects), so the count and the merge/no-link knobs must be
+        // part of the cache key.
+        cache.hash.add(options.llvm_codegen_threads);
+        cache.hash.add(options.llvm_no_merge_shards);
+        cache.hash.add(options.no_link_obj);
         // TODO audit this and make sure everything is in it
 
         const main_mod = options.main_mod orelse options.root_mod;
@@ -3471,14 +3477,17 @@ fn flush(
                 const list = try arena.alloc([*:0]const u8, num_threads);
                 const base_path_slice = std.mem.sliceTo(base_bin_path.?, 0);
 
-                // Strip .o extension if present
-                const base_name: []const u8 = if (std.mem.endsWith(u8, base_path_slice, ".o"))
-                    base_path_slice[0 .. base_path_slice.len - 2]
+                // Strip the target's object-file extension (.o for ELF/Mach-O,
+                // .obj for COFF) so shards become `{stem}.{i}{ext}`.
+                const target = &comp.root_mod.resolved_target.result;
+                const obj_ext = target.ofmt.fileExt(target.cpu.arch);
+                const base_name: []const u8 = if (std.mem.endsWith(u8, base_path_slice, obj_ext))
+                    base_path_slice[0 .. base_path_slice.len - obj_ext.len]
                 else
                     base_path_slice;
 
                 for (0..num_threads) |i| {
-                    list[i] = (try std.fmt.allocPrintSentinel(arena, "{s}.{d}.o", .{ base_name, i }, 0)).ptr;
+                    list[i] = (try std.fmt.allocPrintSentinel(arena, "{s}.{d}{s}", .{ base_name, i, obj_ext }, 0)).ptr;
                 }
                 break :blk list;
             } else null;
