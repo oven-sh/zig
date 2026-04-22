@@ -5466,6 +5466,12 @@ fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
                 .cache_mode = .whole,
                 .reference_trace = reference_trace,
                 .debug_compile_errors = debug_compile_errors,
+                // The build runner pulls in a non-trivial chunk of std.Build;
+                // with single-threaded emit it costs several seconds on a
+                // cold local cache before any user step starts. Shard it the
+                // same as user compiles. `threads.len` is the resolved
+                // `n_jobs` (cpu-count-capped above).
+                .llvm_codegen_threads = @intCast(thread_pool.threads.len),
             }) catch |err| switch (err) {
                 error.CreateFail => fatal("failed to create compilation: {f}", .{create_diag}),
                 else => fatal("failed to create compilation: {s}", .{@errorName(err)}),
