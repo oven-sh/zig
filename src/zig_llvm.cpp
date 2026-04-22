@@ -21,6 +21,8 @@
 #endif
 
 #include <llvm/Analysis/AliasAnalysis.h>
+#include <llvm/Analysis/ModuleSummaryAnalysis.h>
+#include <llvm/Analysis/ProfileSummaryInfo.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
@@ -544,7 +546,17 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machi
     }
 
     if (dest_bin && options->lto) {
-        WriteBitcodeToFile(llvm_module, *dest_bin);
+        // Match Clang's full-LTO output: set module flags and emit a summary so
+        // lld's split-LTO-unit consistency check accepts mixing this with C/C++
+        // bitcode built with -fwhole-program-vtables.
+        if (!llvm_module.getModuleFlag("ThinLTO"))
+            llvm_module.addModuleFlag(Module::Error, "ThinLTO",
+                                      uint32_t(options->lto == ZigLLVMThinOrFullLTOPhase_ThinPreLink));
+        if (!llvm_module.getModuleFlag("EnableSplitLTOUnit"))
+            llvm_module.addModuleFlag(Module::Error, "EnableSplitLTOUnit", uint32_t(1));
+        ProfileSummaryInfo PSI(llvm_module);
+        ModuleSummaryIndex Index = buildModuleSummaryIndex(llvm_module, nullptr, &PSI);
+        WriteBitcodeToFile(llvm_module, *dest_bin, false, &Index);
     }
     if (dest_bitcode) {
         WriteBitcodeToFile(llvm_module, *dest_bitcode);
