@@ -173,12 +173,21 @@ pub fn main() anyerror!void {
         if (build_options.debug_gpa) break :gpa .{ debug_allocator.allocator(), true };
         if (native_os == .wasi) break :gpa .{ std.heap.wasm_allocator, false };
         if (builtin.link_libc) {
-            // We would prefer to use raw libc allocator here, but cannot use
-            // it if it won't support the alignment we need.
-            if (@alignOf(std.c.max_align_t) < @max(@alignOf(i128), std.atomic.cache_line)) {
-                break :gpa .{ std.heap.c_allocator, false };
+            // libc malloc is fine single-threaded, but with ZIG_PARALLEL_SEMA
+            // and high --llvm-codegen-threads the per-process heap lock
+            // (musl's global rwlock, Windows CRT's HeapAlloc critical
+            // section) serialises every gpa allocation across all worker
+            // threads. Prefer the per-thread smp_allocator in release
+            // builds; it backs onto the page allocator so it's safe to mix
+            // with libc malloc used elsewhere (LLVM, C++). Debug keeps
+            // c_allocator so leak tooling and -Ddebug-gpa stay accurate.
+            if (builtin.mode == .Debug) {
+                if (@alignOf(std.c.max_align_t) < @max(@alignOf(i128), std.atomic.cache_line)) {
+                    break :gpa .{ std.heap.c_allocator, false };
+                }
+                break :gpa .{ std.heap.raw_c_allocator, false };
             }
-            break :gpa .{ std.heap.raw_c_allocator, false };
+            break :gpa .{ std.heap.smp_allocator, false };
         }
         break :gpa switch (builtin.mode) {
             .Debug => .{ debug_allocator.allocator(), true },

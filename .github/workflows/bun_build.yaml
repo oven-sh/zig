@@ -47,7 +47,7 @@ jobs:
           repository: oven-sh/mimalloc
           ref: bun-dev3-v2
           path: mimalloc
-      - name: Splice mimalloc into bootstrap build (linux-musl only)
+      - name: Splice mimalloc into bootstrap build (linux-musl)
         # musl's malloc has a single global rwlock; with N parallel LLVM
         # contexts (--llvm-codegen-threads=N) every `operator new` serialises
         # on it. mimalloc has per-thread heaps. Compile its unity-build
@@ -55,7 +55,6 @@ jobs:
         # target after the host zig exists, then link the object into the
         # final cross-compiled zig. Inserted just before the final
         # `$ZIG build` (the `cd "$ROOTDIR/zig"` line) so $ZIG is available.
-        # macOS/Windows mallocs are already per-thread; only musl needs this.
         if: contains(matrix.target, 'linux-musl')
         run: |
           sed -i '/^cd "\$ROOTDIR\/zig"$/i \
@@ -63,6 +62,24 @@ jobs:
             -I "$ROOTDIR/mimalloc/include" \\\
             -target $TARGET -mcpu=$MCPU -O2 -fno-builtin -DNDEBUG -Wno-date-time \\\
             -DMI_MALLOC_OVERRIDE=1 -DMI_LIBC_MUSL=1 -DMI_STATIC_LIB \\\
+            -o "$ROOTDIR/out/mimalloc-$TARGET-$MCPU.o"\
+          ' build
+          sed -i 's#-Dversion-string="$ZIG_VERSION"#-Dversion-string="$ZIG_VERSION" -Dmimalloc-obj="$ROOTDIR/out/mimalloc-$TARGET-$MCPU.o"#' build
+      - name: Splice mimalloc into bootstrap build (windows-gnu)
+        # Windows CRT routes operator new -> HeapAlloc(GetProcessHeap()),
+        # which is guarded by a single critical section — same parallel-emit
+        # serialisation as musl. malloc/free can't be statically interposed
+        # on Windows, but C++ operator new/delete are replaceable per the
+        # standard, and LLVM's hot allocations go through them. Compile the
+        # override TU as C++ so the global operators are emitted; mimalloc
+        # itself is compiled-in via #include of its unity-build static.c.
+        if: contains(matrix.target, 'windows-gnu')
+        run: |
+          sed -i '/^cd "\$ROOTDIR\/zig"$/i \
+          $ZIG c++ -c "$ROOTDIR/zig/tools/mimalloc_new_delete_override.cpp" \\\
+            -I "$ROOTDIR/mimalloc/include" -I "$ROOTDIR/mimalloc" \\\
+            -target $TARGET -mcpu=$MCPU -std=c++17 -O2 -fno-builtin \\\
+            -DNDEBUG -Wno-date-time -DMI_STATIC_LIB \\\
             -o "$ROOTDIR/out/mimalloc-$TARGET-$MCPU.o"\
           ' build
           sed -i 's#-Dversion-string="$ZIG_VERSION"#-Dversion-string="$ZIG_VERSION" -Dmimalloc-obj="$ROOTDIR/out/mimalloc-$TARGET-$MCPU.o"#' build
