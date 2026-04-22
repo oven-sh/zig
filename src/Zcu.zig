@@ -4812,9 +4812,28 @@ pub fn navFileScope(zcu: *Zcu, nav: InternPool.Nav.Index) *File {
     return zcu.fileByIndex(zcu.navFileScopeIndex(nav));
 }
 
+/// Shard assignment for `nav`. Keyed on the file's `shardKey` *plus* the
+/// nav's fully-qualified name so a single file with thousands of generic
+/// instantiations (e.g. printf-style formatters that monomorphise per call
+/// site) doesn't pin the entire emit wall-clock to one LLVM module.
+///
+/// Determinism: the shard key is content-derived (path + FQN bytes), but
+/// FQNs of anonymous types embed InternPool indices (`__anon_N`) which are
+/// not stable across parallel-sema runs. That's no regression — the
+/// per-shard *symbol names* already carry those indices via `shardedNavName`
+/// and the type-name suffix, so sharded `build-obj` output was never
+/// bit-reproducible under `ZIG_PARALLEL_SEMA`. CI release builds use
+/// `--llvm-codegen-threads=1` (no sharding) and remain reproducible. A
+/// proper fix needs structural type-hash naming; tracked separately.
 pub fn navShard(zcu: *Zcu, nav: InternPool.Nav.Index, n: u32) u32 {
     if (n <= 1) return 0;
-    return zcu.navFileScope(nav).computeShard(n);
+    const ip = &zcu.intern_pool;
+    var buf: [512]u8 = undefined;
+    const file_key = zcu.navFileScope(nav).shardKey(&buf);
+    var h: std.hash.Wyhash = .init(0);
+    h.update(file_key);
+    h.update(ip.getNav(nav).fqn.toSlice(ip));
+    return @intCast(h.final() % n);
 }
 
 /// Returns the LLVM codegen shard that owns `unit`. Module-level assembly is
