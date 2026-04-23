@@ -5,6 +5,7 @@ on:
     branches:
       - 014-dev
       - upgrade-0.15.2
+      - upgrade-0.15.2-fast
 concurrency:
   group: ${{ github.head_ref || github.run_id }}-${{ github.actor }}
   cancel-in-progress: true
