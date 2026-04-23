@@ -107,10 +107,14 @@ pub fn broadcast(self: *Condition) void {
     self.impl.wake(.all);
 }
 
+// FutexImpl is used everywhere, including Windows. WindowsImpl wraps the
+// kernel CONDITION_VARIABLE which has no userspace "no waiters" fast-path —
+// every wake() is a kernel32 call. Under heavily-signalled condvars (e.g.
+// the compiler's per-job work_queue_cond.signal()) this dominates wall time
+// at high thread counts. FutexImpl checks `wakeable == 0` in userspace
+// first; on Windows the underlying Futex maps to RtlWaitOnAddress (Win8+).
 const Impl = if (builtin.single_threaded)
     SingleThreadedImpl
-else if (builtin.os.tag == .windows)
-    WindowsImpl
 else
     FutexImpl;
 

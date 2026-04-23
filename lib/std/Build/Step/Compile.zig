@@ -159,12 +159,14 @@ dead_strip_dylibs: bool = false,
 
 /// Number of threads to use for LLVM backend code generation.
 /// 0 means single-threaded (default). > 1 enables parallel codegen.
-/// When enabled, outputs multiple .o files: filename.0.o, filename.1.o, etc.
+/// When enabled, outputs multiple object files: filename.0.o, filename.1.o, etc.
+/// (or .obj on COFF targets).
 llvm_codegen_threads: u32 = 0,
 
 /// Skip the relocatable -r merge of partitioned LLVM output. The shard
-/// objects are emitted directly to `{emit}.{i}.o` for the downstream linker
-/// to consume. Only meaningful when `llvm_codegen_threads > 1`.
+/// objects are emitted directly to `{emit}.{i}.o` (or `.obj` on COFF) for
+/// the downstream linker to consume. Only meaningful when
+/// `llvm_codegen_threads > 1`.
 llvm_no_merge_shards: bool = false,
 
 /// Skip linker step for build-obj - outputs raw LLVM object file(s).
@@ -899,10 +901,11 @@ pub fn getEmittedBin(compile: *Compile) LazyPath {
 }
 
 /// Returns the per-shard object paths when `llvm_no_merge_shards` is set.
-/// Shard `i` lives at `{dir}/{stem}.{i}.o` where `dir` is the emitted-bin
-/// directory and `stem` is `out_filename` with a trailing `.o` stripped. The
-/// returned slice has `llvm_codegen_threads` entries, allocated from the
-/// build arena.
+/// Shard `i` lives at `{dir}/{stem}.{i}{ext}` where `dir` is the emitted-bin
+/// directory, `stem` is `out_filename` with the target's object extension
+/// stripped, and `ext` is that extension (`.o` for ELF/Mach-O, `.obj` for
+/// COFF). The returned slice has `llvm_codegen_threads` entries, allocated
+/// from the build arena.
 ///
 /// Intended use: `addObject` is configured with `llvm_codegen_threads > 1`
 /// and `llvm_no_merge_shards = true`; the consumer (an executable's link
@@ -913,13 +916,15 @@ pub fn getEmittedBinShards(compile: *Compile) []std.Build.LazyPath {
     assert(compile.llvm_codegen_threads > 1);
     const b = compile.step.owner;
     const dir = compile.getEmittedBinDirectory();
-    const stem = if (std.mem.endsWith(u8, compile.out_filename, ".o"))
-        compile.out_filename[0 .. compile.out_filename.len - 2]
+    const target = compile.rootModuleTarget();
+    const obj_ext = target.ofmt.fileExt(target.cpu.arch);
+    const stem = if (std.mem.endsWith(u8, compile.out_filename, obj_ext))
+        compile.out_filename[0 .. compile.out_filename.len - obj_ext.len]
     else
         compile.out_filename;
     const out = b.allocator.alloc(std.Build.LazyPath, compile.llvm_codegen_threads) catch @panic("OOM");
     for (out, 0..) |*p, i| {
-        p.* = dir.path(b, b.fmt("{s}.{d}.o", .{ stem, i }));
+        p.* = dir.path(b, b.fmt("{s}.{d}{s}", .{ stem, i, obj_ext }));
     }
     return out;
 }

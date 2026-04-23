@@ -414,15 +414,17 @@ pub const File = struct {
             out[0] = single;
             return out;
         }
+        const target = &base.comp.root_mod.resolved_target.result;
+        const obj_ext = target.ofmt.fileExt(target.cpu.arch);
         const base_path = single.sub_path;
-        const base_name = if (std.mem.endsWith(u8, base_path, ".o"))
-            base_path[0 .. base_path.len - 2]
+        const base_name = if (std.mem.endsWith(u8, base_path, obj_ext))
+            base_path[0 .. base_path.len - obj_ext.len]
         else
             base_path;
         const out = try arena.alloc(Cache.Path, n);
         for (out, 0..) |*p, i| p.* = .{
             .root_dir = single.root_dir,
-            .sub_path = try std.fmt.allocPrint(arena, "{s}.{d}.o", .{ base_name, i }),
+            .sub_path = try std.fmt.allocPrint(arena, "{s}.{d}{s}", .{ base_name, i, obj_ext }),
         };
         return out;
     }
