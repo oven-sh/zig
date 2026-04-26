@@ -239,15 +239,7 @@ pub const InferredErrorSet = struct {
     }
 };
 
-/// Stores the mapping from `Zir.Inst.Index -> Air.Inst.Ref`, which is used by sema to resolve
-/// instructions during analysis.
-/// Instead of a hash table approach, InstMap is simply a slice that is indexed into using the
-/// zir instruction index and a start offset. An index is not present in the map if the value
-/// at the index is `Air.Inst.Ref.none`.
-/// `ensureSpaceForInstructions` can be called to force InstMap to have a mapped range that
-/// includes all instructions in a slice. After calling this function, `putAssumeCapacity*` can
-/// be called safely for any of the instructions passed in.
-/// Captured call-site context for a `lazy` parameter whose argument expression has not
+/// Captured call-site context for a `zig_lazy` parameter whose argument expression has not
 /// yet been evaluated. See `Sema.lazy_args`.
 pub const LazyArg = struct {
     /// Call-site block; AIR for the deferred argument is emitted here.
@@ -265,6 +257,14 @@ pub const LazyArg = struct {
     maybe_func_src_inst: ?InternPool.TrackedInst.Index,
 };
 
+/// Stores the mapping from `Zir.Inst.Index -> Air.Inst.Ref`, which is used by sema to resolve
+/// instructions during analysis.
+/// Instead of a hash table approach, InstMap is simply a slice that is indexed into using the
+/// zir instruction index and a start offset. An index is not present in the map if the value
+/// at the index is `Air.Inst.Ref.none`.
+/// `ensureSpaceForInstructions` can be called to force InstMap to have a mapped range that
+/// includes all instructions in a slice. After calling this function, `putAssumeCapacity*` can
+/// be called safely for any of the instructions passed in.
 pub const InstMap = struct {
     items: []Air.Inst.Ref = &[_]Air.Inst.Ref{},
     start: Zir.Inst.Index = @enumFromInt(0),
