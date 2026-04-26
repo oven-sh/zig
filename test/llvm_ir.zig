@@ -173,6 +173,14 @@ pub fn addCases(cases: *tests.LlvmIrContext) void {
         "trunc nsw i64",
     }, .{ .optimize = .ReleaseFast });
 
+    cases.addMatches("intCast trunc nuw nsw",
+        \\export fn entry(x: u64) i32 {
+        \\    return @intCast(x);
+        \\}
+    , &.{
+        "trunc nuw nsw i64",
+    }, .{ .optimize = .ReleaseFast });
+
     cases.addMatches("intCast zext nneg",
         \\export fn entry(x: i32) u64 {
         \\    return @intCast(x);
