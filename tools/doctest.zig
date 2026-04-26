@@ -694,6 +694,7 @@ fn tokenizeAndPrint(arena: Allocator, out: anytype, raw_src: []const u8) !void {
             .keyword_volatile,
             .keyword_allowzero,
             .keyword_while,
+            .keyword_zig_lazy,
             .keyword_anytype,
             => {
                 try out.writeAll("<span class=\"tok-kw\">");

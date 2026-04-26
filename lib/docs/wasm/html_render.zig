@@ -141,6 +141,7 @@ pub fn fileSourceHtml(
             .keyword_volatile,
             .keyword_allowzero,
             .keyword_while,
+            .keyword_zig_lazy,
             .keyword_anytype,
             .keyword_fn,
             => {
