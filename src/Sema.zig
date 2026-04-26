@@ -246,9 +246,13 @@ pub const LazyArg = struct {
     block: *Block,
     /// `sema.code` at the call site.
     code: Zir,
-    /// Snapshot of `sema.inst_map` at the call site. The backing storage stays alive for
-    /// the duration of the inline call (it is the saved `old_inst_map` in `analyzeCall`).
-    inst_map: InstMap,
+    /// `sema.inst_map` at the call site. Points at the saved `old_inst_map` local in
+    /// `analyzeCall`, which outlives the inline body. Any growth that happens while
+    /// analyzing the deferred argument is written back through this pointer.
+    inst_map: *InstMap,
+    /// `sema.lazy_args` at the call site, so a deferred expression can itself reference
+    /// an outer inline call's lazy parameter. Points at `old_lazy_args` in `analyzeCall`.
+    lazy_args: *std.AutoArrayHashMapUnmanaged(Zir.Inst.Index, LazyArg),
     args_info: CallArgsInfo,
     arg_index: u32,
     param_ty: ?Type,
@@ -2039,9 +2043,11 @@ fn resolveLazyArg(sema: *Sema, param_inst: Zir.Inst.Index) CompileError!Air.Inst
         const cur_inst_map = sema.inst_map;
         const cur_lazy_args = sema.lazy_args;
         sema.code = lazy.code;
-        sema.inst_map = lazy.inst_map;
-        sema.lazy_args = .empty;
+        sema.inst_map = lazy.inst_map.*;
+        sema.lazy_args = lazy.lazy_args.*;
         defer {
+            lazy.inst_map.* = sema.inst_map;
+            lazy.lazy_args.* = sema.lazy_args;
             sema.code = cur_code;
             sema.inst_map = cur_inst_map;
             sema.lazy_args = cur_lazy_args;
@@ -7821,9 +7827,9 @@ fn analyzeCall(
 
     var new_ies: InferredErrorSet = .{ .func = .none };
 
-    const old_inst_map = sema.inst_map;
+    var old_inst_map = sema.inst_map;
     const old_code = sema.code;
-    const old_lazy_args = sema.lazy_args;
+    var old_lazy_args = sema.lazy_args;
     const old_func_index = sema.func_index;
     const old_fn_ret_ty = sema.fn_ret_ty;
     const old_fn_ret_ty_ies = sema.fn_ret_ty_ies;
@@ -7855,7 +7861,8 @@ fn analyzeCall(
             try sema.lazy_args.put(gpa, fn_zir_info.param_body[arg_idx], .{
                 .block = block,
                 .code = old_code,
-                .inst_map = old_inst_map,
+                .inst_map = &old_inst_map,
+                .lazy_args = &old_lazy_args,
                 .args_info = args_info,
                 .arg_index = @intCast(arg_idx),
                 .param_ty = lazy_param_tys[arg_idx],

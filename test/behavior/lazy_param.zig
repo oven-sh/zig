@@ -227,6 +227,20 @@ test "zig_lazy: nested inline call, outer gate elides through inner lazy" {
     try expect(n == 0);
 }
 
+inline fn outerForce(zig_lazy x: u32) u32 {
+    return innerForce(x);
+}
+
+test "zig_lazy: forcing through chained lazy params resolves outer thunk" {
+    var n: u32 = 0;
+    const r = outerForce(blk: {
+        n += 1;
+        break :blk 5;
+    });
+    try expect(r == 6);
+    try expect(n == 1);
+}
+
 inline fn forceB(zig_lazy a: u32, zig_lazy b: u32) u32 {
     if (b == 0) return 0;
     return a;
