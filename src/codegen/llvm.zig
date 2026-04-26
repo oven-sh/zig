@@ -1193,8 +1193,12 @@ pub const Object = struct {
 
         if (func_analysis.branch_hint == .cold) {
             try attributes.addFnAttr(.cold, &o.builder);
+            try attributes.addFnAttr(.optsize, &o.builder);
         } else {
             _ = try attributes.removeFnAttr(.cold);
+            if (owner_mod.optimize_mode != .ReleaseSmall) {
+                _ = try attributes.removeFnAttr(.optsize);
+            }
         }
 
         if (owner_mod.sanitize_thread and !func_analysis.disable_instrumentation) {
@@ -1329,7 +1333,7 @@ pub const Object = struct {
                         const param = wip.arg(llvm_arg_i);
                         const alignment = param_ty.abiAlignment(zcu).toLlvm();
 
-                        try o.addByRefParamAttrs(&attributes, llvm_arg_i, alignment, it.byval_attr, param_llvm_ty);
+                        try o.addByRefParamAttrs(&attributes, llvm_arg_i, alignment, it.byval_attr, param_llvm_ty, param_ty.abiSize(zcu));
                         llvm_arg_i += 1;
 
                         if (isByRef(param_ty, zcu)) {
@@ -1344,7 +1348,7 @@ pub const Object = struct {
                         const param = wip.arg(llvm_arg_i);
                         const alignment = param_ty.abiAlignment(zcu).toLlvm();
 
-                        try attributes.addParamAttr(llvm_arg_i, .noundef, &o.builder);
+                        try o.addByRefMutParamAttrs(&attributes, llvm_arg_i, alignment, param_ty.abiSize(zcu));
                         llvm_arg_i += 1;
 
                         if (isByRef(param_ty, zcu)) {
@@ -2757,10 +2761,18 @@ pub const Object = struct {
         if (sret) {
             // Sret pointers must not be address 0
             try attributes.addParamAttr(llvm_arg_i, .nonnull, &o.builder);
+            try attributes.addParamAttr(llvm_arg_i, .noundef, &o.builder);
             try attributes.addParamAttr(llvm_arg_i, .@"noalias", &o.builder);
+            try attributes.addParamAttr(llvm_arg_i, .writable, &o.builder);
+            try attributes.addParamAttr(llvm_arg_i, .dead_on_unwind, &o.builder);
 
-            const raw_llvm_ret_ty = try o.lowerType(pt, Type.fromInterned(fn_info.return_type));
+            const ret_ty = Type.fromInterned(fn_info.return_type);
+            const raw_llvm_ret_ty = try o.lowerType(pt, ret_ty);
             try attributes.addParamAttr(llvm_arg_i, .{ .sret = raw_llvm_ret_ty }, &o.builder);
+            try attributes.addParamAttr(llvm_arg_i, .{ .@"align" = ret_ty.abiAlignment(zcu).toLlvm() }, &o.builder);
+            if (math.cast(u32, ret_ty.abiSize(zcu))) |size| {
+                try attributes.addParamAttr(llvm_arg_i, .{ .dereferenceable = size }, &o.builder);
+            }
 
             llvm_arg_i += 1;
         }
@@ -2880,9 +2892,13 @@ pub const Object = struct {
                     const param_ty = Type.fromInterned(fn_info.param_types.get(ip)[it.zig_index - 1]);
                     const param_llvm_ty = try o.lowerType(pt, param_ty);
                     const alignment = param_ty.abiAlignment(zcu);
-                    try o.addByRefParamAttrs(&attributes, it.llvm_index - 1, alignment.toLlvm(), it.byval_attr, param_llvm_ty);
+                    try o.addByRefParamAttrs(&attributes, it.llvm_index - 1, alignment.toLlvm(), it.byval_attr, param_llvm_ty, param_ty.abiSize(zcu));
                 },
-                .byref_mut => try attributes.addParamAttr(it.llvm_index - 1, .noundef, &o.builder),
+                .byref_mut => {
+                    const param_ty = Type.fromInterned(fn_info.param_types.get(ip)[it.zig_index - 1]);
+                    const alignment = param_ty.abiAlignment(zcu);
+                    try o.addByRefMutParamAttrs(&attributes, it.llvm_index - 1, alignment.toLlvm(), param_ty.abiSize(zcu));
+                },
                 // No attributes needed for these.
                 .no_bits,
                 .abi_sized_int,
@@ -3005,7 +3021,14 @@ pub const Object = struct {
         variable_index.setLinkage(.internal, &o.builder);
         variable_index.setMutability(.constant, &o.builder);
         variable_index.setUnnamedAddr(.unnamed_addr, &o.builder);
-        variable_index.setAlignment(alignment.toLlvm(), &o.builder);
+        // Match Clang's heuristic of over-aligning large private constants so that
+        // SROA / memcpy lowering can use wide vector moves. The address is not
+        // observable (`unnamed_addr`), so increasing alignment is always safe.
+        const uav_align = if (Type.fromInterned(decl_ty).abiSize(zcu) >= 16)
+            alignment.maxStrict(.@"16")
+        else
+            alignment;
+        variable_index.setAlignment(uav_align.toLlvm(), &o.builder);
         return variable_index;
     }
 
@@ -4413,6 +4436,29 @@ pub const Object = struct {
                 ptr_info.flags.address_space == .generic)
             {
                 try attributes.addParamAttr(llvm_arg_i, .nonnull, &o.builder);
+                // A non-optional, non-allowzero single-item pointer always points to a live
+                // object of exactly @sizeOf(child) bytes for the lifetime of the call.
+                if (ptr_info.flags.size == .one) {
+                    const child_ty = Type.fromInterned(ptr_info.child);
+                    if (child_ty.hasRuntimeBitsIgnoreComptime(zcu) and
+                        child_ty.zigTypeTag(zcu) != .@"opaque" and
+                        ptr_info.packed_offset.host_size == 0)
+                    {
+                        if (math.cast(u32, child_ty.abiSize(zcu))) |size| {
+                            try attributes.addParamAttr(llvm_arg_i, .{ .dereferenceable = size }, &o.builder);
+                        }
+                    }
+                }
+            } else if (ptr_info.flags.size == .one and ptr_info.flags.address_space == .generic) {
+                const child_ty = Type.fromInterned(ptr_info.child);
+                if (child_ty.hasRuntimeBitsIgnoreComptime(zcu) and
+                    child_ty.zigTypeTag(zcu) != .@"opaque" and
+                    ptr_info.packed_offset.host_size == 0)
+                {
+                    if (math.cast(u32, child_ty.abiSize(zcu))) |size| {
+                        try attributes.addParamAttr(llvm_arg_i, .{ .dereferenceable_or_null = size }, &o.builder);
+                    }
+                }
             }
             switch (fn_info.cc) {
                 else => {},
@@ -4444,11 +4490,31 @@ pub const Object = struct {
         alignment: Builder.Alignment,
         byval: bool,
         param_llvm_ty: Builder.Type,
+        abi_size: u64,
     ) Allocator.Error!void {
         try attributes.addParamAttr(llvm_arg_i, .nonnull, &o.builder);
+        try attributes.addParamAttr(llvm_arg_i, .noundef, &o.builder);
         try attributes.addParamAttr(llvm_arg_i, .readonly, &o.builder);
         try attributes.addParamAttr(llvm_arg_i, .{ .@"align" = alignment }, &o.builder);
+        if (math.cast(u32, abi_size)) |size| {
+            try attributes.addParamAttr(llvm_arg_i, .{ .dereferenceable = size }, &o.builder);
+        }
         if (byval) try attributes.addParamAttr(llvm_arg_i, .{ .byval = param_llvm_ty }, &o.builder);
+    }
+
+    fn addByRefMutParamAttrs(
+        o: *Object,
+        attributes: *Builder.FunctionAttributes.Wip,
+        llvm_arg_i: u32,
+        alignment: Builder.Alignment,
+        abi_size: u64,
+    ) Allocator.Error!void {
+        try attributes.addParamAttr(llvm_arg_i, .nonnull, &o.builder);
+        try attributes.addParamAttr(llvm_arg_i, .noundef, &o.builder);
+        try attributes.addParamAttr(llvm_arg_i, .{ .@"align" = alignment }, &o.builder);
+        if (math.cast(u32, abi_size)) |size| {
+            try attributes.addParamAttr(llvm_arg_i, .{ .dereferenceable = size }, &o.builder);
+        }
     }
 
     fn llvmFieldIndex(o: *Object, struct_ty: Type, field_index: usize) ?c_uint {
@@ -5294,8 +5360,17 @@ pub const FuncGen = struct {
         const ret_ptr = if (!sret) null else blk: {
             const llvm_ret_ty = try o.lowerType(pt, return_type);
             try attributes.addParamAttr(0, .{ .sret = llvm_ret_ty }, &o.builder);
+            try attributes.addParamAttr(0, .nonnull, &o.builder);
+            try attributes.addParamAttr(0, .noundef, &o.builder);
+            try attributes.addParamAttr(0, .@"noalias", &o.builder);
+            try attributes.addParamAttr(0, .writable, &o.builder);
+            try attributes.addParamAttr(0, .dead_on_unwind, &o.builder);
 
             const alignment = return_type.abiAlignment(zcu).toLlvm();
+            try attributes.addParamAttr(0, .{ .@"align" = alignment }, &o.builder);
+            if (math.cast(u32, return_type.abiSize(zcu))) |size| {
+                try attributes.addParamAttr(0, .{ .dereferenceable = size }, &o.builder);
+            }
             const ret_ptr = try self.buildAlloca(llvm_ret_ty, alignment);
             try llvm_args.append(ret_ptr);
             break :blk ret_ptr;
@@ -5457,9 +5532,14 @@ pub const FuncGen = struct {
                     const param_ty = Type.fromInterned(fn_info.param_types.get(ip)[param_index]);
                     const param_llvm_ty = try o.lowerType(pt, param_ty);
                     const alignment = param_ty.abiAlignment(zcu).toLlvm();
-                    try o.addByRefParamAttrs(&attributes, it.llvm_index - 1, alignment, it.byval_attr, param_llvm_ty);
+                    try o.addByRefParamAttrs(&attributes, it.llvm_index - 1, alignment, it.byval_attr, param_llvm_ty, param_ty.abiSize(zcu));
                 },
-                .byref_mut => try attributes.addParamAttr(it.llvm_index - 1, .noundef, &o.builder),
+                .byref_mut => {
+                    const param_index = it.zig_index - 1;
+                    const param_ty = Type.fromInterned(fn_info.param_types.get(ip)[param_index]);
+                    const alignment = param_ty.abiAlignment(zcu).toLlvm();
+                    try o.addByRefMutParamAttrs(&attributes, it.llvm_index - 1, alignment, param_ty.abiSize(zcu));
+                },
                 // No attributes needed for these.
                 .no_bits,
                 .abi_sized_int,
@@ -8874,7 +8954,10 @@ pub const FuncGen = struct {
 
         if (op != .tan and intrinsicsAllowed(scalar_ty, target)) switch (op) {
             // Some operations are dedicated LLVM instructions, not available as intrinsics
-            .neg => return self.wip.un(.fneg, params[0], ""),
+            .neg => return self.wip.un(switch (fast) {
+                .normal => .fneg,
+                .fast => .@"fneg fast",
+            }, params[0], ""),
             .add, .sub, .mul, .div, .fmod => return self.wip.bin(switch (fast) {
                 .normal => switch (op) {
                     .add => .fadd,
@@ -9254,27 +9337,32 @@ pub const FuncGen = struct {
         const operand_info = operand_ty.intInfo(zcu);
 
         const dest_is_enum = dest_ty.zigTypeTag(zcu) == .@"enum";
+        const dest_info = dest_ty.intInfo(zcu);
+
+        const have_min_check, const have_max_check = c: {
+            const dest_pos_bits = dest_info.bits - @intFromBool(dest_info.signedness == .signed);
+            const operand_pos_bits = operand_info.bits - @intFromBool(operand_info.signedness == .signed);
+
+            const dest_allows_neg = dest_info.signedness == .signed and dest_info.bits > 0;
+            const operand_maybe_neg = operand_info.signedness == .signed and operand_info.bits > 0;
+
+            break :c .{
+                operand_maybe_neg and (!dest_allows_neg or dest_info.bits < operand_info.bits),
+                dest_pos_bits < operand_pos_bits,
+            };
+        };
 
         bounds_check: {
+            // In unchecked mode, do not emit `llvm.assume(icmp ...)` for the bounds. The
+            // assume intrinsic is opaque to FunctionAttrs (it loses `memory(none)`) and the
+            // vector path's `vector.reduce.and` cannot be decomposed by the optimizer, so
+            // the cost outweighs the range hint. Flagged casts (`trunc nuw/nsw`, `zext nneg`)
+            // convey the same information without side effects.
+            if (!safety) break :bounds_check;
+            if (!have_min_check and !have_max_check) break :bounds_check;
+
             const dest_scalar = dest_ty.scalarType(zcu);
             const operand_scalar = operand_ty.scalarType(zcu);
-
-            const dest_info = dest_ty.intInfo(zcu);
-
-            const have_min_check, const have_max_check = c: {
-                const dest_pos_bits = dest_info.bits - @intFromBool(dest_info.signedness == .signed);
-                const operand_pos_bits = operand_info.bits - @intFromBool(operand_info.signedness == .signed);
-
-                const dest_allows_neg = dest_info.signedness == .signed and dest_info.bits > 0;
-                const operand_maybe_neg = operand_info.signedness == .signed and operand_info.bits > 0;
-
-                break :c .{
-                    operand_maybe_neg and (!dest_allows_neg or dest_info.bits < operand_info.bits),
-                    dest_pos_bits < operand_pos_bits,
-                };
-            };
-
-            if (!have_min_check and !have_max_check) break :bounds_check;
 
             const operand_llvm_ty = try o.lowerType(pt, operand_ty);
             const operand_scalar_llvm_ty = try o.lowerType(pt, operand_scalar);
@@ -9292,16 +9380,12 @@ pub const FuncGen = struct {
                     const vec_ty = ok_maybe_vec.typeOfWip(&fg.wip);
                     break :ok try fg.wip.callIntrinsic(.normal, .none, .@"vector.reduce.and", &.{vec_ty}, &.{ok_maybe_vec}, "");
                 } else ok_maybe_vec;
-                if (safety) {
-                    const fail_block = try fg.wip.block(1, "IntMinFail");
-                    const ok_block = try fg.wip.block(1, "IntMinOk");
-                    _ = try fg.wip.brCond(ok, ok_block, fail_block, .none);
-                    fg.wip.cursor = .{ .block = fail_block };
-                    try fg.buildSimplePanic(panic_id);
-                    fg.wip.cursor = .{ .block = ok_block };
-                } else {
-                    _ = try fg.wip.callIntrinsic(.normal, .none, .assume, &.{}, &.{ok}, "");
-                }
+                const fail_block = try fg.wip.block(1, "IntMinFail");
+                const ok_block = try fg.wip.block(1, "IntMinOk");
+                _ = try fg.wip.brCond(ok, ok_block, fail_block, .none);
+                fg.wip.cursor = .{ .block = fail_block };
+                try fg.buildSimplePanic(panic_id);
+                fg.wip.cursor = .{ .block = ok_block };
             }
 
             if (have_max_check) {
@@ -9312,23 +9396,41 @@ pub const FuncGen = struct {
                     const vec_ty = ok_maybe_vec.typeOfWip(&fg.wip);
                     break :ok try fg.wip.callIntrinsic(.normal, .none, .@"vector.reduce.and", &.{vec_ty}, &.{ok_maybe_vec}, "");
                 } else ok_maybe_vec;
-                if (safety) {
-                    const fail_block = try fg.wip.block(1, "IntMaxFail");
-                    const ok_block = try fg.wip.block(1, "IntMaxOk");
-                    _ = try fg.wip.brCond(ok, ok_block, fail_block, .none);
-                    fg.wip.cursor = .{ .block = fail_block };
-                    try fg.buildSimplePanic(panic_id);
-                    fg.wip.cursor = .{ .block = ok_block };
-                } else {
-                    _ = try fg.wip.callIntrinsic(.normal, .none, .assume, &.{}, &.{ok}, "");
-                }
+                const fail_block = try fg.wip.block(1, "IntMaxFail");
+                const ok_block = try fg.wip.block(1, "IntMaxOk");
+                _ = try fg.wip.brCond(ok, ok_block, fail_block, .none);
+                fg.wip.cursor = .{ .block = fail_block };
+                try fg.buildSimplePanic(panic_id);
+                fg.wip.cursor = .{ .block = ok_block };
             }
         }
 
-        const result = try fg.wip.conv(switch (operand_info.signedness) {
-            .signed => .signed,
-            .unsigned => .unsigned,
-        }, operand, dest_llvm_ty, "");
+        const result = result: {
+            const operand_llvm_ty = operand.typeOfWip(&fg.wip);
+            const operand_llvm_bits = operand_llvm_ty.scalarBits(&o.builder);
+            const dest_llvm_bits = dest_llvm_ty.scalarBits(&o.builder);
+            if (dest_llvm_bits < operand_llvm_bits) {
+                // Out-of-range narrowing is illegal behavior, so the dropped bits are known.
+                const tag: Builder.WipFunction.Instruction.Tag = switch (dest_info.signedness) {
+                    .unsigned => .@"trunc nuw",
+                    .signed => switch (operand_info.signedness) {
+                        .unsigned => .@"trunc nuw nsw",
+                        .signed => .@"trunc nsw",
+                    },
+                };
+                break :result try fg.wip.cast(tag, operand, dest_llvm_ty, "");
+            } else if (dest_llvm_bits > operand_llvm_bits and
+                operand_info.signedness == .signed and have_min_check)
+            {
+                // Widening from signed to a type that cannot hold negative values: the
+                // operand is asserted non-negative, so prefer `zext nneg` over `sext`.
+                break :result try fg.wip.cast(.@"zext nneg", operand, dest_llvm_ty, "");
+            }
+            break :result try fg.wip.conv(switch (operand_info.signedness) {
+                .signed => .signed,
+                .unsigned => .unsigned,
+            }, operand, dest_llvm_ty, "");
+        };
 
         if (safety and dest_is_enum and !dest_ty.isNonexhaustiveEnum(zcu)) {
             const llvm_fn = try fg.getIsNamedEnumValueFunction(dest_ty);
@@ -10107,26 +10209,23 @@ pub const FuncGen = struct {
             return .none;
         }
 
-        // non-byte-sized element. lower with a loop. something like this:
-
+        // non-byte-sized element. lower with a counted loop so that ScalarEvolution
+        // sees a clean `len` trip count instead of a pointer-difference expression:
+        //
         // entry:
-        //   ...
-        //   %end_ptr = getelementptr %ptr, %len
-        //   br %loop
-        // loop:
-        //   %it_ptr = phi body %next_ptr, entry %ptr
-        //   %end = cmp eq %it_ptr, %end_ptr
-        //   br %end, %body, %end
+        //   %empty = icmp eq %len, 0
+        //   br %empty, %end, %body
         // body:
-        //   store %it_ptr, %value
-        //   %next_ptr = getelementptr %it_ptr, 1
-        //   br %loop
+        //   %i = phi [ 0, entry ], [ %i.next, body ]
+        //   %it_ptr = getelementptr %ptr, %i
+        //   store %value, %it_ptr
+        //   %i.next = add nuw %i, 1
+        //   %done = icmp eq %i.next, %len
+        //   br %done, %end, %body
         // end:
-        //   ...
         const entry_block = self.wip.cursor.block;
-        const loop_block = try self.wip.block(2, "InlineMemsetLoop");
-        const body_block = try self.wip.block(1, "InlineMemsetBody");
-        const end_block = try self.wip.block(1, "InlineMemsetEnd");
+        const body_block = try self.wip.block(2, "InlineMemsetBody");
+        const end_block = try self.wip.block(2, "InlineMemsetEnd");
 
         const llvm_usize_ty = try o.lowerType(pt, Type.usize);
         const len = switch (ptr_ty.ptrSize(zcu)) {
@@ -10135,20 +10234,18 @@ pub const FuncGen = struct {
             .many, .c => unreachable,
         };
         const elem_llvm_ty = try o.lowerType(pt, elem_ty);
-        const end_ptr = try self.wip.gep(.inbounds, elem_llvm_ty, dest_ptr, &.{len}, "");
-        _ = try self.wip.br(loop_block);
-
-        self.wip.cursor = .{ .block = loop_block };
-        const it_ptr = try self.wip.phi(.ptr, "");
-        const end = try self.wip.icmp(.ne, it_ptr.toValue(), end_ptr, "");
-        _ = try self.wip.brCond(end, body_block, end_block, .none);
+        const usize_zero = try o.builder.intValue(llvm_usize_ty, 0);
+        const empty = try self.wip.icmp(.eq, len, usize_zero, "");
+        _ = try self.wip.brCond(empty, end_block, body_block, .none);
 
         self.wip.cursor = .{ .block = body_block };
+        const idx = try self.wip.phi(llvm_usize_ty, "");
+        const it_ptr = try self.wip.gep(.inbounds, elem_llvm_ty, dest_ptr, &.{idx.toValue()}, "");
         const elem_abi_align = elem_ty.abiAlignment(zcu);
         const it_ptr_align = InternPool.Alignment.fromLlvm(dest_ptr_align).min(elem_abi_align).toLlvm();
         if (isByRef(elem_ty, zcu)) {
             _ = try self.wip.callMemCpy(
-                it_ptr.toValue(),
+                it_ptr,
                 it_ptr_align,
                 value,
                 elem_abi_align.toLlvm(),
@@ -10156,14 +10253,13 @@ pub const FuncGen = struct {
                 access_kind,
                 self.disable_intrinsics,
             );
-        } else _ = try self.wip.store(access_kind, value, it_ptr.toValue(), it_ptr_align);
-        const next_ptr = try self.wip.gep(.inbounds, elem_llvm_ty, it_ptr.toValue(), &.{
-            try o.builder.intValue(llvm_usize_ty, 1),
-        }, "");
-        _ = try self.wip.br(loop_block);
+        } else _ = try self.wip.store(access_kind, value, it_ptr, it_ptr_align);
+        const idx_next = try self.wip.bin(.@"add nuw", idx.toValue(), try o.builder.intValue(llvm_usize_ty, 1), "");
+        const done = try self.wip.icmp(.eq, idx_next, len, "");
+        _ = try self.wip.brCond(done, end_block, body_block, .none);
 
         self.wip.cursor = .{ .block = end_block };
-        it_ptr.finish(&.{ next_ptr, dest_ptr }, &.{ body_block, entry_block }, &self.wip);
+        idx.finish(&.{ usize_zero, idx_next }, &.{ entry_block, body_block }, &self.wip);
         return .none;
     }
 

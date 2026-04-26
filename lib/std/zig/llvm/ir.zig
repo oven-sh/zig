@@ -1272,6 +1272,7 @@ pub const FunctionBlock = struct {
         Select,
         SelectFast,
         Cast,
+        CastFlags,
         Alloca,
         GetElementPtr,
         ExtractValue,
@@ -1518,6 +1519,26 @@ pub const FunctionBlock = struct {
         val: u32,
         type_index: Builder.Type,
         opcode: CastOpcode,
+    };
+
+    pub const CastFlags = struct {
+        const CastOpcode = Builder.CastOpcode;
+        pub const ops = [_]AbbrevOp{
+            .{ .literal = 3 },
+            ValueAbbrev,
+            .{ .fixed_runtime = Builder.Type },
+            .{ .fixed = @bitSizeOf(CastOpcode) },
+            .{ .fixed = 2 },
+        };
+
+        val: u32,
+        type_index: Builder.Type,
+        opcode: CastOpcode,
+        /// trunc: bit0 = nuw, bit1 = nsw. zext: bit0 = nneg.
+        flags: packed struct(u2) {
+            bit0: bool,
+            bit1: bool,
+        },
     };
 
     pub const Alloca = struct {
