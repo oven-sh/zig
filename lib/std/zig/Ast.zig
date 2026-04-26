@@ -2700,7 +2700,7 @@ pub const full = struct {
                             .colon => continue,
                             .identifier => name_token = tok_i,
                             .doc_comment => first_doc_comment = tok_i,
-                            .keyword_comptime, .keyword_noalias => comptime_noalias = tok_i,
+                            .keyword_comptime, .keyword_noalias, .keyword_zig_lazy => comptime_noalias = tok_i,
                             else => break,
                         };
                         it.param_i += 1;
@@ -2741,7 +2741,7 @@ pub const full = struct {
                                 .type_expr = null,
                             };
                         },
-                        .keyword_noalias, .keyword_comptime => {
+                        .keyword_noalias, .keyword_comptime, .keyword_zig_lazy => {
                             comptime_noalias = it.tok_i;
                             it.tok_i += 1;
                         },

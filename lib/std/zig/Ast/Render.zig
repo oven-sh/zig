@@ -1737,7 +1737,7 @@ fn renderFnProto(r: *Render, fn_proto: Ast.full.FnProto, space: Space) Error!voi
                     try renderToken(r, last_param_token, .none); // ...
                     break;
                 },
-                .keyword_noalias, .keyword_comptime => {
+                .keyword_noalias, .keyword_comptime, .keyword_zig_lazy => {
                     try renderToken(r, last_param_token, .space);
                     last_param_token += 1;
                 },
@@ -1788,7 +1788,7 @@ fn renderFnProto(r: *Render, fn_proto: Ast.full.FnProto, space: Space) Error!voi
                     try renderToken(r, last_param_token, .comma); // ...
                     break;
                 },
-                .keyword_noalias, .keyword_comptime => {
+                .keyword_noalias, .keyword_comptime, .keyword_zig_lazy => {
                     try renderToken(r, last_param_token, .space);
                     last_param_token += 1;
                 },

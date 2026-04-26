@@ -56,6 +56,7 @@ pub const Token = struct {
         .{ "var", .keyword_var },
         .{ "volatile", .keyword_volatile },
         .{ "while", .keyword_while },
+        .{ "zig_lazy", .keyword_zig_lazy },
     });
 
     pub fn getKeyword(bytes: []const u8) ?Tag {
@@ -182,6 +183,7 @@ pub const Token = struct {
         keyword_var,
         keyword_volatile,
         keyword_while,
+        keyword_zig_lazy,
 
         pub fn lexeme(tag: Tag) ?[]const u8 {
             return switch (tag) {
@@ -306,6 +308,7 @@ pub const Token = struct {
                 .keyword_var => "var",
                 .keyword_volatile => "volatile",
                 .keyword_while => "while",
+                .keyword_zig_lazy => "zig_lazy",
             };
         }
 

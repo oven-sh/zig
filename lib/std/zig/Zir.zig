@@ -2583,9 +2583,11 @@ pub const Inst = struct {
     /// }
     /// 6. noalias_bits: u32 // if has_any_noalias
     ///    - each bit starting with LSB corresponds to parameter indexes
-    /// 7. body: Index // for each body_len
-    /// 8. src_locs: Func.SrcLocs // if body_len != 0
-    /// 9. proto_hash: std.zig.SrcHash // if body_len != 0; hash of function prototype
+    /// 7. lazy_bits: u32 // if has_any_lazy
+    ///    - each bit starting with LSB corresponds to parameter indexes
+    /// 8. body: Index // for each body_len
+    /// 9. src_locs: Func.SrcLocs // if body_len != 0
+    /// 10. proto_hash: std.zig.SrcHash // if body_len != 0; hash of function prototype
     pub const FuncFancy = struct {
         /// Points to the block that contains the param instructions for this function.
         /// If this is a `declaration`, it refers to the declaration's value body.
@@ -2604,8 +2606,9 @@ pub const Inst = struct {
             has_ret_ty_ref: bool,
             has_ret_ty_body: bool,
             has_any_noalias: bool,
+            has_any_lazy: bool,
             ret_ty_is_generic: bool,
-            _: u23 = undefined,
+            _: u22 = undefined,
         };
     };
 
@@ -4666,6 +4669,7 @@ fn findTrackableInner(
             }
 
             extra_index += @intFromBool(extra.data.bits.has_any_noalias);
+            extra_index += @intFromBool(extra.data.bits.has_any_lazy);
 
             const body = zir.bodySlice(extra_index, extra.data.body_len);
             return zir.findTrackableBody(gpa, contents, defers, body);
@@ -4886,6 +4890,7 @@ pub const FnInfo = struct {
     ret_ty_is_generic: bool,
     total_params_len: u32,
     inferred_error_set: bool,
+    lazy_bits: u32,
 };
 
 pub fn getParamBody(zir: Zir, fn_inst: Inst.Index) []const Zir.Inst.Index {
@@ -4936,6 +4941,7 @@ pub fn getFnInfo(zir: Zir, fn_inst: Inst.Index) FnInfo {
         ret_ty_body: []const Inst.Index,
         ret_ty_is_generic: bool,
         ies: bool,
+        lazy_bits: u32,
     } = switch (tags[@intFromEnum(fn_inst)]) {
         .func, .func_inferred => |tag| blk: {
             const inst_data = datas[@intFromEnum(fn_inst)].pl_node;
@@ -4969,6 +4975,7 @@ pub fn getFnInfo(zir: Zir, fn_inst: Inst.Index) FnInfo {
                 .body = body,
                 .ret_ty_is_generic = extra.data.ret_ty.is_generic,
                 .ies = tag == .func_inferred,
+                .lazy_bits = 0,
             };
         },
         .func_fancy => blk: {
@@ -4997,6 +5004,11 @@ pub fn getFnInfo(zir: Zir, fn_inst: Inst.Index) FnInfo {
             }
 
             extra_index += @intFromBool(extra.data.bits.has_any_noalias);
+            const lazy_bits: u32 = if (extra.data.bits.has_any_lazy) b: {
+                const x = zir.extra[extra_index];
+                extra_index += 1;
+                break :b x;
+            } else 0;
 
             const body = zir.bodySlice(extra_index, extra.data.body_len);
             extra_index += body.len;
@@ -5007,6 +5019,7 @@ pub fn getFnInfo(zir: Zir, fn_inst: Inst.Index) FnInfo {
                 .body = body,
                 .ret_ty_is_generic = extra.data.bits.ret_ty_is_generic,
                 .ies = extra.data.bits.is_inferred_error,
+                .lazy_bits = lazy_bits,
             };
         },
         else => unreachable,
@@ -5030,6 +5043,7 @@ pub fn getFnInfo(zir: Zir, fn_inst: Inst.Index) FnInfo {
         .total_params_len = total_params_len,
         .ret_ty_is_generic = info.ret_ty_is_generic,
         .inferred_error_set = info.ies,
+        .lazy_bits = info.lazy_bits,
     };
 }
 
@@ -5154,6 +5168,7 @@ pub fn getAssociatedSrcHash(zir: Zir, inst: Zir.Inst.Index) ?std.zig.SrcHash {
                 extra_index += 1 + body_len;
             } else extra_index += @intFromBool(bits.has_ret_ty_ref);
             extra_index += @intFromBool(bits.has_any_noalias);
+            extra_index += @intFromBool(bits.has_any_lazy);
             extra_index += extra.data.body_len;
             extra_index += @typeInfo(Zir.Inst.Func.SrcLocs).@"struct".fields.len;
             return @bitCast([4]u32{

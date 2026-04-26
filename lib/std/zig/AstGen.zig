@@ -1327,6 +1327,7 @@ fn fnProtoExprInner(
     const block_inst = try gz.makeBlockInst(.block_inline, node);
 
     var noalias_bits: u32 = 0;
+    var lazy_bits: u32 = 0;
     const is_var_args = is_var_args: {
         var param_type_i: usize = 0;
         var it = fn_proto.iterate(tree);
@@ -1335,6 +1336,11 @@ fn fnProtoExprInner(
                 .keyword_noalias => is_comptime: {
                     noalias_bits |= @as(u32, 1) << (std.math.cast(u5, param_type_i) orelse
                         return astgen.failTok(token, "this compiler implementation only supports 'noalias' on the first 32 parameters", .{}));
+                    break :is_comptime false;
+                },
+                .keyword_zig_lazy => is_comptime: {
+                    lazy_bits |= @as(u32, 1) << (std.math.cast(u5, param_type_i) orelse
+                        return astgen.failTok(token, "this compiler implementation only supports 'zig_lazy' on the first 32 parameters", .{}));
                     break :is_comptime false;
                 },
                 .keyword_comptime => true,
@@ -1417,6 +1423,7 @@ fn fnProtoExprInner(
         .is_inferred_error = false,
         .is_noinline = false,
         .noalias_bits = noalias_bits,
+        .lazy_bits = lazy_bits,
 
         .proto_hash = undefined, // ignored for `body_gz == null`
     });
@@ -4257,6 +4264,7 @@ fn fnDeclInner(
     var any_param_used = false;
 
     var noalias_bits: u32 = 0;
+    var lazy_bits: u32 = 0;
     var params_scope = scope;
     const is_var_args = is_var_args: {
         var param_type_i: usize = 0;
@@ -4266,6 +4274,11 @@ fn fnDeclInner(
                 .keyword_noalias => is_comptime: {
                     noalias_bits |= @as(u32, 1) << (std.math.cast(u5, param_type_i) orelse
                         return astgen.failTok(token, "this compiler implementation only supports 'noalias' on the first 32 parameters", .{}));
+                    break :is_comptime false;
+                },
+                .keyword_zig_lazy => is_comptime: {
+                    lazy_bits |= @as(u32, 1) << (std.math.cast(u5, param_type_i) orelse
+                        return astgen.failTok(token, "this compiler implementation only supports 'zig_lazy' on the first 32 parameters", .{}));
                     break :is_comptime false;
                 },
                 .keyword_comptime => true,
@@ -4490,6 +4503,7 @@ fn fnDeclInner(
         .is_inferred_error = is_inferred_error,
         .is_noinline = is_noinline,
         .noalias_bits = noalias_bits,
+        .lazy_bits = lazy_bits,
         .proto_hash = proto_hash,
     });
     _ = try decl_gz.addBreakWithSrcNode(.break_inline, decl_inst, func_inst, decl_node);
@@ -4891,6 +4905,7 @@ fn testDecl(
         .is_inferred_error = false,
         .is_noinline = false,
         .noalias_bits = 0,
+        .lazy_bits = 0,
 
         // Tests don't have a prototype that needs hashing
         .proto_hash = .{0} ** 16,
@@ -12040,6 +12055,7 @@ const GenZir = struct {
             ret_ref: Zir.Inst.Ref,
 
             noalias_bits: u32,
+            lazy_bits: u32,
             is_var_args: bool,
             is_inferred_error: bool,
             is_noinline: bool,
@@ -12110,7 +12126,7 @@ const GenZir = struct {
         const body_len = astgen.countBodyLenAfterFixupsExtraRefs(body, args.param_insts);
 
         const tag: Zir.Inst.Tag, const payload_index: u32 = if (args.cc_ref != .none or
-            args.is_var_args or args.noalias_bits != 0 or args.is_noinline)
+            args.is_var_args or args.noalias_bits != 0 or args.lazy_bits != 0 or args.is_noinline)
         inst_info: {
             try astgen.extra.ensureUnusedCapacity(
                 gpa,
@@ -12118,7 +12134,8 @@ const GenZir = struct {
                     fancyFnExprExtraLen(astgen, &.{}, cc_body, args.cc_ref) +
                     fancyFnExprExtraLen(astgen, args.ret_param_refs, ret_body, ret_ref) +
                     body_len + src_locs_and_hash.len +
-                    @intFromBool(args.noalias_bits != 0),
+                    @intFromBool(args.noalias_bits != 0) +
+                    @intFromBool(args.lazy_bits != 0),
             );
             const payload_index = astgen.addExtraAssumeCapacity(Zir.Inst.FuncFancy{
                 .param_block = args.param_block,
@@ -12128,6 +12145,7 @@ const GenZir = struct {
                     .is_inferred_error = args.is_inferred_error,
                     .is_noinline = args.is_noinline,
                     .has_any_noalias = args.noalias_bits != 0,
+                    .has_any_lazy = args.lazy_bits != 0,
 
                     .has_cc_ref = args.cc_ref != .none,
                     .has_ret_ty_ref = ret_ref != .none,
@@ -12165,6 +12183,9 @@ const GenZir = struct {
 
             if (args.noalias_bits != 0) {
                 astgen.extra.appendAssumeCapacity(args.noalias_bits);
+            }
+            if (args.lazy_bits != 0) {
+                astgen.extra.appendAssumeCapacity(args.lazy_bits);
             }
 
             astgen.appendBodyWithFixupsExtraRefsArrayList(&astgen.extra, body, args.param_insts);

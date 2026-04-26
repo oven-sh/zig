@@ -3030,7 +3030,7 @@ fn parseAddrSpace(p: *Parse) !?Node.Index {
 fn expectParamDecl(p: *Parse) !?Node.Index {
     _ = try p.eatDocComments();
     switch (p.tokenTag(p.tok_i)) {
-        .keyword_noalias, .keyword_comptime => p.tok_i += 1,
+        .keyword_noalias, .keyword_comptime, .keyword_zig_lazy => p.tok_i += 1,
         .ellipsis3 => {
             p.tok_i += 1;
             return null;

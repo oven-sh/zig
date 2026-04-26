@@ -1769,7 +1769,7 @@ pub const SrcLoc = struct {
 
                 var first_tok = tree.firstToken(node);
                 while (true) switch (tree.tokenTag(first_tok - 1)) {
-                    .colon, .identifier, .keyword_comptime, .keyword_noalias => first_tok -= 1,
+                    .colon, .identifier, .keyword_comptime, .keyword_noalias, .keyword_zig_lazy => first_tok -= 1,
                     else => break,
                 };
                 return tree.tokensToSpan(
@@ -1785,7 +1785,7 @@ pub const SrcLoc = struct {
 
                 var first_tok = tok_index;
                 while (true) switch (tree.tokenTag(first_tok - 1)) {
-                    .colon, .identifier, .keyword_comptime, .keyword_noalias => first_tok -= 1,
+                    .colon, .identifier, .keyword_comptime, .keyword_noalias, .keyword_zig_lazy => first_tok -= 1,
                     else => break,
                 };
                 return tree.tokensToSpan(

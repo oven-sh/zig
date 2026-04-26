@@ -49,6 +49,10 @@ air_instructions: std.MultiArrayList(Air.Inst) = .{},
 air_extra: std.ArrayListUnmanaged(u32) = .empty,
 /// Maps ZIR to AIR.
 inst_map: InstMap = .{},
+/// Unevaluated `lazy` parameter arguments for the inline call currently being expanded.
+/// Keyed by the param's ZIR index in the callee's `code`. Populated by `analyzeCall` for
+/// inline calls and forced via `resolveLazyArg` on first reference from the inlined body.
+lazy_args: std.AutoArrayHashMapUnmanaged(Zir.Inst.Index, LazyArg) = .empty,
 /// The "owner" of a `Sema` represents the root "thing" that is being analyzed.
 /// This does not change throughout the entire lifetime of a `Sema`. For instance,
 /// when analyzing a runtime function body, this is always `func` of that function,
@@ -243,6 +247,24 @@ pub const InferredErrorSet = struct {
 /// `ensureSpaceForInstructions` can be called to force InstMap to have a mapped range that
 /// includes all instructions in a slice. After calling this function, `putAssumeCapacity*` can
 /// be called safely for any of the instructions passed in.
+/// Captured call-site context for a `lazy` parameter whose argument expression has not
+/// yet been evaluated. See `Sema.lazy_args`.
+pub const LazyArg = struct {
+    /// Call-site block; AIR for the deferred argument is emitted here.
+    block: *Block,
+    /// `sema.code` at the call site.
+    code: Zir,
+    /// Snapshot of `sema.inst_map` at the call site. The backing storage stays alive for
+    /// the duration of the inline call (it is the saved `old_inst_map` in `analyzeCall`).
+    inst_map: InstMap,
+    args_info: CallArgsInfo,
+    arg_index: u32,
+    param_ty: ?Type,
+    func_ty_info: InternPool.Key.FuncType,
+    callee: Air.Inst.Ref,
+    maybe_func_src_inst: ?InternPool.TrackedInst.Index,
+};
+
 pub const InstMap = struct {
     items: []Air.Inst.Ref = &[_]Air.Inst.Ref{},
     start: Zir.Inst.Index = @enumFromInt(0),
@@ -993,6 +1015,7 @@ pub fn deinit(sema: *Sema) void {
     sema.air_instructions.deinit(gpa);
     sema.air_extra.deinit(gpa);
     sema.inst_map.deinit(gpa);
+    sema.lazy_args.deinit(gpa);
     {
         var it = sema.post_hoc_blocks.iterator();
         while (it.next()) |entry| {
@@ -1986,7 +2009,7 @@ fn analyzeBodyInner(
     }
 }
 
-pub fn resolveInstAllowNone(sema: *Sema, zir_ref: Zir.Inst.Ref) !Air.Inst.Ref {
+pub fn resolveInstAllowNone(sema: *Sema, zir_ref: Zir.Inst.Ref) CompileError!Air.Inst.Ref {
     if (zir_ref == .none) {
         return .none;
     } else {
@@ -1994,14 +2017,49 @@ pub fn resolveInstAllowNone(sema: *Sema, zir_ref: Zir.Inst.Ref) !Air.Inst.Ref {
     }
 }
 
-pub fn resolveInst(sema: *Sema, zir_ref: Zir.Inst.Ref) !Air.Inst.Ref {
+pub fn resolveInst(sema: *Sema, zir_ref: Zir.Inst.Ref) CompileError!Air.Inst.Ref {
     assert(zir_ref != .none);
     if (zir_ref.toIndex()) |i| {
-        return sema.inst_map.get(i).?;
+        if (sema.inst_map.get(i)) |result| return result;
+        return sema.resolveLazyArg(i);
     }
     // First section of indexes correspond to a set number of constant values.
     // We intentionally map the same indexes to the same values between ZIR and AIR.
     return @enumFromInt(@intFromEnum(zir_ref));
+}
+
+/// Forces evaluation of a `lazy` parameter's argument expression at its first point of
+/// use inside an inline call body. Swaps `sema.code`/`sema.inst_map` back to the call
+/// site, runs `analyzeArg`, then restores callee context and memoizes the result.
+fn resolveLazyArg(sema: *Sema, param_inst: Zir.Inst.Index) CompileError!Air.Inst.Ref {
+    const lazy = sema.lazy_args.get(param_inst).?;
+
+    const result = result: {
+        const cur_code = sema.code;
+        const cur_inst_map = sema.inst_map;
+        const cur_lazy_args = sema.lazy_args;
+        sema.code = lazy.code;
+        sema.inst_map = lazy.inst_map;
+        sema.lazy_args = .empty;
+        defer {
+            sema.code = cur_code;
+            sema.inst_map = cur_inst_map;
+            sema.lazy_args = cur_lazy_args;
+        }
+        break :result try lazy.args_info.analyzeArg(
+            sema,
+            lazy.block,
+            lazy.arg_index,
+            lazy.param_ty,
+            lazy.func_ty_info,
+            lazy.callee,
+            lazy.maybe_func_src_inst,
+        );
+    };
+
+    try sema.inst_map.ensureSpaceForInstructions(sema.gpa, &.{param_inst});
+    sema.inst_map.putAssumeCapacity(param_inst, result);
+    return result;
 }
 
 fn resolveConstBool(
@@ -2093,7 +2151,7 @@ fn resolveDestType(
         const msg = msg: {
             const msg = try sema.errMsg(src, "{s} must have a known result type", .{builtin_name});
             errdefer msg.destroy(sema.gpa);
-            switch (sema.genericPoisonReason(block, zir_ref)) {
+            switch (try sema.genericPoisonReason(block, zir_ref)) {
                 .anytype_param => |call_src| try sema.errNote(call_src, msg, "result type is unknown due to anytype parameter", .{}),
                 .anyopaque_ptr => |ptr_src| try sema.errNote(ptr_src, msg, "result type is unknown due to opaque pointer type", .{}),
                 .unknown => {},
@@ -2125,7 +2183,7 @@ const GenericPoisonReason = union(enum) {
 
 /// Backtracks through ZIR instructions to determine the reason a generic poison
 /// type was created. Used for error reporting.
-fn genericPoisonReason(sema: *Sema, block: *Block, ref: Zir.Inst.Ref) GenericPoisonReason {
+fn genericPoisonReason(sema: *Sema, block: *Block, ref: Zir.Inst.Ref) CompileError!GenericPoisonReason {
     var cur = ref;
     while (true) {
         const inst = cur.toIndex() orelse return .unknown;
@@ -7313,8 +7371,15 @@ fn analyzeCall(
         try sema.declareDependency(.{ .src_hash = fn_tracked_inst });
     }
 
+    const lazy_bits: u32 = if (func_val != null) fn_zir_info.lazy_bits else 0;
+    const lazy_param_tys = try arena.alloc(?Type, args_info.count());
+
     const args = try arena.alloc(Air.Inst.Ref, args_info.count());
     for (args, 0..) |*arg, arg_idx| {
+        const is_lazy = if (std.math.cast(u5, arg_idx)) |i|
+            @as(u1, @truncate(lazy_bits >> i)) != 0
+        else
+            false;
         const param_ty: ?Type = if (arg_idx < func_ty_info.param_types.len) ty: {
             const raw = func_ty_info.param_types.get(ip)[arg_idx];
             if (raw != .generic_poison_type) break :ty .fromInterned(raw);
@@ -7362,6 +7427,14 @@ fn analyzeCall(
 
             break :ty param_ty;
         } else null; // vararg
+
+        if (is_lazy and early_known_inline and args_info == .zir_call) {
+            // Defer evaluation; the argument expression is captured and analyzed only if
+            // the parameter is actually referenced from the inlined body.
+            arg.* = .none;
+            lazy_param_tys[arg_idx] = param_ty;
+            continue;
+        }
 
         arg.* = try args_info.analyzeArg(sema, block, arg_idx, param_ty, func_ty_info, callee, maybe_func_inst);
         const arg_ty = sema.typeOf(arg.*);
@@ -7692,6 +7765,7 @@ fn analyzeCall(
 
     if (block.isComptime()) {
         for (args, 0..) |arg, arg_idx| {
+            if (arg == .none) continue;
             if (!try sema.isComptimeKnown(arg)) {
                 const arg_src = args_info.argSrc(block, arg_idx);
                 return sema.failWithNeededComptime(block, arg_src, null);
@@ -7710,6 +7784,7 @@ fn analyzeCall(
         // check that it's worthwhile first!), each memoized call needs an `AnalUnit`.
         if (zcu.comp.incremental) break :m false;
         if (!block.isComptime()) break :m false;
+        if (lazy_bits != 0) break :m false;
         for (args) |a| {
             const val = (try sema.resolveValue(a)).?;
             if (val.canMutateComptimeVarState(zcu)) break :m false;
@@ -7748,6 +7823,7 @@ fn analyzeCall(
 
     const old_inst_map = sema.inst_map;
     const old_code = sema.code;
+    const old_lazy_args = sema.lazy_args;
     const old_func_index = sema.func_index;
     const old_fn_ret_ty = sema.fn_ret_ty;
     const old_fn_ret_ty_ies = sema.fn_ret_ty_ies;
@@ -7756,12 +7832,15 @@ fn analyzeCall(
         sema.inst_map.deinit(gpa);
         sema.inst_map = old_inst_map;
         sema.code = old_code;
+        sema.lazy_args.deinit(gpa);
+        sema.lazy_args = old_lazy_args;
         sema.func_index = old_func_index;
         sema.fn_ret_ty = old_fn_ret_ty;
         sema.fn_ret_ty_ies = old_fn_ret_ty_ies;
         sema.error_return_trace_index_on_fn_entry = old_error_return_trace_index_on_fn_entry;
     }
     sema.inst_map = .{};
+    sema.lazy_args = .empty;
     sema.code = fn_zir;
     sema.func_index = func_val.?.toIntern();
     sema.fn_ret_ty = if (fn_zir_info.inferred_error_set) try pt.errorUnionType(
@@ -7772,6 +7851,20 @@ fn analyzeCall(
 
     try sema.inst_map.ensureSpaceForInstructions(gpa, fn_zir_info.param_body);
     for (args, 0..) |arg, arg_idx| {
+        if (arg == .none) {
+            try sema.lazy_args.put(gpa, fn_zir_info.param_body[arg_idx], .{
+                .block = block,
+                .code = old_code,
+                .inst_map = old_inst_map,
+                .args_info = args_info,
+                .arg_index = @intCast(arg_idx),
+                .param_ty = lazy_param_tys[arg_idx],
+                .func_ty_info = func_ty_info,
+                .callee = callee,
+                .maybe_func_src_inst = maybe_func_inst,
+            });
+            continue;
+        }
         sema.inst_map.putAssumeCapacityNoClobber(fn_zir_info.param_body[arg_idx], arg);
     }
 
@@ -7788,6 +7881,7 @@ fn analyzeCall(
         .func = func_val.?.toIntern(),
         .is_generic_instantiation = false,
         .has_comptime_args = for (args) |a| {
+            if (a == .none) continue;
             if (try sema.isComptimeKnown(a)) break true;
         } else false,
         .comptime_result = undefined,
@@ -7835,14 +7929,14 @@ fn analyzeCall(
         const zir_datas = sema.code.instructions.items(.data);
         for (fn_zir_info.param_body) |inst| switch (zir_tags[@intFromEnum(inst)]) {
             .param, .param_comptime => {
+                const air_inst = sema.inst_map.get(inst) orelse continue;
                 const extra = sema.code.extraData(Zir.Inst.Param, zir_datas[@intFromEnum(inst)].pl_tok.payload_index);
                 const param_name = sema.code.nullTerminatedString(extra.data.name);
-                const air_inst = sema.inst_map.get(inst).?;
                 try sema.addDbgVar(&child_block, air_inst, .dbg_arg_inline, param_name);
             },
             .param_anytype, .param_anytype_comptime => {
+                const air_inst = sema.inst_map.get(inst) orelse continue;
                 const param_name = zir_datas[@intFromEnum(inst)].str_tok.get(sema.code);
-                const air_inst = sema.inst_map.get(inst).?;
                 try sema.addDbgVar(&child_block, air_inst, .dbg_arg_inline, param_name);
             },
             else => {},
@@ -25431,6 +25525,8 @@ fn zirFuncFancy(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!A
         extra_index += 1;
         break :blk x;
     } else 0;
+
+    extra_index += @intFromBool(extra.data.bits.has_any_lazy);
 
     var src_locs: Zir.Inst.Func.SrcLocs = undefined;
     if (has_body) {

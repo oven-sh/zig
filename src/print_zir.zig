@@ -2348,6 +2348,7 @@ const Writer = struct {
             inst_data.src_node,
             src_locs,
             0,
+            0,
         );
     }
 
@@ -2386,6 +2387,12 @@ const Writer = struct {
             break :blk x;
         } else 0;
 
+        const lazy_bits: u32 = if (extra.data.bits.has_any_lazy) blk: {
+            const x = self.code.extra[extra_index];
+            extra_index += 1;
+            break :blk x;
+        } else 0;
+
         const body = self.code.bodySlice(extra_index, extra.data.body_len);
         extra_index += body.len;
 
@@ -2407,6 +2414,7 @@ const Writer = struct {
             inst_data.src_node,
             src_locs,
             noalias_bits,
+            lazy_bits,
         );
     }
 
@@ -2567,6 +2575,7 @@ const Writer = struct {
         src_node: Ast.Node.Offset,
         src_locs: Zir.Inst.Func.SrcLocs,
         noalias_bits: u32,
+        lazy_bits: u32,
     ) !void {
         try self.writeOptionalInstRefOrBody(stream, "cc=", cc_ref, cc_body);
         if (ret_ty_is_generic) try stream.writeAll("[generic] ");
@@ -2577,6 +2586,9 @@ const Writer = struct {
 
         if (noalias_bits != 0) {
             try stream.print("noalias=0b{b}, ", .{noalias_bits});
+        }
+        if (lazy_bits != 0) {
+            try stream.print("lazy=0b{b}, ", .{lazy_bits});
         }
 
         try stream.writeAll("body=");
