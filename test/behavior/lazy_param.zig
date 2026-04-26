@@ -289,6 +289,34 @@ inline fn bunAssert(zig_lazy ok: bool) void {
 
 inline fn noopLog(comptime _: []const u8, zig_lazy _: anytype) void {}
 
+const LogFunction = fn (comptime fmt: []const u8, args: anytype) callconv(.@"inline") void;
+
+fn pickLog(comptime on: bool) LogFunction {
+    if (on) return scopedLogOn;
+    return noopLog;
+}
+
+inline fn scopedLogOn(comptime fmt: []const u8, args: anytype) void {
+    realPrint(fmt, args);
+}
+
+test "zig_lazy: laziness survives coercion through fn type without zig_lazy" {
+    var n: u32 = 0;
+    const debug = pickLog(false);
+    debug("{}", .{sideEffect(&n)});
+    try expect(n == 0);
+    debug("{}", .{@compileError("must not be analyzed")});
+
+    log_len = 0;
+    const info = pickLog(true);
+    info("n={d}", .{blk: {
+        n += 1;
+        break :blk n;
+    }});
+    try expect(n == 1);
+    try expect(std.mem.eql(u8, log_buf[0..log_len], "n=1"));
+}
+
 test "zig_lazy: callconv(.inline) form, discard params" {
     var n: u32 = 0;
     bunAssert(sideEffect(&n));
