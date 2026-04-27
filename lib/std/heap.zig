@@ -8,6 +8,7 @@ const c = std.c;
 const Allocator = std.mem.Allocator;
 const windows = std.os.windows;
 const Alignment = std.mem.Alignment;
+const Asan = std.debug.Asan;
 
 pub const ArenaAllocator = @import("heap/arena_allocator.zig").ArenaAllocator;
 pub const SmpAllocator = @import("heap/SmpAllocator.zig");
@@ -406,6 +407,10 @@ pub fn StackFallbackAllocator(comptime size: usize) type {
                 self.get_called = true;
             }
             self.fixed_buffer_allocator = FixedBufferAllocator.init(self.buffer[0..]);
+            // The unallocated tail is intentionally not poisoned: Zig does not
+            // yet emit per-frame ASAN shadow cleanup, so eager poisoning would
+            // leave stale poison after the owning frame returns. Freed regions
+            // are still poisoned (see free/resize).
             return .{
                 .ptr = self,
                 .vtable = &.{
@@ -430,8 +435,11 @@ pub fn StackFallbackAllocator(comptime size: usize) type {
             ra: usize,
         ) ?[*]u8 {
             const self: *Self = @ptrCast(@alignCast(ctx));
-            return FixedBufferAllocator.alloc(&self.fixed_buffer_allocator, len, alignment, ra) orelse
-                return self.fallback_allocator.rawAlloc(len, alignment, ra);
+            if (FixedBufferAllocator.alloc(&self.fixed_buffer_allocator, len, alignment, ra)) |ptr| {
+                Asan.unpoison(ptr, len);
+                return ptr;
+            }
+            return self.fallback_allocator.rawAlloc(len, alignment, ra);
         }
 
         fn resize(
@@ -443,7 +451,15 @@ pub fn StackFallbackAllocator(comptime size: usize) type {
         ) bool {
             const self: *Self = @ptrCast(@alignCast(ctx));
             if (self.fixed_buffer_allocator.ownsPtr(buf.ptr)) {
-                return FixedBufferAllocator.resize(&self.fixed_buffer_allocator, buf, alignment, new_len, ra);
+                const ok = FixedBufferAllocator.resize(&self.fixed_buffer_allocator, buf, alignment, new_len, ra);
+                if (ok) {
+                    if (new_len > buf.len) {
+                        Asan.unpoison(buf.ptr + buf.len, new_len - buf.len);
+                    } else if (new_len < buf.len) {
+                        Asan.poison(buf.ptr + new_len, buf.len - new_len);
+                    }
+                }
+                return ok;
             } else {
                 return self.fallback_allocator.rawResize(buf, alignment, new_len, ra);
             }
@@ -458,7 +474,16 @@ pub fn StackFallbackAllocator(comptime size: usize) type {
         ) ?[*]u8 {
             const self: *Self = @ptrCast(@alignCast(context));
             if (self.fixed_buffer_allocator.ownsPtr(memory.ptr)) {
-                return FixedBufferAllocator.remap(&self.fixed_buffer_allocator, memory, alignment, new_len, return_address);
+                const result = FixedBufferAllocator.remap(&self.fixed_buffer_allocator, memory, alignment, new_len, return_address);
+                if (result) |ptr| {
+                    // FixedBufferAllocator.remap only ever resizes in place.
+                    if (new_len > memory.len) {
+                        Asan.unpoison(ptr + memory.len, new_len - memory.len);
+                    } else if (new_len < memory.len) {
+                        Asan.poison(ptr + new_len, memory.len - new_len);
+                    }
+                }
+                return result;
             } else {
                 return self.fallback_allocator.rawRemap(memory, alignment, new_len, return_address);
             }
@@ -472,7 +497,9 @@ pub fn StackFallbackAllocator(comptime size: usize) type {
         ) void {
             const self: *Self = @ptrCast(@alignCast(ctx));
             if (self.fixed_buffer_allocator.ownsPtr(buf.ptr)) {
-                return FixedBufferAllocator.free(&self.fixed_buffer_allocator, buf, alignment, ra);
+                FixedBufferAllocator.free(&self.fixed_buffer_allocator, buf, alignment, ra);
+                Asan.poison(buf.ptr, buf.len);
+                return;
             } else {
                 return self.fallback_allocator.rawFree(buf, alignment, ra);
             }

@@ -6,6 +6,7 @@ const mem = std.mem;
 const math = std.math;
 const Allocator = mem.Allocator;
 const ArrayList = std.ArrayList;
+const Asan = std.debug.Asan;
 
 /// Deprecated.
 pub fn Managed(comptime T: type) type {
@@ -40,6 +41,28 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
             return if (alignment) |a| ([:s]align(a.toByteUnits()) T) else [:s]T;
         }
 
+        /// ASAN: re-annotate the backing buffer so that `[0..items.len)` is
+        /// addressable and `[items.len..capacity)` is poisoned. `old_len` must
+        /// be the previous `items.len` (or `capacity` for a freshly-unpoisoned
+        /// buffer). No-op when ASAN is disabled or `T` is zero-sized.
+        inline fn asanAnnotate(self: Self, old_len: usize) void {
+            if (!Asan.enabled or @sizeOf(T) == 0 or self.capacity == 0) return;
+            Asan.annotateContiguousContainer(
+                @ptrCast(self.items.ptr),
+                self.capacity * @sizeOf(T),
+                old_len * @sizeOf(T),
+                self.items.len * @sizeOf(T),
+            );
+        }
+
+        /// ASAN: unpoison the entire allocated buffer. Called before handing
+        /// memory back to an allocator (free/remap) or to external code so that
+        /// non-ASAN-aware consumers do not fault on the spare-capacity bytes.
+        inline fn asanUnpoisonAll(self: Self) void {
+            if (!Asan.enabled or @sizeOf(T) == 0 or self.capacity == 0) return;
+            Asan.unpoison(@ptrCast(self.items.ptr), self.capacity * @sizeOf(T));
+        }
+
         /// Deinitialize with `deinit` or use `toOwnedSlice`.
         pub fn init(gpa: Allocator) Self {
             return Self{
@@ -61,6 +84,7 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
         /// Release all allocated memory.
         pub fn deinit(self: Self) void {
             if (@sizeOf(T) > 0) {
+                self.asanUnpoisonAll();
                 self.allocator.free(self.allocatedSlice());
             }
         }
@@ -102,6 +126,7 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
             const allocator = self.allocator;
 
             const old_memory = self.allocatedSlice();
+            self.asanUnpoisonAll();
             if (allocator.remap(old_memory, self.items.len)) |new_items| {
                 self.* = init(allocator);
                 return new_items;
@@ -148,6 +173,7 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
         pub fn insertAssumeCapacity(self: *Self, i: usize, item: T) void {
             assert(self.items.len < self.capacity);
             self.items.len += 1;
+            self.asanAnnotate(self.items.len - 1);
 
             @memmove(self.items[i + 1 .. self.items.len], self.items[i .. self.items.len - 1]);
             self.items[i] = item;
@@ -174,9 +200,11 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
             // extra capacity.
             const new_capacity = Aligned(T, alignment).growCapacity(self.capacity, new_len);
             const old_memory = self.allocatedSlice();
+            self.asanUnpoisonAll();
             if (self.allocator.remap(old_memory, new_capacity)) |new_memory| {
                 self.items.ptr = new_memory.ptr;
                 self.capacity = new_memory.len;
+                self.asanAnnotate(self.capacity);
                 return addManyAtAssumeCapacity(self, index, count);
             }
 
@@ -189,6 +217,7 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
             self.allocator.free(old_memory);
             self.items = new_memory[0..new_len];
             self.capacity = new_memory.len;
+            self.asanAnnotate(self.capacity);
             // The inserted elements at `new_memory[index..][0..count]` have
             // already been set to `undefined` by memory allocation.
             return new_memory[index..][0..count];
@@ -207,6 +236,7 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
             assert(self.capacity >= new_len);
             const to_move = self.items[index..];
             self.items.len = new_len;
+            self.asanAnnotate(new_len - count);
             @memmove(self.items[index + count ..][0..to_move.len], to_move);
             const result = self.items[index..][0..count];
             @memset(result, undefined);
@@ -303,6 +333,7 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
             const new_len = old_len + items.len;
             assert(new_len <= self.capacity);
             self.items.len = new_len;
+            self.asanAnnotate(old_len);
             @memcpy(self.items[old_len..][0..items.len], items);
         }
 
@@ -326,6 +357,7 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
             const new_len = old_len + items.len;
             assert(new_len <= self.capacity);
             self.items.len = new_len;
+            self.asanAnnotate(old_len);
             @memcpy(self.items[old_len..][0..items.len], items);
         }
 
@@ -386,18 +418,22 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
         /// have a more optimal memset codegen in case it has a repeated byte pattern.
         /// Asserts that the list can hold the additional items.
         pub inline fn appendNTimesAssumeCapacity(self: *Self, value: T, n: usize) void {
-            const new_len = self.items.len + n;
+            const old_len = self.items.len;
+            const new_len = old_len + n;
             assert(new_len <= self.capacity);
-            @memset(self.items.ptr[self.items.len..new_len], value);
             self.items.len = new_len;
+            self.asanAnnotate(old_len);
+            @memset(self.items.ptr[old_len..new_len], value);
         }
 
         /// Adjust the list length to `new_len`.
         /// Additional elements contain the value `undefined`.
         /// Invalidates element pointers if additional memory is needed.
         pub fn resize(self: *Self, new_len: usize) Allocator.Error!void {
+            const old_len = self.items.len;
             try self.ensureTotalCapacity(new_len);
             self.items.len = new_len;
+            self.asanAnnotate(old_len);
         }
 
         /// Reduce allocated capacity to `new_len`.
@@ -414,16 +450,21 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
         /// Asserts that the new length is less than or equal to the previous length.
         pub fn shrinkRetainingCapacity(self: *Self, new_len: usize) void {
             assert(new_len <= self.items.len);
+            const old_len = self.items.len;
             self.items.len = new_len;
+            self.asanAnnotate(old_len);
         }
 
         /// Invalidates all element pointers.
         pub fn clearRetainingCapacity(self: *Self) void {
+            const old_len = self.items.len;
             self.items.len = 0;
+            self.asanAnnotate(old_len);
         }
 
         /// Invalidates all element pointers.
         pub fn clearAndFree(self: *Self) void {
+            self.asanUnpoisonAll();
             self.allocator.free(self.allocatedSlice());
             self.items.len = 0;
             self.capacity = 0;
@@ -461,6 +502,7 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
             // the allocator implementation would pointlessly copy our
             // extra capacity.
             const old_memory = self.allocatedSlice();
+            self.asanUnpoisonAll();
             if (self.allocator.remap(old_memory, new_capacity)) |new_memory| {
                 self.items.ptr = new_memory.ptr;
                 self.capacity = new_memory.len;
@@ -471,6 +513,7 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
                 self.items.ptr = new_memory.ptr;
                 self.capacity = new_memory.len;
             }
+            self.asanAnnotate(self.capacity);
         }
 
         /// Modify the array so that it can hold at least `additional_count` **more** items.
@@ -483,7 +526,9 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
         /// The new elements have `undefined` values.
         /// Never invalidates element pointers.
         pub fn expandToCapacity(self: *Self) void {
+            const old_len = self.items.len;
             self.items.len = self.capacity;
+            self.asanAnnotate(old_len);
         }
 
         /// Increase length by 1, returning pointer to the new item.
@@ -502,6 +547,7 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
         pub fn addOneAssumeCapacity(self: *Self) *T {
             assert(self.items.len < self.capacity);
             self.items.len += 1;
+            self.asanAnnotate(self.items.len - 1);
             return &self.items[self.items.len - 1];
         }
 
@@ -524,6 +570,7 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
             assert(self.items.len + n <= self.capacity);
             const prev_len = self.items.len;
             self.items.len += n;
+            self.asanAnnotate(prev_len);
             return self.items[prev_len..][0..n];
         }
 
@@ -546,6 +593,7 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
             assert(self.items.len + n <= self.capacity);
             const prev_len = self.items.len;
             self.items.len += n;
+            self.asanAnnotate(prev_len);
             return self.items[prev_len..][0..n];
         }
 
@@ -555,6 +603,7 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
             if (self.items.len == 0) return null;
             const val = self.items[self.items.len - 1];
             self.items.len -= 1;
+            self.asanAnnotate(self.items.len + 1);
             return val;
         }
 
@@ -570,6 +619,10 @@ pub fn AlignedManaged(comptime T: type, comptime alignment: ?mem.Alignment) type
         /// Note that such an operation must be followed up with a direct
         /// modification of `self.items.len`.
         pub fn unusedCapacitySlice(self: Self) []T {
+            // Callers are expected to write directly into this region; unpoison
+            // it so ASAN does not flag those writes. The next length-changing
+            // operation will re-establish the poison boundary.
+            self.asanUnpoisonAll();
             return self.allocatedSlice()[self.items.len..];
         }
 
@@ -629,6 +682,28 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
             return if (alignment) |a| ([:s]align(a.toByteUnits()) T) else [:s]T;
         }
 
+        /// ASAN: re-annotate the backing buffer so that `[0..items.len)` is
+        /// addressable and `[items.len..capacity)` is poisoned. `old_len` must
+        /// be the previous `items.len` (or `capacity` for a freshly-unpoisoned
+        /// buffer). No-op when ASAN is disabled or `T` is zero-sized.
+        inline fn asanAnnotate(self: Self, old_len: usize) void {
+            if (!Asan.enabled or @sizeOf(T) == 0 or self.capacity == 0) return;
+            Asan.annotateContiguousContainer(
+                @ptrCast(self.items.ptr),
+                self.capacity * @sizeOf(T),
+                old_len * @sizeOf(T),
+                self.items.len * @sizeOf(T),
+            );
+        }
+
+        /// ASAN: unpoison the entire allocated buffer. Called before handing
+        /// memory back to an allocator (free/remap) or to external code so that
+        /// non-ASAN-aware consumers do not fault on the spare-capacity bytes.
+        inline fn asanUnpoisonAll(self: Self) void {
+            if (!Asan.enabled or @sizeOf(T) == 0 or self.capacity == 0) return;
+            Asan.unpoison(@ptrCast(self.items.ptr), self.capacity * @sizeOf(T));
+        }
+
         /// Initialize with capacity to hold `num` elements.
         /// The resulting capacity will equal `num` exactly.
         /// Deinitialize with `deinit` or use `toOwnedSlice`.
@@ -652,6 +727,7 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
 
         /// Release all allocated memory.
         pub fn deinit(self: *Self, gpa: Allocator) void {
+            self.asanUnpoisonAll();
             gpa.free(self.allocatedSlice());
             self.* = undefined;
         }
@@ -684,6 +760,7 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
         /// Its capacity is cleared, making deinit() safe but unnecessary to call.
         pub fn toOwnedSlice(self: *Self, gpa: Allocator) Allocator.Error!Slice {
             const old_memory = self.allocatedSlice();
+            self.asanUnpoisonAll();
             if (gpa.remap(old_memory, self.items.len)) |new_items| {
                 self.* = .empty;
                 return new_items;
@@ -733,6 +810,7 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
         pub fn insertAssumeCapacity(self: *Self, i: usize, item: T) void {
             assert(self.items.len < self.capacity);
             self.items.len += 1;
+            self.asanAnnotate(self.items.len - 1);
 
             @memmove(self.items[i + 1 .. self.items.len], self.items[i .. self.items.len - 1]);
             self.items[i] = item;
@@ -785,6 +863,7 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
             assert(self.capacity >= new_len);
             const to_move = self.items[index..];
             self.items.len = new_len;
+            self.asanAnnotate(new_len - count);
             @memmove(self.items[index + count ..][0..to_move.len], to_move);
             const result = self.items[index..][0..count];
             @memset(result, undefined);
@@ -874,6 +953,7 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
                 @memmove(self.items[after_range - extra ..][0..src.len], src);
                 @memset(self.items[self.items.len - extra ..], undefined);
                 self.items.len -= extra;
+                self.asanAnnotate(self.items.len + extra);
             }
         }
 
@@ -952,6 +1032,7 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
             const len = end - start; // safety checks final `sorted_indexes` are in range
             @memmove(self.items[start - shift ..][0..len], self.items[start..][0..len]);
             self.items.len = end - shift;
+            self.asanAnnotate(end);
         }
 
         /// Removes the element at the specified index and returns it.
@@ -984,6 +1065,7 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
             const new_len = old_len + items.len;
             assert(new_len <= self.capacity);
             self.items.len = new_len;
+            self.asanAnnotate(old_len);
             @memcpy(self.items[old_len..][0..items.len], items);
         }
 
@@ -1015,6 +1097,7 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
             const new_len = old_len + items.len;
             assert(new_len <= self.capacity);
             self.items.len = new_len;
+            self.asanAnnotate(old_len);
             @memcpy(self.items[old_len..][0..items.len], items);
         }
 
@@ -1033,6 +1116,9 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
         pub fn print(self: *Self, gpa: Allocator, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
             comptime assert(T == u8);
             try self.ensureUnusedCapacity(gpa, fmt.len);
+            // The Allocating writer manages our buffer directly; unpoison the
+            // spare capacity so it can write without ASAN false positives.
+            self.asanUnpoisonAll();
             var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, self);
             defer self.* = aw.toArrayList();
             return aw.writer.print(fmt, args) catch |err| switch (err) {
@@ -1116,10 +1202,12 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
         ///
         /// Asserts that the list can hold the additional items.
         pub inline fn appendNTimesAssumeCapacity(self: *Self, value: T, n: usize) void {
-            const new_len = self.items.len + n;
+            const old_len = self.items.len;
+            const new_len = old_len + n;
             assert(new_len <= self.capacity);
-            @memset(self.items.ptr[self.items.len..new_len], value);
             self.items.len = new_len;
+            self.asanAnnotate(old_len);
+            @memset(self.items.ptr[old_len..new_len], value);
         }
 
         /// Append a value to the list `n` times.
@@ -1132,18 +1220,22 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
         /// If the list lacks unused capacity for the additional items, returns
         /// `error.OutOfMemory`.
         pub inline fn appendNTimesBounded(self: *Self, value: T, n: usize) error{OutOfMemory}!void {
-            const new_len = self.items.len + n;
+            const old_len = self.items.len;
+            const new_len = old_len + n;
             if (self.capacity < new_len) return error.OutOfMemory;
-            @memset(self.items.ptr[self.items.len..new_len], value);
             self.items.len = new_len;
+            self.asanAnnotate(old_len);
+            @memset(self.items.ptr[old_len..new_len], value);
         }
 
         /// Adjust the list length to `new_len`.
         /// Additional elements contain the value `undefined`.
         /// Invalidates element pointers if additional memory is needed.
         pub fn resize(self: *Self, gpa: Allocator, new_len: usize) Allocator.Error!void {
+            const old_len = self.items.len;
             try self.ensureTotalCapacity(gpa, new_len);
             self.items.len = new_len;
+            self.asanAnnotate(old_len);
         }
 
         /// Reduce allocated capacity to `new_len`.
@@ -1158,6 +1250,7 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
             }
 
             const old_memory = self.allocatedSlice();
+            self.asanUnpoisonAll();
             if (gpa.remap(old_memory, new_len)) |new_items| {
                 self.capacity = new_items.len;
                 self.items = new_items;
@@ -1184,16 +1277,21 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
         /// Asserts that the new length is less than or equal to the previous length.
         pub fn shrinkRetainingCapacity(self: *Self, new_len: usize) void {
             assert(new_len <= self.items.len);
+            const old_len = self.items.len;
             self.items.len = new_len;
+            self.asanAnnotate(old_len);
         }
 
         /// Invalidates all element pointers.
         pub fn clearRetainingCapacity(self: *Self) void {
+            const old_len = self.items.len;
             self.items.len = 0;
+            self.asanAnnotate(old_len);
         }
 
         /// Invalidates all element pointers.
         pub fn clearAndFree(self: *Self, gpa: Allocator) void {
+            self.asanUnpoisonAll();
             gpa.free(self.allocatedSlice());
             self.items.len = 0;
             self.capacity = 0;
@@ -1224,6 +1322,7 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
             // the allocator implementation would pointlessly copy our
             // extra capacity.
             const old_memory = self.allocatedSlice();
+            self.asanUnpoisonAll();
             if (gpa.remap(old_memory, new_capacity)) |new_memory| {
                 self.items.ptr = new_memory.ptr;
                 self.capacity = new_memory.len;
@@ -1234,6 +1333,7 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
                 self.items.ptr = new_memory.ptr;
                 self.capacity = new_memory.len;
             }
+            self.asanAnnotate(self.capacity);
         }
 
         /// Modify the array so that it can hold at least `additional_count` **more** items.
@@ -1250,7 +1350,9 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
         /// The new elements have `undefined` values.
         /// Never invalidates element pointers.
         pub fn expandToCapacity(self: *Self) void {
+            const old_len = self.items.len;
             self.items.len = self.capacity;
+            self.asanAnnotate(old_len);
         }
 
         /// Increase length by 1, returning pointer to the new item.
@@ -1273,6 +1375,7 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
             assert(self.items.len < self.capacity);
 
             self.items.len += 1;
+            self.asanAnnotate(self.items.len - 1);
             return &self.items[self.items.len - 1];
         }
 
@@ -1310,6 +1413,7 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
             assert(self.items.len + n <= self.capacity);
             const prev_len = self.items.len;
             self.items.len += n;
+            self.asanAnnotate(prev_len);
             return self.items[prev_len..][0..n];
         }
 
@@ -1349,6 +1453,7 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
             assert(self.items.len + n <= self.capacity);
             const prev_len = self.items.len;
             self.items.len += n;
+            self.asanAnnotate(prev_len);
             return self.items[prev_len..][0..n];
         }
 
@@ -1372,6 +1477,7 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
             if (self.items.len == 0) return null;
             const val = self.items[self.items.len - 1];
             self.items.len -= 1;
+            self.asanAnnotate(self.items.len + 1);
             return val;
         }
 
@@ -1386,6 +1492,10 @@ pub fn Aligned(comptime T: type, comptime alignment: ?mem.Alignment) type {
         /// Note that such an operation must be followed up with a direct
         /// modification of `self.items.len`.
         pub fn unusedCapacitySlice(self: Self) []T {
+            // Callers are expected to write directly into this region; unpoison
+            // it so ASAN does not flag those writes. The next length-changing
+            // operation will re-establish the poison boundary.
+            self.asanUnpoisonAll();
             return self.allocatedSlice()[self.items.len..];
         }
 

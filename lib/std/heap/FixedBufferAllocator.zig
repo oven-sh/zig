@@ -2,6 +2,7 @@ const std = @import("../std.zig");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const mem = std.mem;
+const Asan = std.debug.Asan;
 
 const FixedBufferAllocator = @This();
 
@@ -9,10 +10,20 @@ end_index: usize,
 buffer: []u8,
 
 pub fn init(buffer: []u8) FixedBufferAllocator {
+    // The unallocated tail is intentionally not poisoned here: Zig does not
+    // yet emit per-frame ASAN shadow cleanup, so poisoning a stack-backed
+    // buffer would leave stale poison after the FBA goes out of scope.
+    // Freed regions are still poisoned (see free/resize/reset).
     return .{
         .buffer = buffer,
         .end_index = 0,
     };
+}
+
+/// Unpoisons the backing buffer so it can be reused outside this allocator.
+pub fn deinit(self: *FixedBufferAllocator) void {
+    if (!@inComptime()) Asan.unpoisonSlice(self.buffer);
+    self.* = undefined;
 }
 
 /// Using this at the same time as the interface returned by `threadSafeAllocator` is not thread safe.
@@ -68,7 +79,9 @@ pub fn alloc(ctx: *anyopaque, n: usize, alignment: mem.Alignment, ra: usize) ?[*
     const new_end_index = adjusted_index + n;
     if (new_end_index > self.buffer.len) return null;
     self.end_index = new_end_index;
-    return self.buffer.ptr + adjusted_index;
+    const result = self.buffer.ptr + adjusted_index;
+    if (!@inComptime()) Asan.unpoison(result, n);
+    return result;
 }
 
 pub fn resize(
@@ -85,18 +98,21 @@ pub fn resize(
 
     if (!self.isLastAllocation(buf)) {
         if (new_size > buf.len) return false;
+        if (!@inComptime()) Asan.poison(buf.ptr + new_size, buf.len - new_size);
         return true;
     }
 
     if (new_size <= buf.len) {
         const sub = buf.len - new_size;
         self.end_index -= sub;
+        if (!@inComptime()) Asan.poison(buf.ptr + new_size, sub);
         return true;
     }
 
     const add = new_size - buf.len;
     if (add + self.end_index > self.buffer.len) return false;
 
+    if (!@inComptime()) Asan.unpoison(buf.ptr + buf.len, add);
     self.end_index += add;
     return true;
 }
@@ -125,6 +141,7 @@ pub fn free(
     if (self.isLastAllocation(buf)) {
         self.end_index -= buf.len;
     }
+    if (!@inComptime()) Asan.poisonSlice(buf);
 }
 
 fn threadSafeAlloc(ctx: *anyopaque, n: usize, alignment: mem.Alignment, ra: usize) ?[*]u8 {
@@ -137,12 +154,16 @@ fn threadSafeAlloc(ctx: *anyopaque, n: usize, alignment: mem.Alignment, ra: usiz
         const adjusted_index = end_index + adjust_off;
         const new_end_index = adjusted_index + n;
         if (new_end_index > self.buffer.len) return null;
-        end_index = @cmpxchgWeak(usize, &self.end_index, end_index, new_end_index, .seq_cst, .seq_cst) orelse
-            return self.buffer[adjusted_index..new_end_index].ptr;
+        end_index = @cmpxchgWeak(usize, &self.end_index, end_index, new_end_index, .seq_cst, .seq_cst) orelse {
+            const result = self.buffer.ptr + adjusted_index;
+            Asan.unpoison(result, n);
+            return result;
+        };
     }
 }
 
 pub fn reset(self: *FixedBufferAllocator) void {
+    if (!@inComptime()) Asan.poisonSlice(self.buffer[0..self.end_index]);
     self.end_index = 0;
 }
 

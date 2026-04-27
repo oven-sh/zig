@@ -21,6 +21,7 @@ pub const Pdb = @import("debug/Pdb.zig");
 pub const SelfInfo = @import("debug/SelfInfo.zig");
 pub const Info = @import("debug/Info.zig");
 pub const Coverage = @import("debug/Coverage.zig");
+pub const Asan = @import("debug/Asan.zig");
 
 pub const simple_panic = @import("debug/simple_panic.zig");
 pub const no_panic = @import("debug/no_panic.zig");
@@ -1780,4 +1781,5 @@ test {
     _ = &Pdb;
     _ = &SelfInfo;
     _ = &dumpHex;
+    _ = @import("debug/asan_test.zig");
 }
