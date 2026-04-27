@@ -12,7 +12,9 @@
 const builtin = @import("builtin");
 
 /// Whether the current compilation has AddressSanitizer instrumentation.
-pub const enabled = builtin.sanitize_address;
+/// Guarded with @hasDecl so the bootstrap stage1 (whose builtin predates
+/// sanitize_address) can still compile std.
+pub const enabled = @hasDecl(builtin, "sanitize_address") and builtin.sanitize_address;
 
 /// Mark `[ptr, ptr+len)` as inaccessible. Any subsequent load or store in
 /// that range triggers an ASAN `use-after-poison` report.
