@@ -89,6 +89,7 @@ const assert = std.debug.assert;
 const mem = std.mem;
 const Allocator = std.mem.Allocator;
 const StackTrace = std.builtin.StackTrace;
+const Asan = std.debug.Asan;
 
 const default_page_size: usize = switch (builtin.os.tag) {
     // Makes `std.heap.PageAllocator` take the happy path.
@@ -772,6 +773,9 @@ pub fn DebugAllocator(comptime config: Config) type {
                     if (config.verbose_log) {
                         log.info("small alloc {d} bytes at 0x{x}", .{ len, addr });
                     }
+                    // The slot was poisoned when the page was created; unpoison
+                    // it now that it is being handed to the caller.
+                    Asan.unpoison(@as([*]u8, @ptrFromInt(addr)), size_class);
                     return @ptrFromInt(addr);
                 }
             }
@@ -805,6 +809,12 @@ pub fn DebugAllocator(comptime config: Config) type {
                 bucket.requestedSizes(slot_count)[0] = @intCast(len);
                 bucket.log2PtrAligns(slot_count)[0] = alignment;
             }
+
+            // Poison every slot except slot 0 (which is being returned now) so
+            // that overruns and use-before-allocation are caught by ASAN. The
+            // bucket metadata lives past the slot region and is left untouched.
+            const size_class = @as(usize, 1) << @as(Log2USize, @intCast(size_class_index));
+            Asan.poison(page + size_class, (@as(usize, slot_count) - 1) * size_class);
 
             if (config.verbose_log) {
                 log.info("small alloc {d} bytes at 0x{x}", .{ len, @intFromPtr(page) });
@@ -939,6 +949,10 @@ pub fn DebugAllocator(comptime config: Config) type {
                 bucket.requestedSizes(slot_count)[slot_index] = 0;
             }
             bucket.freed_count += 1;
+            // Poison the freed slot so use-after-free is caught by ASAN. Slots
+            // are never reused; the whole page is unpoisoned below before being
+            // returned to the backing allocator once every slot has been freed.
+            Asan.poison(old_memory.ptr, size_class);
             if (bucket.freed_count == bucket.allocated_count) {
                 if (bucket.prev) |prev| {
                     prev.next = bucket.next;
@@ -954,6 +968,9 @@ pub fn DebugAllocator(comptime config: Config) type {
 
                 if (!config.never_unmap) {
                     const page: [*]align(page_size) u8 = @ptrFromInt(page_addr);
+                    // Unpoison the entire page before returning it to the
+                    // backing allocator, which may not be ASAN-aware.
+                    Asan.unpoison(page, page_size);
                     self.backing_allocator.rawFree(page[0..page_size], page_align, @returnAddress());
                 }
             }

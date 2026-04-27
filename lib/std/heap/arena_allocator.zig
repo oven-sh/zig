@@ -3,6 +3,7 @@ const assert = std.debug.assert;
 const mem = std.mem;
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
+const Asan = std.debug.Asan;
 
 /// This allocator takes an existing allocator, wraps it, and provides an interface where
 /// you can allocate and then free it all together. Calls to free an individual item only
@@ -57,6 +58,8 @@ pub const ArenaAllocator = struct {
             const next_it = node.next;
             const buf_node: *BufNode = @fieldParentPtr("node", node);
             const alloc_buf = @as([*]u8, @ptrCast(buf_node))[0..buf_node.data];
+            // Hand back fully unpoisoned memory; the child allocator may not be ASAN-aware.
+            Asan.unpoisonSlice(alloc_buf);
             self.child_allocator.rawFree(alloc_buf, BufNode_alignment, @returnAddress());
             it = next_it;
         }
@@ -138,6 +141,7 @@ pub const ArenaAllocator = struct {
                 break node;
             const buf_node: *BufNode = @fieldParentPtr("node", node);
             const alloc_buf = @as([*]u8, @ptrCast(buf_node))[0..buf_node.data];
+            Asan.unpoisonSlice(alloc_buf);
             self.child_allocator.rawFree(alloc_buf, BufNode_alignment, @returnAddress());
             it = next_it;
         } else null;
@@ -148,22 +152,31 @@ pub const ArenaAllocator = struct {
             self.state.buffer_list.first = first_node;
             // perfect, no need to invoke the child_allocator
             const first_buf_node: *BufNode = @fieldParentPtr("node", first_node);
-            if (first_buf_node.data == total_size)
+            if (first_buf_node.data == total_size) {
+                // Retained as-is: poison the data region so use-after-reset is caught.
+                Asan.poison(@as([*]u8, @ptrCast(first_buf_node)) + @sizeOf(BufNode), total_size - @sizeOf(BufNode));
                 return true;
+            }
             const first_alloc_buf = @as([*]u8, @ptrCast(first_buf_node))[0..first_buf_node.data];
+            // Unpoison before letting the child allocator resize/free this region.
+            Asan.unpoisonSlice(first_alloc_buf);
             if (self.child_allocator.rawResize(first_alloc_buf, BufNode_alignment, total_size, @returnAddress())) {
                 // successful resize
                 first_buf_node.data = total_size;
+                Asan.poison(first_alloc_buf.ptr + @sizeOf(BufNode), total_size - @sizeOf(BufNode));
             } else {
                 // manual realloc
                 const new_ptr = self.child_allocator.rawAlloc(total_size, BufNode_alignment, @returnAddress()) orelse {
                     // we failed to preheat the arena properly, signal this to the user.
+                    // Re-poison the retained buffer's data region (still owned by us).
+                    Asan.poisonSlice(first_alloc_buf[@sizeOf(BufNode)..]);
                     return false;
                 };
                 self.child_allocator.rawFree(first_alloc_buf, BufNode_alignment, @returnAddress());
                 const buf_node: *BufNode = @ptrCast(@alignCast(new_ptr));
                 buf_node.* = .{ .data = total_size };
                 self.state.buffer_list.first = &buf_node.node;
+                Asan.poison(new_ptr + @sizeOf(BufNode), total_size - @sizeOf(BufNode));
             }
         }
         return true;
@@ -179,6 +192,9 @@ pub const ArenaAllocator = struct {
         buf_node.* = .{ .data = len };
         self.state.buffer_list.prepend(&buf_node.node);
         self.state.end_index = 0;
+        // Poison the data region (everything past the header). The header itself
+        // must remain accessible for list traversal and `data` reads.
+        Asan.poison(ptr + @sizeOf(BufNode), len - @sizeOf(BufNode));
         return buf_node;
     }
 
@@ -202,11 +218,15 @@ pub const ArenaAllocator = struct {
             if (new_end_index <= cur_buf.len) {
                 const result = cur_buf[adjusted_index..new_end_index];
                 self.state.end_index = new_end_index;
+                Asan.unpoisonSlice(result);
                 return result.ptr;
             }
 
             const bigger_buf_size = @sizeOf(BufNode) + new_end_index;
             if (self.child_allocator.rawResize(cur_alloc_buf, BufNode_alignment, bigger_buf_size, @returnAddress())) {
+                // Poison the freshly-grown tail; the next loop iteration will
+                // unpoison exactly the slice handed to the caller.
+                Asan.poison(cur_alloc_buf.ptr + cur_alloc_buf.len, bigger_buf_size - cur_alloc_buf.len);
                 cur_node.data = bigger_buf_size;
             } else {
                 // Allocate a new node if that's not possible
@@ -226,14 +246,20 @@ pub const ArenaAllocator = struct {
         if (@intFromPtr(cur_buf.ptr) + self.state.end_index != @intFromPtr(buf.ptr) + buf.len) {
             // It's not the most recent allocation, so it cannot be expanded,
             // but it's fine if they want to make it smaller.
-            return new_len <= buf.len;
+            if (new_len <= buf.len) {
+                Asan.poisonSlice(buf[new_len..]);
+                return true;
+            }
+            return false;
         }
 
         if (buf.len >= new_len) {
             self.state.end_index -= buf.len - new_len;
+            Asan.poisonSlice(buf[new_len..]);
             return true;
         } else if (cur_buf.len - self.state.end_index >= new_len - buf.len) {
             self.state.end_index += new_len - buf.len;
+            Asan.unpoison(buf.ptr + buf.len, new_len - buf.len);
             return true;
         } else {
             return false;
@@ -263,6 +289,8 @@ pub const ArenaAllocator = struct {
         if (@intFromPtr(cur_buf.ptr) + self.state.end_index == @intFromPtr(buf.ptr) + buf.len) {
             self.state.end_index -= buf.len;
         }
+        // Catch use-after-free regardless of whether we could rewind end_index.
+        Asan.poisonSlice(buf);
     }
 };
 

@@ -1,5 +1,6 @@
 const std = @import("../std.zig");
 const Alignment = std.mem.Alignment;
+const Asan = std.debug.Asan;
 
 const debug_mode = @import("builtin").mode == .Debug;
 
@@ -76,6 +77,7 @@ pub fn MemoryPoolExtra(comptime Item: type, comptime pool_options: Options) type
 
         /// Destroys the memory pool and frees all allocated memory.
         pub fn deinit(pool: *Pool) void {
+            pool.unpoisonFreeList();
             pool.arena.deinit();
             pool.* = undefined;
         }
@@ -92,6 +94,8 @@ pub fn MemoryPoolExtra(comptime Item: type, comptime pool_options: Options) type
                     .next = pool.free_list,
                 };
                 pool.free_list = free_node;
+                // Poison the payload past the free-list link so stale references trip ASAN.
+                Asan.poison(@as([*]u8, @ptrCast(free_node)) + @sizeOf(Node), item_size - @sizeOf(Node));
             }
         }
 
@@ -110,6 +114,7 @@ pub fn MemoryPoolExtra(comptime Item: type, comptime pool_options: Options) type
             // TODO: Potentially store all allocated objects in a list as well, allowing to
             //       just move them into the free list instead of actually releasing the memory.
 
+            pool.unpoisonFreeList();
             const reset_successful = pool.arena.reset(mode);
 
             pool.free_list = null;
@@ -127,6 +132,11 @@ pub fn MemoryPoolExtra(comptime Item: type, comptime pool_options: Options) type
             else
                 return error.OutOfMemory;
 
+            // Unpoison the full item before handing it to the caller. The free-list
+            // header was kept addressable, but the tail may have been poisoned by
+            // destroy()/preheat().
+            Asan.unpoison(@as([*]u8, @ptrCast(node)), item_size);
+
             const ptr = @as(ItemPtr, @ptrCast(node));
             ptr.* = undefined;
             return ptr;
@@ -142,6 +152,21 @@ pub fn MemoryPoolExtra(comptime Item: type, comptime pool_options: Options) type
                 .next = pool.free_list,
             };
             pool.free_list = node;
+            // Poison everything past the free-list link so use-after-destroy is caught.
+            // The first @sizeOf(Node) bytes stay addressable so we can walk `next`.
+            Asan.poison(@as([*]u8, @ptrCast(node)) + @sizeOf(Node), item_size - @sizeOf(Node));
+        }
+
+        /// Walk the free list and unpoison every node's payload. Called before
+        /// returning memory to the backing allocator (deinit/reset) so that an
+        /// allocator which is not ASAN-aware does not trip on poisoned bytes.
+        fn unpoisonFreeList(pool: *Pool) void {
+            if (!Asan.enabled) return;
+            var it = pool.free_list;
+            while (it) |node| {
+                it = node.next;
+                Asan.unpoison(@as([*]u8, @ptrCast(node)), item_size);
+            }
         }
 
         fn allocNew(pool: *Pool) MemoryPoolError!*align(item_alignment.toByteUnits()) [item_size]u8 {
